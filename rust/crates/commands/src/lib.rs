@@ -1181,6 +1181,7 @@ pub enum SlashCommand {
     AddDir {
         path: Option<String>,
     },
+    Models,
     Unknown(String),
 }
 
@@ -1266,6 +1267,10 @@ pub fn validate_slash_command_input(
         "model" => SlashCommand::Model {
             model: optional_single_arg(command, &args, "[model]")?,
         },
+        "models" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::Models
+        }
         "permissions" => SlashCommand::Permissions {
             mode: parse_permissions_mode(&args)?,
         },
@@ -3199,6 +3204,7 @@ pub fn handle_slash_command(
         | SlashCommand::DebugToolCall
         | SlashCommand::Sandbox
         | SlashCommand::Model { .. }
+        | SlashCommand::Models
         | SlashCommand::Permissions { .. }
         | SlashCommand::Clear { .. }
         | SlashCommand::Cost

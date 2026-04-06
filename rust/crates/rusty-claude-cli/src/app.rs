@@ -107,6 +107,10 @@ const SLASH_COMMAND_HANDLERS: &[SlashCommandHandler] = &[
         summary: "Show or switch the active model",
     },
     SlashCommandHandler {
+        command: SlashCommand::Models,
+        summary: "List all available models grouped by provider",
+    },
+    SlashCommandHandler {
         command: SlashCommand::Permissions { mode: None },
         summary: "Show or switch the active permission mode",
     },
@@ -194,6 +198,7 @@ impl CliApp {
             SlashCommand::Status => self.handle_status(out),
             SlashCommand::Compact => self.handle_compact(out),
             SlashCommand::Model { model } => self.handle_model(model.as_deref(), out),
+            SlashCommand::Models => self.handle_models(out),
             SlashCommand::Permissions { mode } => self.handle_permissions(mode.as_deref(), out),
             SlashCommand::Config { section } => self.handle_config(section.as_deref(), out),
             SlashCommand::Memory => self.handle_memory(out),
@@ -213,6 +218,7 @@ impl CliApp {
                 SlashCommand::Status => "/status",
                 SlashCommand::Compact => "/compact",
                 SlashCommand::Model { .. } => "/model [model]",
+                SlashCommand::Models => "/models",
                 SlashCommand::Permissions { .. } => "/permissions [mode]",
                 SlashCommand::Config { .. } => "/config [section]",
                 SlashCommand::Memory => "/memory",
@@ -269,6 +275,32 @@ impl CliApp {
                 writeln!(out, "Active model: {}", self.config.model)?;
             }
         }
+        Ok(CommandResult::Continue)
+    }
+
+    fn handle_models(&self, out: &mut impl Write) -> io::Result<CommandResult> {
+        let current = &self.config.model;
+        let marker = |id: &str| if current == id || current.contains(id) { "▶" } else { " " };
+        writeln!(out, "Available models  (/model <alias> to switch)\n")?;
+        writeln!(out, "  ── Anthropic (ANTHROPIC_API_KEY) ─────────────────────")?;
+        writeln!(out, "  {}  claude-opus-4-6        alias: opus", marker("claude-opus-4-6"))?;
+        writeln!(out, "  {}  claude-sonnet-4-6      alias: sonnet", marker("claude-sonnet-4-6"))?;
+        writeln!(out, "  {}  claude-haiku-4-5       alias: haiku", marker("haiku"))?;
+        writeln!(out, "\n  ── Google AI Studio (GOOGLE_API_KEY) ─────────────────")?;
+        writeln!(out, "     Gemma 4 — tool calling ✓, 256K context")?;
+        writeln!(out, "  {}  gemma-4-31b-it         alias: gemma, gemma4", marker("gemma-4-31b-it"))?;
+        writeln!(out, "  {}  gemma-4-26b-a4b-it     alias: gemma-4-27b-it (MoE, 26B)", marker("gemma-4-26b-a4b-it"))?;
+        writeln!(out, "     Gemini — tool calling ✓")?;
+        writeln!(out, "  {}  gemini-2.5-flash       alias: gemini  (recommended)", marker("gemini-2.5-flash"))?;
+        writeln!(out, "  {}  gemini-2.5-flash-lite  (1000 req/day free)", marker("gemini-2.5-flash-lite"))?;
+        writeln!(out, "  {}  gemini-2.5-pro         (5 RPM / 100/day)", marker("gemini-2.5-pro"))?;
+        writeln!(out, "\n  ── Groq (GROQ_API_KEY) — ultra-fast, free ────────────")?;
+        writeln!(out, "     ⚠ Free tier: only llama4-scout has sufficient TPM")?;
+        writeln!(out, "     ⚠ Agent/tool calling not working on Groq free tier")?;
+        writeln!(out, "  {}  llama4-scout  (chat only, no tools)  alias: llama4-scout", marker("llama-4-scout"))?;
+        writeln!(out, "\n  ── xAI (XAI_API_KEY) ─────────────────────────────────")?;
+        writeln!(out, "  {}  grok-3                 alias: grok", marker("grok-3"))?;
+        writeln!(out, "  {}  grok-3-mini            alias: grok-mini", marker("grok-3-mini"))?;
         Ok(CommandResult::Continue)
     }
 

@@ -5,3 +5,13 @@ archive/
 # Claude Code local artifacts
 .claude/settings.local.json
 .claude/sessions/
+# Environment / secrets
+.env
+.env.local
+# claw session data (personal, not for repo)
+rust/.claw/sessions/
+rust/.claw/plugins/
+rust/.claw/installed/
+# Compiled binaries
+rust/target/
+*.exe

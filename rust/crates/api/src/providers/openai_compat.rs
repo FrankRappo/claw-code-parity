@@ -16,6 +16,8 @@ use super::{Provider, ProviderFuture};
 
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+pub const DEFAULT_GOOGLE_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/openai/";
+pub const DEFAULT_GROQ_BASE_URL: &str = "https://api.groq.com/openai/v1";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
@@ -32,6 +34,8 @@ pub struct OpenAiCompatConfig {
 
 const XAI_ENV_VARS: &[&str] = &["XAI_API_KEY"];
 const OPENAI_ENV_VARS: &[&str] = &["OPENAI_API_KEY"];
+const GOOGLE_ENV_VARS: &[&str] = &["GOOGLE_API_KEY"];
+const GROQ_ENV_VARS: &[&str] = &["GROQ_API_KEY"];
 
 impl OpenAiCompatConfig {
     #[must_use]
@@ -53,11 +57,34 @@ impl OpenAiCompatConfig {
             default_base_url: DEFAULT_OPENAI_BASE_URL,
         }
     }
+
+    #[must_use]
+    pub const fn google() -> Self {
+        Self {
+            provider_name: "Google",
+            api_key_env: "GOOGLE_API_KEY",
+            base_url_env: "GOOGLE_BASE_URL",
+            default_base_url: DEFAULT_GOOGLE_BASE_URL,
+        }
+    }
+
+    #[must_use]
+    pub const fn groq() -> Self {
+        Self {
+            provider_name: "Groq",
+            api_key_env: "GROQ_API_KEY",
+            base_url_env: "GROQ_BASE_URL",
+            default_base_url: DEFAULT_GROQ_BASE_URL,
+        }
+    }
+
     #[must_use]
     pub fn credential_env_vars(self) -> &'static [&'static str] {
         match self.provider_name {
             "xAI" => XAI_ENV_VARS,
             "OpenAI" => OPENAI_ENV_VARS,
+            "Google" => GOOGLE_ENV_VARS,
+            "Groq" => GROQ_ENV_VARS,
             _ => &[],
         }
     }
@@ -334,7 +361,7 @@ impl StreamState {
             self.message_started = true;
             events.push(StreamEvent::MessageStart(MessageStartEvent {
                 message: MessageResponse {
-                    id: chunk.id.clone(),
+                    id: chunk.id.clone().unwrap_or_default(),
                     kind: "message".to_string(),
                     role: "assistant".to_string(),
                     content: Vec::new(),
@@ -539,7 +566,8 @@ impl ToolCallState {
 
 #[derive(Debug, Deserialize)]
 struct ChatCompletionResponse {
-    id: String,
+    #[serde(default)]
+    id: Option<String>,
     model: String,
     choices: Vec<ChatChoice>,
     #[serde(default)]
@@ -564,7 +592,8 @@ struct ChatMessage {
 
 #[derive(Debug, Deserialize)]
 struct ResponseToolCall {
-    id: String,
+    #[serde(default)]
+    id: Option<String>,
     function: ResponseToolFunction,
 }
 
@@ -584,7 +613,8 @@ struct OpenAiUsage {
 
 #[derive(Debug, Deserialize)]
 struct ChatCompletionChunk {
-    id: String,
+    #[serde(default)]
+    id: Option<String>,
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
@@ -777,16 +807,19 @@ fn normalize_response(
     if let Some(text) = choice.message.content.filter(|value| !value.is_empty()) {
         content.push(OutputContentBlock::Text { text });
     }
-    for tool_call in choice.message.tool_calls {
+    for (idx, tool_call) in choice.message.tool_calls.into_iter().enumerate() {
+        let id = tool_call
+            .id
+            .unwrap_or_else(|| format!("tool_call_{idx}"));
         content.push(OutputContentBlock::ToolUse {
-            id: tool_call.id,
+            id,
             name: tool_call.function.name,
             input: parse_tool_arguments(&tool_call.function.arguments),
         });
     }
 
     Ok(MessageResponse {
-        id: response.id,
+        id: response.id.unwrap_or_default(),
         kind: "message".to_string(),
         role: choice.message.role,
         content,

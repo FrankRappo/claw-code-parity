@@ -2,10 +2,18 @@ from __future__ import annotations
 
 import argparse
 
+# Load .env automatically if present (requires: pip install python-dotenv)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 from .bootstrap_graph import build_bootstrap_graph
 from .command_graph import build_command_graph
 from .commands import execute_command, get_command, get_commands, render_command_index
 from .direct_modes import run_deep_link, run_direct_connect
+from .gemma_agent import GemmaAgentRuntime
 from .parity_audit import run_parity_audit
 from .permissions import ToolPermissionContext
 from .port_manifest import build_port_manifest
@@ -88,6 +96,15 @@ def build_parser() -> argparse.ArgumentParser:
     exec_tool_parser = subparsers.add_parser('exec-tool', help='execute a mirrored tool shim by exact name')
     exec_tool_parser.add_argument('name')
     exec_tool_parser.add_argument('payload')
+
+    gemma_parser = subparsers.add_parser('gemma-agent', help='run a prompt (or interactive REPL) using Gemma 4 31B as the agent backend')
+    gemma_parser.add_argument('prompt', nargs='?', default='', help='prompt to send (omit for interactive REPL)')
+    gemma_parser.add_argument('--model', default='gemma-4-31b-it', help='Gemma model ID (default: gemma-4-31b-it)')
+    gemma_parser.add_argument('--max-turns', type=int, default=10, help='maximum agentic turns (default: 10)')
+    gemma_parser.add_argument('--temperature', type=float, default=0.7, help='sampling temperature (default: 0.7)')
+    gemma_parser.add_argument('--no-tools', action='store_true', help='disable native tool calling')
+    gemma_parser.add_argument('--markdown', action='store_true', help='print full session as Markdown (non-interactive mode only)')
+
     return parser
 
 
@@ -205,6 +222,28 @@ def main(argv: list[str] | None = None) -> int:
         result = execute_tool(args.name, args.payload)
         print(result.message)
         return 0 if result.handled else 1
+    if args.command == 'gemma-agent':
+        try:
+            runtime = GemmaAgentRuntime(
+                model_name=args.model,
+                max_turns=args.max_turns,
+                use_native_tools=not args.no_tools,
+                temperature=args.temperature,
+            )
+        except (ImportError, ValueError) as exc:
+            print(f'Error: {exc}', file=__import__('sys').stderr)
+            return 1
+        if args.prompt:
+            session = runtime.run(args.prompt)
+            if args.markdown:
+                print(session.as_markdown())
+            else:
+                last = session.turns[-1] if session.turns else None
+                if last:
+                    print(last.reply)
+        else:
+            runtime.run_interactive()
+        return 0
     parser.error(f'unknown command: {args.command}')
     return 2
 
