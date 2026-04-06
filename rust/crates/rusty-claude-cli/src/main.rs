@@ -54,11 +54,7 @@ use tools::{GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput};
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
 fn max_tokens_for_model(model: &str) -> u32 {
-    if model.contains("opus") {
-        32_000
-    } else {
-        64_000
-    }
+    api::max_tokens_for_model(model)
 }
 const DEFAULT_DATE: &str = "2026-03-31";
 const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 4545;
@@ -592,13 +588,8 @@ fn levenshtein_distance(left: &str, right: &str) -> usize {
     previous[right_chars.len()]
 }
 
-fn resolve_model_alias(model: &str) -> &str {
-    match model {
-        "opus" => "claude-opus-4-6",
-        "sonnet" => "claude-sonnet-4-6",
-        "haiku" => "claude-haiku-4-5-20251213",
-        _ => model,
-    }
+fn resolve_model_alias(model: &str) -> String {
+    api::resolve_model_alias(model)
 }
 
 fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, String> {
@@ -1179,8 +1170,39 @@ fn format_model_report(model: &str, message_count: usize, turns: u32) -> String 
 
 Usage
   Inspect current model with /model
-  Switch models with /model <name>"
+  Switch models with /model <name>
+  List all models with /models"
     )
+}
+
+fn format_models_list(current: &str) -> String {
+    let m = |id: &str| if current == id || current.contains(id) { "▶" } else { " " };
+    let lines = vec![
+        "Available models  (use /model <alias> to switch)\n".to_string(),
+        "  ── Anthropic (ANTHROPIC_API_KEY) ──────────────".to_string(),
+        format!("  {}  claude-opus-4-6        alias: opus", m("claude-opus-4-6")),
+        format!("  {}  claude-sonnet-4-6      alias: sonnet", m("claude-sonnet-4-6")),
+        format!("  {}  claude-haiku-4-5       alias: haiku", m("haiku")),
+        "".to_string(),
+        "  ── Google AI Studio (GOOGLE_API_KEY) ──────────".to_string(),
+        "     Gemma 4 — tool calling ✓, 256K context".to_string(),
+        format!("  {}  gemma-4-31b-it         alias: gemma, gemma4", m("gemma-4-31b-it")),
+        format!("  {}  gemma-4-26b-a4b-it     alias: gemma-4-27b-it (MoE, 26B)", m("gemma-4-26b-a4b-it")),
+        "     Gemini — tool calling ✓".to_string(),
+        format!("  {}  gemini-2.5-flash       alias: gemini  (recommended)", m("gemini-2.5-flash")),
+        format!("  {}  gemini-2.5-flash-lite  (1000 req/day free)", m("gemini-2.5-flash-lite")),
+        format!("  {}  gemini-2.5-pro         (5 RPM / 100/day)", m("gemini-2.5-pro")),
+        "".to_string(),
+        "  ── Groq (GROQ_API_KEY) — ultra-fast, free ─────".to_string(),
+        "     ⚠ Free tier: only llama4-scout has sufficient TPM for claw".to_string(),
+        "     ⚠ Tool calling (agent mode) not working on Groq free tier".to_string(),
+        format!("  {}  llama4-scout  (chat only, no tools)  alias: llama4-scout", m("llama-4-scout")),
+        "".to_string(),
+        "  ── xAI (XAI_API_KEY) ──────────────────────────".to_string(),
+        format!("  {}  grok-3                 alias: grok", m("grok-3")),
+        format!("  {}  grok-3-mini            alias: grok-mini", m("grok-3-mini")),
+    ];
+    lines.join("\n")
 }
 
 fn format_model_switch_report(previous: &str, next: &str, message_count: usize) -> String {
@@ -1695,6 +1717,7 @@ fn run_resume_command(
         | SlashCommand::DebugToolCall { .. }
         | SlashCommand::Resume { .. }
         | SlashCommand::Model { .. }
+        | SlashCommand::Models
         | SlashCommand::Permissions { .. }
         | SlashCommand::Session { .. }
         | SlashCommand::Plugins { .. }
@@ -2550,6 +2573,10 @@ impl LiveCli {
                 false
             }
             SlashCommand::Model { model } => self.set_model(model)?,
+            SlashCommand::Models => {
+                println!("{}", format_models_list(&self.model));
+                false
+            }
             SlashCommand::Permissions { mode } => self.set_permissions(mode)?,
             SlashCommand::Clear { confirm } => self.clear_session(confirm)?,
             SlashCommand::Cost => {
@@ -5004,7 +5031,7 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
 
 struct AnthropicRuntimeClient {
     runtime: tokio::runtime::Runtime,
-    client: AnthropicClient,
+    client: api::ProviderClient,
     model: String,
     enable_tools: bool,
     emit_output: bool,
@@ -5023,11 +5050,26 @@ impl AnthropicRuntimeClient {
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let provider = api::detect_provider_kind(&model);
+        // gemma-3-* models don't support function calling via API; gemma-4+ does
+        let model_lower = model.to_ascii_lowercase();
+        let enable_tools = enable_tools
+            && !(model_lower.starts_with("gemma-3") || model_lower.starts_with("gemma3"));
+        let client = match provider {
+            api::ProviderKind::Google
+            | api::ProviderKind::Xai
+            | api::ProviderKind::OpenAi
+            | api::ProviderKind::Groq => api::ProviderClient::from_model(&model)
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?,
+            api::ProviderKind::Anthropic => api::ProviderClient::Anthropic(
+                AnthropicClient::from_auth(resolve_cli_auth_source()?)
+                    .with_base_url(api::read_base_url())
+                    .with_prompt_cache(PromptCache::new(session_id)),
+            ),
+        };
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
-            client: AnthropicClient::from_auth(resolve_cli_auth_source()?)
-                .with_base_url(api::read_base_url())
-                .with_prompt_cache(PromptCache::new(session_id)),
+            client,
             model,
             enable_tools,
             emit_output,
@@ -5830,7 +5872,7 @@ fn response_to_events(
     Ok(events)
 }
 
-fn push_prompt_cache_record(client: &AnthropicClient, events: &mut Vec<AssistantEvent>) {
+fn push_prompt_cache_record(client: &api::ProviderClient, events: &mut Vec<AssistantEvent>) {
     if let Some(record) = client.take_last_prompt_cache_record() {
         if let Some(event) = prompt_cache_record_to_runtime_event(record) {
             events.push(AssistantEvent::PromptCache(event));

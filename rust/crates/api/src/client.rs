@@ -11,6 +11,8 @@ pub enum ProviderClient {
     Anthropic(AnthropicClient),
     Xai(OpenAiCompatClient),
     OpenAi(OpenAiCompatClient),
+    Google(OpenAiCompatClient),
+    Groq(OpenAiCompatClient),
 }
 
 impl ProviderClient {
@@ -34,6 +36,12 @@ impl ProviderClient {
             ProviderKind::OpenAi => Ok(Self::OpenAi(OpenAiCompatClient::from_env(
                 OpenAiCompatConfig::openai(),
             )?)),
+            ProviderKind::Google => Ok(Self::Google(OpenAiCompatClient::from_env(
+                OpenAiCompatConfig::google(),
+            )?)),
+            ProviderKind::Groq => Ok(Self::Groq(OpenAiCompatClient::from_env(
+                OpenAiCompatConfig::groq(),
+            )?)),
         }
     }
 
@@ -43,6 +51,8 @@ impl ProviderClient {
             Self::Anthropic(_) => ProviderKind::Anthropic,
             Self::Xai(_) => ProviderKind::Xai,
             Self::OpenAi(_) => ProviderKind::OpenAi,
+            Self::Google(_) => ProviderKind::Google,
+            Self::Groq(_) => ProviderKind::Groq,
         }
     }
 
@@ -58,7 +68,7 @@ impl ProviderClient {
     pub fn prompt_cache_stats(&self) -> Option<PromptCacheStats> {
         match self {
             Self::Anthropic(client) => client.prompt_cache_stats(),
-            Self::Xai(_) | Self::OpenAi(_) => None,
+            Self::Xai(_) | Self::OpenAi(_) | Self::Google(_) | Self::Groq(_) => None,
         }
     }
 
@@ -66,7 +76,7 @@ impl ProviderClient {
     pub fn take_last_prompt_cache_record(&self) -> Option<PromptCacheRecord> {
         match self {
             Self::Anthropic(client) => client.take_last_prompt_cache_record(),
-            Self::Xai(_) | Self::OpenAi(_) => None,
+            Self::Xai(_) | Self::OpenAi(_) | Self::Google(_) | Self::Groq(_) => None,
         }
     }
 
@@ -76,7 +86,10 @@ impl ProviderClient {
     ) -> Result<MessageResponse, ApiError> {
         match self {
             Self::Anthropic(client) => client.send_message(request).await,
-            Self::Xai(client) | Self::OpenAi(client) => client.send_message(request).await,
+            Self::Xai(client)
+            | Self::OpenAi(client)
+            | Self::Google(client)
+            | Self::Groq(client) => client.send_message(request).await,
         }
     }
 
@@ -89,7 +102,10 @@ impl ProviderClient {
                 .stream_message(request)
                 .await
                 .map(MessageStream::Anthropic),
-            Self::Xai(client) | Self::OpenAi(client) => client
+            Self::Xai(client)
+            | Self::OpenAi(client)
+            | Self::Google(client)
+            | Self::Groq(client) => client
                 .stream_message(request)
                 .await
                 .map(MessageStream::OpenAiCompat),
