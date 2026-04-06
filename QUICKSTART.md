@@ -41,18 +41,35 @@ $env:ANTHROPIC_API_KEY = "sk-ant-..."
 ```powershell
 cd "C:\claw cod\claw-code-parity — копия (2)\rust"
 
-# Groq llama4-scout (бесплатно, рекомендуется)
-.\target\release\claw.exe --model llama4-scout
-
-# Google Gemma 4 31B (бесплатно, с инструментами)
+# Google Gemma 4 31B (бесплатно, агент с инструментами) — РЕКОМЕНДУЕТСЯ
 .\target\release\claw.exe --model gemma4
 
-# Google Gemini 2.5 Flash (бесплатно)
-.\target\release\claw.exe --model gemini
+# Google Gemini 2.5 Flash Lite (бесплатно, 1000 req/day)
+.\target\release\claw.exe --model gemini-2.5-flash-lite
+
+# Groq llama4-scout (бесплатно, только чат)
+.\target\release\claw.exe --model llama4-scout
 
 # Claude Sonnet (платно)
 .\target\release\claw.exe --model sonnet
 ```
+
+### Без запроса подтверждений (авто-режим)
+
+По умолчанию claw спрашивает разрешение перед каждым действием с файлами.
+Чтобы работал **без подтверждений** — добавь флаг:
+
+```powershell
+# Разрешить всё в рамках текущей директории (рекомендуется)
+.\target\release\claw.exe --model gemma4 --dangerously-skip-permissions
+
+# Или установить режим через команду внутри REPL:
+/permissions workspace-write   # файлы только в текущем проекте
+/permissions danger-full-access # без ограничений (как выше)
+```
+
+> ⚠ `--dangerously-skip-permissions` даёт агенту полный доступ — запускай
+> только в доверенной директории проекта.
 
 ### Одиночный запрос (без REPL)
 
