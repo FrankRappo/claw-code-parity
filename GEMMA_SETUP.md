@@ -88,3 +88,19 @@ set ANTHROPIC_API_KEY=
 target\release\claw.exe --model gemma-4-27b-it
 ```
 (claw выберет OpenAI-провайдер автоматически когда OPENAI_API_KEY установлен)
+
+---
+
+## Системный prompt для локальной Gemma / llama.cpp
+
+Для OpenAI-compatible провайдеров Claw поддерживает принудительный system prompt через env:
+
+```bash
+export CLAW_SYSTEM_PROMPT_FILE=/home/ubuntu/second-llm/prompts/system-prompt-gemma4-abliterated-current.txt
+# или напрямую:
+export CLAW_SYSTEM_PROMPT='You are the local deployment assistant. Answer directly.'
+```
+
+`CLAW_SYSTEM_PROMPT_FILE` предпочтительнее: файл читается при сборке каждого `/v1/chat/completions` запроса, поэтому prompt можно менять без пересборки бинарника. Если у Claw есть собственный сгенерированный system prompt, внешний prompt добавляется перед ним в том же `role=system` сообщении.
+
+Подробно: `SYSTEM_PROMPT.md`.
