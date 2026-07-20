@@ -35,6 +35,22 @@ def test_config(root: Path) -> bridge.BridgeConfig:
     )
 
 
+class BridgeConfigTests(unittest.TestCase):
+    def test_default_tool_allowlist_includes_public_web_tools(self):
+        with mock.patch.dict(
+            bridge.os.environ,
+            {"CLAW_BRIDGE_TOKEN": "x" * 32},
+            clear=True,
+        ):
+            config = bridge.BridgeConfig.from_env()
+
+        tools = set(config.allowed_tools.split(","))
+        self.assertIn("WebFetch", tools)
+        self.assertIn("WebSearch", tools)
+        self.assertIn("bash", tools)
+        self.assertIn("Agent", tools)
+
+
 class ProjectStoreTests(unittest.TestCase):
     def test_new_switch_close_and_reload(self):
         with tempfile.TemporaryDirectory() as directory:

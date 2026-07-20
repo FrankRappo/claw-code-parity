@@ -113,7 +113,8 @@ class BridgeConfig:
             ),
             model=os.environ.get("CLAW_MODEL", "gemma4"),
             allowed_tools=os.environ.get(
-                "CLAW_ALLOWED_TOOLS", "read,write,edit,glob,grep,bash"
+                "CLAW_ALLOWED_TOOLS",
+                "read,write,edit,glob,grep,bash,WebFetch,WebSearch,Agent,Sleep",
             ),
             permission_mode=os.environ.get(
                 "CLAW_PERMISSION_MODE", "workspace-write"

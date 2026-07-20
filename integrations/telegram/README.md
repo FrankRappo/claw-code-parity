@@ -43,6 +43,12 @@ running process group. A future approval-button mode would require a separate
 asynchronous stdin/permission protocol and is not mixed with the current
 `danger-full-access` deployment.
 
+The parent Claw allowlist includes `WebFetch` and `WebSearch` in addition to
+`bash`, so requests for current public information do not depend on an
+interactive shell approval. Public internet is available; the guest firewall
+continues to deny private-network egress, and the process environment continues
+to omit bridge, Telegram, cluster, and general GitHub credentials.
+
 The local Gemma deployment prompt is injected as a real OpenAI-compatible
 `role=system` message for ordinary Telegram chat, Claw, Vision preprocessing,
 and the built-in child Agent. It is file-backed and hot-reloaded on each model
