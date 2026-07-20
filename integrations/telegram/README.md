@@ -99,6 +99,12 @@ Production evidence for resume, restart recovery, stop, automatic OCR, and two
 parallel projects is recorded in
 [`PRODUCTION-VALIDATION.md`](./PRODUCTION-VALIDATION.md).
 
+The next infrastructure step is to move the Claw runtime, bridge, sessions, and
+workspaces off the shared VM and onto one dedicated sandbox VM. Per-project
+containers and repository-scoped GitHub deploy keys are documented as future
+upgrades, not current requirements. See
+[`DEDICATED-SANDBOX-VM.md`](./DEDICATED-SANDBOX-VM.md).
+
 ## Tunnel key restriction
 
 Use a dedicated unprivileged account on the Telegram host. Restrict its public

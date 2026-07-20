@@ -53,7 +53,7 @@ See the matching server measurements in
 ## Regression commands
 
 ```bash
-cargo test -p claw-runtime
+cargo test -p runtime
 cargo test -p rusty-claude-cli
 python3 -m unittest discover -s integrations/telegram/tests -v
 systemd-analyze verify integrations/telegram/systemd/claw-telegram-bridge.service
