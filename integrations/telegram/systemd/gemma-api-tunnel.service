@@ -1,0 +1,24 @@
+[Unit]
+Description=Local SSH tunnel from the Claw VM to the Gemma API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=clawrun
+Group=clawrun
+EnvironmentFile=/etc/gemma-api-tunnel.env
+ExecStart=/usr/bin/ssh -NT -i ${IDENTITY_FILE} -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=20 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=yes -L 127.0.0.1:${LOCAL_PORT}:${REMOTE_BIND_HOST}:${REMOTE_BIND_PORT} ${REMOTE_USER}@${REMOTE_HOST}
+Restart=always
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadOnlyPaths=-/home/clawrun/.ssh
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

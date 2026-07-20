@@ -23,13 +23,17 @@ Users simply forward the file into the same chat.
 
 - `claw_project_bridge.py`: authenticated localhost HTTP service on the Claw VM;
 - `telegram_claw_bot.py`: combined Gemma/Claw Telegram bot for the Telegram host;
-- `systemd/`: service and reverse-tunnel templates;
+- `systemd/`: bridge, model-tunnel, reverse-tunnel, and dedicated-sandbox
+  templates;
 - `tests/`: dependency-free unit tests.
 
-The bridge uses `workspace-write`, an explicit tool allowlist, argument arrays
-instead of a shell, per-chat serialization, a global concurrency limit, process
-groups for interruption, atomic state writes, attachment signature checks, and
-a separate project transcript.
+The source configuration defaults to `workspace-write`. It also uses an
+explicit tool allowlist, argument arrays instead of a shell, per-chat
+serialization, a global concurrency limit, process groups for interruption,
+atomic state writes, attachment signature checks, and a separate project
+transcript. The production dedicated-VM deployment intentionally overrides the
+permission mode to `danger-full-access` and permits `sudo`; the whole disposable
+VM, rather than the process sandbox, is the security boundary.
 
 ## Claw patch
 
@@ -80,6 +84,13 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now claw-telegram-bridge.service
 ```
 
+On a dedicated disposable VM only, install
+`systemd/claw-telegram-bridge-sandbox.conf` as a systemd drop-in and set
+`CLAW_PERMISSION_MODE=danger-full-access`. Do not use that override on a shared
+or credential-bearing host. Install the model tunnel from
+`systemd/gemma-api-tunnel.service` and its external environment file before the
+bridge; install the reverse tunnel last, after local bridge health succeeds.
+
 Validate the unit and service before exposing the reverse tunnel:
 
 ```bash
@@ -95,14 +106,15 @@ cargo test -p rusty-claude-cli
 python3 -m unittest discover -s integrations/telegram/tests -v
 ```
 
-Production evidence for resume, restart recovery, stop, automatic OCR, and two
-parallel projects is recorded in
+Production evidence for resume, restart recovery, stop, automatic OCR, two
+parallel projects, dedicated-VM migration, package installation, firewall
+isolation, and VM reboot recovery is recorded in
 [`PRODUCTION-VALIDATION.md`](./PRODUCTION-VALIDATION.md).
 
-The next infrastructure step is to move the Claw runtime, bridge, sessions, and
-workspaces off the shared VM and onto one dedicated sandbox VM. Per-project
-containers and repository-scoped GitHub deploy keys are documented as future
-upgrades, not current requirements. See
+The Claw runtime, bridge, sessions, and workspaces have been moved off the
+shared VM and onto one dedicated sandbox VM. Per-project containers and
+repository-scoped GitHub deploy keys remain documented future upgrades, not
+current requirements. See
 [`DEDICATED-SANDBOX-VM.md`](./DEDICATED-SANDBOX-VM.md).
 
 ## Tunnel key restriction

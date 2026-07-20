@@ -1,4 +1,4 @@
-# Production validation — 2026-07-20
+# Production validation — 2026-07-20 through 2026-07-21
 
 This record is intentionally sanitized: it contains no tokens, usernames,
 public addresses, private paths, model weights, or Telegram chat identifiers.
@@ -18,6 +18,14 @@ public addresses, private paths, model weights, or Telegram chat identifiers.
   capped at 1024: tool loops and later turns continue normally.
 - Automatic compaction begins at 110000 input tokens for the measured 163840-
   token Gemma slot.
+- Claw now runs on one dedicated, disposable, GPU-less sandbox VM. The Telegram
+  bot and Gemma inference remain on their existing hosts.
+- The VM has 8 vCPU, 16 GiB RAM, and a 250 GB SSD. It is configured to boot with
+  the hypervisor; its model tunnel, bridge, and reverse forward are enabled in
+  the guest.
+- The sandbox has public internet and noninteractive package-install ability,
+  but private-network egress is denied except for narrowly required tunnel and
+  management destinations. It has no GitHub write key.
 
 ## End-to-end results
 
@@ -31,10 +39,36 @@ public addresses, private paths, model weights, or Telegram chat identifiers.
 | Parallel resume | Both projects recalled their own distinct markers concurrently in 16.658 s; session IDs and files remained unchanged. |
 | Service health | Bridge active, model tunnel active, bridge restart count 0 after final code deployment. |
 | Lost CLI stdout recovery | If a resumed turn is persisted but its final JSON stdout is lost, the bridge returns the newly persisted assistant text instead of reporting a false failure. It never replays an unchanged older answer. |
+| Dedicated VM tool/install test | Claw fetched a public HTTPS endpoint, installed a harmless package through noninteractive `sudo`, executed it, and returned the expected marker. |
+| Migration integrity | Both real Telegram project session files matched the source SHA-256 hashes byte for byte; the original active project/session metadata was unchanged. |
+| VM reboot recovery | The model tunnel, bridge, and reverse forward automatically returned active with zero restarts; the Telegram host health check and bot recovered. |
+| Post-reboot resume | A marker was recalled after reboot and after the final RAM resize using the same session ID. |
+| Post-migration parallelism | Two projects completed simultaneously in 18.297 s wall time versus 36.400 s summed turn time, with distinct session IDs. |
+| Post-migration automatic OCR | A PNG attachment passed through the reverse-forwarded bridge, local OCR extracted the test number, and the agent returned that exact number. |
+| Network isolation | Public HTTPS remained usable; direct access from the sandbox to the old shared VM was blocked after the temporary migration rule and key were removed. |
 
 The OCR agent turn completed in 69.182 s on the deployed hardware. That test
 validates behavior, not a per-request latency target; the 1024-token completion
 cap and turn timeout bound pathological generation.
+
+## Dedicated VM capacity result
+
+The initially documented 32 GiB VM plan was rejected after measuring the
+selected 62 GiB hypervisor: together with the existing 32 GiB shared VM it
+would leave too little host headroom. A temporary 24 GiB validation profile
+worked, but still allowed an unsafe simultaneous worst case. The final 16 GiB
+limit leaves about 14 GiB, or 22%, outside the two VM limits. Immediately after
+the final boot the guest had about 15 GiB available and 239 GB disk free. The
+hypervisor SSD had 550 GB free. These figures are dated measurements, not a
+substitute for ongoing monitoring.
+
+The secondary GPU server was not selected: it has only a small CPU/RAM budget
+and should remain focused on inference. The sandbox VM resides on the primary
+server SSD; it has no GPU passthrough and therefore cannot consume model VRAM.
+
+The old shared-VM bridge and reverse-forward units remain disabled for rollback
+and are not in the live request path. The temporary migration SSH credential
+and private-network firewall exception have been removed.
 
 ## Incident: persisted turn with missing CLI stdout
 
@@ -75,4 +109,5 @@ cargo test -p runtime
 cargo test -p rusty-claude-cli
 python3 -m unittest discover -s integrations/telegram/tests -v
 systemd-analyze verify integrations/telegram/systemd/claw-telegram-bridge.service
+systemd-analyze verify integrations/telegram/systemd/gemma-api-tunnel.service
 ```
