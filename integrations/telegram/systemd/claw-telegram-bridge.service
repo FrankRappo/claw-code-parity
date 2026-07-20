@@ -23,7 +23,10 @@ ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
-ReadWritePaths=/home/clawrun/analise_storage/state /home/clawrun/analise_storage/telegram-projects /home/clawrun/.claw
+# The '-' prefix prevents a first-install namespace failure before the bridge
+# has created these writable directories. Deployment should still pre-create
+# and chown them as documented.
+ReadWritePaths=-/home/clawrun/analise_storage/state -/home/clawrun/analise_storage/telegram-projects -/home/clawrun/.claw
 
 [Install]
 WantedBy=multi-user.target

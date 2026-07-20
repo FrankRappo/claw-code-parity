@@ -11,7 +11,7 @@ deployment without adding a separate OCR menu.
 - **Close** stops the active project without deleting it.
 - **Projects** lists saved projects; `/project ID` opens one again.
 - A VM or bridge restart does not lose completed turns. The bridge restores the
-  stored Claw session ID on the next message.
+  exact stored Claw session file on the next message.
 
 Images and PDFs are attached to the active workspace. Images receive a Gemma
 Vision preprocessing pass. When the request asks to read text, numbers, errors,
@@ -41,10 +41,17 @@ claw --output-format json --resume SESSION prompt "continue the task"
 
 JSON output includes `session_id` and `session_path`. This makes completed
 project context recoverable after a process or server restart. The active model
-context is automatically compacted using
+context is automatically compacted before an oversized request using
 `CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS`; set the bridge's
 `CLAW_AUTO_COMPACT_INPUT_TOKENS` to roughly 65–70% of the verified Gemma context
 per slot.
+
+The measured Gemma deployment exposes two 163840-token slots and uses a 110000-
+token threshold. A project can continue through repeated compactions, but one
+model call can never exceed its physical slot. Compaction summarizes older
+completed turns, so exact verbatim details far back in the project should be
+written to project files when they must be preserved losslessly. An interrupted
+in-flight turn is not promised to persist; all previously completed turns do.
 
 The bridge example caps each individual model completion at 1024 tokens. This
 does not cap the project session and does not prevent multi-step tool loops; it
@@ -52,12 +59,45 @@ prevents a simple Telegram turn from spending minutes draining an unused 4096-
 token completion. Raise it explicitly for workloads that need longer single
 responses.
 
+The Gemma server profile, capacity measurements, rejected larger contexts, and
+ordinary Gemma Telegram bot are maintained in
+[`FrankRappo/gemma4-amd-vulkan-ops`](https://github.com/FrankRappo/gemma4-amd-vulkan-ops).
+
+## Install safely
+
+Create writable paths before starting the hardened unit. The unit also marks
+them optional in `ReadWritePaths`, preventing a first-install namespace failure
+if provisioning and service startup race.
+
+```bash
+sudo install -d -m 0700 -o clawrun -g clawrun \
+  /home/clawrun/analise_storage/state \
+  /home/clawrun/analise_storage/telegram-projects \
+  /home/clawrun/.claw
+sudo install -m 0600 -o root -g root \
+  claw-telegram-bridge.env /etc/claw-telegram-bridge.env
+sudo systemctl daemon-reload
+sudo systemctl enable --now claw-telegram-bridge.service
+```
+
+Validate the unit and service before exposing the reverse tunnel:
+
+```bash
+systemd-analyze verify integrations/telegram/systemd/claw-telegram-bridge.service
+systemctl show claw-telegram-bridge.service -p ActiveState -p NRestarts
+curl --fail --silent http://127.0.0.1:19090/health
+```
+
 ## Test
 
 ```bash
 cargo test -p rusty-claude-cli
 python3 -m unittest discover -s integrations/telegram/tests -v
 ```
+
+Production evidence for resume, restart recovery, stop, automatic OCR, and two
+parallel projects is recorded in
+[`PRODUCTION-VALIDATION.md`](./PRODUCTION-VALIDATION.md).
 
 ## Tunnel key restriction
 

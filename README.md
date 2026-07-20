@@ -38,6 +38,9 @@
 > context compaction, a configurable Gemma output limit, and a persisted
 > Telegram project bridge. See
 > [`integrations/telegram/README.md`](./integrations/telegram/README.md).
+> The matching two-GPU Gemma runtime configuration and ordinary Gemma Telegram
+> bot live separately in
+> [`FrankRappo/gemma4-amd-vulkan-ops`](https://github.com/FrankRappo/gemma4-amd-vulkan-ops).
 
 > Want the bigger idea behind this repo? Read [`PHILOSOPHY.md`](./PHILOSOPHY.md) and Sigrid Jin's public explanation: https://x.com/realsigridjin/status/2039472968624185713
 
