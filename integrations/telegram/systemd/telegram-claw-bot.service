@@ -1,0 +1,24 @@
+[Unit]
+Description=Telegram bot with Gemma Vision and persistent Claw projects
+After=network-online.target llm-srv1-forward.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tg-gemma-bot
+Group=tg-gemma-bot
+WorkingDirectory=/opt/tg-claw-bot
+EnvironmentFile=/etc/tg-claw-bot.env
+ExecStart=/usr/bin/python3 /opt/tg-claw-bot/telegram_claw_bot.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=15
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/tg-gemma-bot
+
+[Install]
+WantedBy=multi-user.target

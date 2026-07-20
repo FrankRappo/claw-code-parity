@@ -1,0 +1,29 @@
+[Unit]
+Description=Authenticated Telegram project bridge for Claw Code
+After=network-online.target gemma-api-tunnel.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=clawrun
+Group=clawrun
+WorkingDirectory=/home/clawrun/analise_storage
+EnvironmentFile=/etc/claw-telegram-bridge.env
+ExecStart=/usr/bin/python3 /home/clawrun/analise_storage/claw-code-parity/integrations/telegram/claw_project_bridge.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+KillMode=mixed
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/home/clawrun/analise_storage/state /home/clawrun/analise_storage/telegram-projects /home/clawrun/.claw
+
+[Install]
+WantedBy=multi-user.target

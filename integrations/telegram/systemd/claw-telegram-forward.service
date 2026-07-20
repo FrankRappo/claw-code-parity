@@ -1,0 +1,16 @@
+[Unit]
+Description=Reverse SSH tunnel from the Claw VM to the Telegram host
+After=network-online.target claw-telegram-bridge.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=clawrun
+Group=clawrun
+EnvironmentFile=/etc/claw-telegram-forward.env
+ExecStart=/usr/bin/ssh -NT -i ${IDENTITY_FILE} -o ExitOnForwardFailure=yes -o ServerAliveInterval=20 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=yes -R 127.0.0.1:${REMOTE_PORT}:127.0.0.1:${LOCAL_PORT} ${REMOTE_USER}@${REMOTE_HOST}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
