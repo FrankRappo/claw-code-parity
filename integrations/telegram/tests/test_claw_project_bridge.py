@@ -86,6 +86,8 @@ class RunnerTests(unittest.TestCase):
             self.assertNotIn("UNRELATED_SECRET", environment)
             self.assertEqual(environment["HOME"], "/home/clawrun")
             self.assertEqual(environment["GOOGLE_API_KEY"], "local-test")
+            self.assertEqual(environment["CLAW_SUBAGENT_MODEL"], "gemma4")
+            self.assertEqual(environment["CLAW_SUBAGENT_MAX_CONCURRENT"], "1")
 
     def test_first_turn_and_resume_commands(self):
         with tempfile.TemporaryDirectory() as directory:

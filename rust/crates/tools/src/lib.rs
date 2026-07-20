@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use api::{
@@ -3019,9 +3020,46 @@ fn resolve_skill_path(skill: &str) -> Result<std::path::PathBuf, String> {
 const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
 const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
+static ACTIVE_SUBAGENTS: AtomicUsize = AtomicUsize::new(0);
+
+struct ActiveSubagentPermit;
+
+impl ActiveSubagentPermit {
+    fn acquire() -> Result<Self, String> {
+        let limit = std::env::var("CLAW_SUBAGENT_MAX_CONCURRENT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(4)
+            .clamp(1, 16);
+        let mut active = ACTIVE_SUBAGENTS.load(Ordering::Acquire);
+        loop {
+            if active >= limit {
+                return Err(format!(
+                    "sub-agent concurrency limit reached ({active}/{limit}); wait for the running agent"
+                ));
+            }
+            match ACTIVE_SUBAGENTS.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(Self),
+                Err(current) => active = current,
+            }
+        }
+    }
+}
+
+impl Drop for ActiveSubagentPermit {
+    fn drop(&mut self) {
+        ACTIVE_SUBAGENTS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 fn execute_agent(input: AgentInput) -> Result<AgentOutput, String> {
-    execute_agent_with_spawn(input, spawn_agent_job)
+    let permit = ActiveSubagentPermit::acquire()?;
+    execute_agent_with_spawn(input, move |job| spawn_agent_job(job, permit))
 }
 
 fn execute_agent_with_spawn<F>(input: AgentInput, spawn_fn: F) -> Result<AgentOutput, String>
@@ -3103,11 +3141,12 @@ where
     Ok(manifest)
 }
 
-fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
+fn spawn_agent_job(job: AgentJob, permit: ActiveSubagentPermit) -> Result<(), String> {
     let thread_name = format!("clawd-agent-{}", job.manifest.agent_id);
     std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
+            let _permit = permit;
             let result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_agent_job(&job)));
             match result {
@@ -3180,8 +3219,14 @@ fn resolve_agent_model(model: Option<&str>) -> String {
     model
         .map(str::trim)
         .filter(|model| !model.is_empty())
-        .unwrap_or(DEFAULT_AGENT_MODEL)
-        .to_string()
+        .map(str::to_string)
+        .or_else(|| {
+            std::env::var("CLAW_SUBAGENT_MODEL")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| DEFAULT_AGENT_MODEL.to_string())
 }
 
 fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
@@ -4952,8 +4997,8 @@ mod tests {
         agent_permission_policy, allowed_tools_for_subagent, classify_lane_failure,
         execute_agent_with_spawn, execute_tool, final_assistant_text, mvp_tool_specs,
         permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
-        run_task_packet, AgentInput, AgentJob, GlobalToolRegistry, LaneEventName,
-        LaneFailureClass, SubagentToolExecutor,
+        resolve_agent_model, run_task_packet, AgentInput, AgentJob, GlobalToolRegistry,
+        LaneEventName, LaneFailureClass, SubagentToolExecutor,
     };
     use api::OutputContentBlock;
     use runtime::{
@@ -5817,6 +5862,20 @@ mod tests {
         let named_output: serde_json::Value = serde_json::from_str(&named).expect("valid json");
         assert_eq!(named_output["name"], "ship-audit");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn agent_model_uses_deployment_default_unless_explicitly_overridden() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("CLAW_SUBAGENT_MODEL", "gemma4");
+        assert_eq!(resolve_agent_model(None), "gemma4");
+        assert_eq!(
+            resolve_agent_model(Some("explicit-model")),
+            "explicit-model"
+        );
+        std::env::remove_var("CLAW_SUBAGENT_MODEL");
     }
 
     #[test]

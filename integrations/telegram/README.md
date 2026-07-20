@@ -35,6 +35,21 @@ transcript. The production dedicated-VM deployment intentionally overrides the
 permission mode to `danger-full-access` and permits `sudo`; the whole disposable
 VM, rather than the process sandbox, is the security boundary.
 
+The Telegram deployment is persistent but not a live terminal TTY. Every
+Telegram message starts or resumes one non-interactive Claw turn. In the
+dedicated VM, command approval is automatic because the whole disposable VM is
+the sandbox; `/permissions` explains the active policy and `/stop` interrupts a
+running process group. A future approval-button mode would require a separate
+asynchronous stdin/permission protocol and is not mixed with the current
+`danger-full-access` deployment.
+
+The top-level Claw session may use the `Agent` tool to launch one background
+sub-agent on the same Gemma deployment. The bridge injects `gemma4` as the
+sub-agent default and limits active sub-agents to one per top-level process.
+Sub-agents do not receive `Agent`, so recursion stops after one level. This
+matches the two available Gemma slots: parent plus one child. Other Telegram
+projects may still queue while both slots are occupied.
+
 ## Claw patch
 
 The CLI accepts a new non-interactive continuation form:
@@ -57,11 +72,13 @@ completed turns, so exact verbatim details far back in the project should be
 written to project files when they must be preserved losslessly. An interrupted
 in-flight turn is not promised to persist; all previously completed turns do.
 
-The bridge example caps each individual model completion at 1024 tokens. This
-does not cap the project session and does not prevent multi-step tool loops; it
-prevents a simple Telegram turn from spending minutes draining an unused 4096-
-token completion. Raise it explicitly for workloads that need longer single
-responses.
+The bridge caps each individual model completion at 4096 tokens. This does not
+cap the project session and does not prevent multi-step tool loops. Telegram
+responses are divided on paragraph/newline/word boundaries into ordered chunks
+of at most 3900 characters, with no character loss, for both ordinary Gemma and
+Claw. The ordinary Gemma default is also 4096 output tokens; `/tokens` may raise
+one chat to 8192. These are generation safety limits, not Telegram truncation:
+all text actually returned by the model is sent.
 
 The Gemma server profile, capacity measurements, rejected larger contexts, and
 ordinary Gemma Telegram bot are maintained in

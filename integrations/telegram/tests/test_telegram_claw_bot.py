@@ -206,6 +206,55 @@ class ExistingBotBehaviorTests(unittest.TestCase):
             bot.handle_message(message)
         self.assertIn("PNG/JPEG", send.call_args.args[1])
 
+    def test_long_response_is_sent_in_order_without_character_loss(self):
+        text = ("Первый абзац.\n" * 400) + ("X" * 4200) + "\nКонец"
+        with mock.patch.object(bot, "tg") as telegram:
+            bot.send_message(10, text, reply_to=30)
+
+        payloads = [call.args[1] for call in telegram.call_args_list]
+        self.assertGreater(len(payloads), 1)
+        self.assertEqual("".join(payload["text"] for payload in payloads), text)
+        self.assertTrue(all(len(payload["text"]) <= 3900 for payload in payloads))
+        self.assertEqual(payloads[0]["reply_parameters"], {"message_id": 30})
+        self.assertTrue(
+            all("reply_parameters" not in payload for payload in payloads[1:])
+        )
+        self.assertTrue(
+            all("reply_markup" not in payload for payload in payloads[:-1])
+        )
+        self.assertIn("reply_markup", payloads[-1])
+
+    def test_tokens_command_allows_long_multi_message_answers(self):
+        message = {
+            "chat": {"id": 10},
+            "from": {"id": 20},
+            "message_id": 30,
+            "text": "/tokens 999999",
+        }
+        with mock.patch.object(bot, "ALLOWED", set()), mock.patch.object(
+            bot,
+            "ALLOWED_USERNAMES",
+            set(),
+        ), mock.patch.object(bot, "send_message"):
+            bot.handle_message(message)
+        self.assertEqual(bot.chat_token_limit(10), bot.MAX_RESPONSE_TOKENS)
+
+    def test_permissions_command_explains_sandbox_auto_approval(self):
+        message = {
+            "chat": {"id": 10},
+            "from": {"id": 20},
+            "message_id": 30,
+            "text": "/permissions",
+        }
+        with mock.patch.object(bot, "ALLOWED", set()), mock.patch.object(
+            bot,
+            "ALLOWED_USERNAMES",
+            set(),
+        ), mock.patch.object(bot, "send_message") as send:
+            bot.handle_message(message)
+        self.assertIn("danger-full-access", send.call_args.args[1])
+        self.assertIn("автоматически", send.call_args.args[1])
+
 
 class MessageHandlingTests(unittest.TestCase):
     def setUp(self):

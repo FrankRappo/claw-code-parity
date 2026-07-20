@@ -33,7 +33,11 @@ ALLOWED_USERNAMES = {
     for value in os.environ.get("BOT_ALLOWED_USERNAMES", "").replace(",", " ").split()
     if value.strip()
 }
-MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "512"))
+MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "4096"))
+MAX_RESPONSE_TOKENS = max(
+    64,
+    int(os.environ.get("MAX_RESPONSE_TOKENS", "8192")),
+)
 TEMPERATURE = float(os.environ.get("TEMPERATURE", "1.0"))
 TOP_P = float(os.environ.get("TOP_P", "0.95"))
 TOP_K = int(os.environ.get("TOP_K", "64"))
@@ -112,7 +116,8 @@ COMMANDS = [
     {"command": "reset", "description": "Очистить историю текущего чата"},
     {"command": "status", "description": "Проверить LLM и настройки"},
     {"command": "bench", "description": "Бенчмарк генерации, например /bench 128"},
-    {"command": "tokens", "description": "Лимит ответа, например /tokens 512"},
+    {"command": "tokens", "description": "Лимит ответа, например /tokens 4096"},
+    {"command": "permissions", "description": "Права команд Claw в sandbox VM"},
     {"command": "whoami", "description": "Показать chat_id, user_id и username"},
     {"command": "gemma", "description": "Переключиться на обычный чат Gemma"},
     {"command": "claw", "description": "Переключиться на текущий проект Claw"},
@@ -160,17 +165,34 @@ def tg(method, payload=None, timeout=REQUEST_TIMEOUT):
     return http_json(f"{API}/{method}", payload or {}, timeout=timeout)
 
 
-def send_message(chat_id, text, reply_to=None, keyboard=True):
-    text = text or "(пустой ответ)"
+def split_telegram_text(text, limit=3900):
+    """Return every character in ordered Telegram-safe chunks."""
+
+    remaining = str(text or "(пустой ответ)")
     chunks = []
-    while text:
-        chunks.append(text[:3900])
-        text = text[3900:]
-    for part in chunks:
+    while len(remaining) > limit:
+        window = remaining[:limit]
+        split_at = -1
+        for separator in ("\n\n", "\n", " "):
+            candidate = window.rfind(separator, limit // 2)
+            if candidate >= 0:
+                split_at = candidate + len(separator)
+                break
+        if split_at <= 0:
+            split_at = limit
+        chunks.append(remaining[:split_at])
+        remaining = remaining[split_at:]
+    chunks.append(remaining)
+    return chunks
+
+
+def send_message(chat_id, text, reply_to=None, keyboard=True):
+    chunks = split_telegram_text(text)
+    for index, part in enumerate(chunks):
         payload = {"chat_id": chat_id, "text": part, "disable_web_page_preview": True}
-        if reply_to:
+        if reply_to and index == 0:
             payload["reply_parameters"] = {"message_id": reply_to}
-        if keyboard:
+        if keyboard and index == len(chunks) - 1:
             payload["reply_markup"] = main_keyboard()
         tg("sendMessage", payload, timeout=60)
 
@@ -609,7 +631,10 @@ def claw_status_text(chat_id):
         f"Claw: {'выполняет задачу' if response.get('running') else 'готов'}\n"
         f"Проект: {project_text}\n"
         f"Auto-compact: {response.get('auto_compact_input_tokens')} input tokens\n"
-        f"Parallel turns: {response.get('max_concurrent')}"
+        f"Parallel turns: {response.get('max_concurrent')}\n"
+        f"Agents: {'включены (один уровень)' if response.get('agents_enabled') else 'выключены'}\n"
+        f"Permissions: {response.get('permission_mode') or '?'}\n"
+        f"Max output/call: {response.get('gemma_max_output_tokens') or '?'} tokens"
     )
 
 
@@ -718,7 +743,9 @@ def handle_message(message):
             "сессии после перезапуска.\n\n"
             "Фото/PNG/JPEG можно просто пересылать в оба режима. В Claw также "
             "поддерживается PDF; OCR запускается агентом автоматически при необходимости, "
-            "отдельного OCR-меню нет.\n\n" + commands_text(),
+            "отдельного OCR-меню нет. Длинные ответы Gemma и Claw автоматически "
+            "приходят несколькими сообщениями без обрезания. Claw может запустить "
+            "одного фонового агента внутри текущего задания.\n\n" + commands_text(),
             reply_to=message_id,
         )
         return
@@ -832,12 +859,23 @@ def handle_message(message):
         )
         return
     if text.startswith("/tokens"):
-        limit = max(64, min(parse_int_arg(text, MAX_TOKENS), 2048))
+        limit = max(64, min(parse_int_arg(text, MAX_TOKENS), MAX_RESPONSE_TOKENS))
         with STATE_LOCK:
             TOKEN_LIMITS[chat_id] = limit
         send_message(
             chat_id,
             f"Лимит ответа для этого чата: {limit} tokens. Для скорости: /bench {min(limit, 512)}",
+            reply_to=message_id,
+        )
+        return
+    if text.startswith("/permissions"):
+        send_message(
+            chat_id,
+            "Claw работает внутри отдельной одноразовой VM в режиме "
+            "danger-full-access: команды и установка пакетов выполняются автоматически, "
+            "без промежуточного подтверждения в Telegram. Остановить текущую операцию "
+            "можно кнопкой «⛔ Остановить Claw» или /stop. Доступа к VM120, "
+            "гипервизору, Telegram-токену и GitHub write-ключу у агента нет.",
             reply_to=message_id,
         )
         return

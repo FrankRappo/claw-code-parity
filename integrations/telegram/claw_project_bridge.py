@@ -134,7 +134,7 @@ class BridgeConfig:
             ),
             gemma_api_key=os.environ.get("GOOGLE_API_KEY", "local-gemma"),
             gemma_max_output_tokens=max(
-                1, int(os.environ.get("CLAW_GEMMA_MAX_OUTPUT_TOKENS", "1024"))
+                1, int(os.environ.get("CLAW_GEMMA_MAX_OUTPUT_TOKENS", "4096"))
             ),
             ocr_timeout=max(10, int(os.environ.get("CLAW_OCR_TIMEOUT", "180"))),
             ocr_languages=os.environ.get("CLAW_OCR_LANGUAGES", "rus+eng"),
@@ -358,6 +358,11 @@ class ClawRunner:
                 "CLAW_GEMMA_MAX_OUTPUT_TOKENS": str(
                     self.config.gemma_max_output_tokens
                 ),
+                "CLAW_SUBAGENT_MODEL": self.config.model,
+                # The Agent tool is deliberately one level deep: sub-agents do
+                # not receive Agent themselves. One child is the safe operating
+                # target for the two-slot Gemma deployment.
+                "CLAW_SUBAGENT_MAX_CONCURRENT": "1",
                 "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS": str(
                     self.config.auto_compact_input_tokens
                 ),
@@ -872,6 +877,10 @@ def make_handler(application: BridgeApplication):
                         "project": public_project(project) if project else None,
                         "auto_compact_input_tokens": application.config.auto_compact_input_tokens,
                         "max_concurrent": application.config.max_concurrent,
+                        "permission_mode": application.config.permission_mode,
+                        "agents_enabled": "agent"
+                        in application.config.allowed_tools.casefold(),
+                        "gemma_max_output_tokens": application.config.gemma_max_output_tokens,
                     }
                 else:
                     raise BridgeError("not found", HTTPStatus.NOT_FOUND)
