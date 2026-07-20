@@ -36,6 +36,23 @@ The OCR agent turn completed in 69.182 s on the deployed hardware. That test
 validates behavior, not a per-request latency target; the 1024-token completion
 cap and turn timeout bound pathological generation.
 
+## Incident: persisted turn with missing CLI stdout
+
+On 2026-07-21 Telegram reported `Claw returned no JSON result` for one resumed
+turn. The bot, bridge, model tunnel, and model endpoint remained healthy with
+zero service restarts. Claw exited successfully and the exact session file
+contained the new user turn, tool result, and a non-empty final assistant
+message, proving that execution and persistence completed before the bridge
+lost the CLI result. The low-level stdout-loss trigger was intermittent and did
+not reproduce on an isolated resume probe.
+
+The bridge now snapshots the exact session before each resumed turn. If CLI
+stdout contains no result but that invocation added a new persisted assistant
+record, the bridge returns that new record. A timestamp-only change or an
+unchanged tail is rejected, so an older answer cannot be replayed as the result
+of a new request. Regression tests cover both recovery and the no-replay guard;
+the deployed live smoke test returned a marker and session metadata normally.
+
 ## Context behavior
 
 The model server has two 163840-token slots. Claw compacts before a request
