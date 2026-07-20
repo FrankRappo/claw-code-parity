@@ -74,10 +74,16 @@ class RunnerTests(unittest.TestCase):
             first = runner._command(project, "hello")
             self.assertEqual(first[-2:], ["prompt", "hello"])
             resumed = runner._command(
-                {"workspace": str(root), "session_id": "session-42"}, "continue"
+                {
+                    "workspace": str(root),
+                    "session_id": "session-42",
+                    "session_path": "/sessions/session-42.jsonl",
+                },
+                "continue",
             )
             self.assertEqual(
-                resumed[-4:], ["--resume", "session-42", "prompt", "continue"]
+                resumed[-4:],
+                ["--resume", "/sessions/session-42.jsonl", "prompt", "continue"],
             )
             self.assertIn("workspace-write", resumed)
 

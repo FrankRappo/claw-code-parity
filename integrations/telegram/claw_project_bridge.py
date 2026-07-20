@@ -312,7 +312,11 @@ class ClawRunner:
             self.config.allowed_tools,
         ]
         if project.get("session_id"):
-            command.extend(["--resume", project["session_id"], "prompt", prompt])
+            # Prefer the exact persisted file. This remains unambiguous even
+            # for sessions created by older Claw builds whose process-local ID
+            # counters could collide across simultaneous worker processes.
+            reference = project.get("session_path") or project["session_id"]
+            command.extend(["--resume", reference, "prompt", prompt])
         else:
             command.extend(["prompt", prompt])
         return command

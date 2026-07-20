@@ -845,8 +845,11 @@ fn current_time_millis() -> u64 {
 
 fn generate_session_id() -> String {
     let millis = current_time_millis();
+    let process_id = std::process::id();
     let counter = SESSION_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("session-{millis}-{counter}")
+    // The counter is process-local. Include the PID so two bridge workers
+    // starting in the same millisecond cannot create the same session ID.
+    format!("session-{millis}-{process_id}-{counter}")
 }
 
 fn write_atomic(path: &Path, contents: &str) -> Result<(), SessionError> {
@@ -932,14 +935,21 @@ fn cleanup_rotated_logs(path: &Path) -> Result<(), SessionError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        cleanup_rotated_logs, rotate_session_file_if_needed, ContentBlock, ConversationMessage,
-        MessageRole, Session, SessionFork,
+        cleanup_rotated_logs, generate_session_id, rotate_session_file_if_needed, ContentBlock,
+        ConversationMessage, MessageRole, Session, SessionFork,
     };
     use crate::json::JsonValue;
     use crate::usage::TokenUsage;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn generated_session_id_includes_process_identity() {
+        let session_id = generate_session_id();
+        assert!(session_id.starts_with("session-"));
+        assert!(session_id.contains(&format!("-{}-", std::process::id())));
+    }
 
     #[test]
     fn persists_and_restores_session_jsonl() {
