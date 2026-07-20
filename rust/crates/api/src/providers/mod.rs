@@ -377,7 +377,13 @@ pub fn max_tokens_for_model(model: &str) -> u32 {
     }
     // Gemma 4 models: outputTokenLimit = 32 768 (from API)
     if canonical.starts_with("gemma-4") {
-        return 32_000;
+        // Local Gemma is used as an autonomous tool agent. Keep per-turn output
+        // bounded so long-running tasks do not spend minutes draining an unused
+        // 32k-token completion budget. Operators can override this explicitly.
+        return std::env::var("CLAW_GEMMA_MAX_OUTPUT_TOKENS")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(4_096);
     }
     if canonical.contains("opus") {
         32_000

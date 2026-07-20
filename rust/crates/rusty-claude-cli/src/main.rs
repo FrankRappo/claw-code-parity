@@ -114,6 +114,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             session_path,
             commands,
         } => resume_session(&session_path, &commands),
+        CliAction::ResumePrompt {
+            session_path,
+            prompt,
+            model,
+            output_format,
+            allowed_tools,
+            permission_mode,
+        } => LiveCli::from_saved_session(&session_path, model, allowed_tools, permission_mode)?
+            .run_turn_with_output(&prompt, output_format)?,
         CliAction::Status {
             model,
             permission_mode,
@@ -164,6 +173,14 @@ enum CliAction {
     ResumeSession {
         session_path: PathBuf,
         commands: Vec<String>,
+    },
+    ResumePrompt {
+        session_path: PathBuf,
+        prompt: String,
+        model: String,
+        output_format: CliOutputFormat,
+        allowed_tools: Option<AllowedToolSet>,
+        permission_mode: PermissionMode,
     },
     Status {
         model: String,
@@ -340,14 +357,20 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             permission_mode,
         });
     }
+    let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
+
     if rest.first().map(String::as_str) == Some("--resume") {
-        return parse_resume_args(&rest[1..]);
+        return parse_resume_args(
+            &rest[1..],
+            &model,
+            output_format,
+            allowed_tools,
+            permission_mode,
+        );
     }
     if let Some(action) = parse_single_word_command_alias(&rest, &model, permission_mode_override) {
         return action;
     }
-
-    let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
 
     match rest[0].as_str() {
         "dump-manifests" => Ok(CliAction::DumpManifests),
@@ -728,7 +751,13 @@ fn parse_branch_args(args: &[String]) -> Result<CliAction, String> {
     }
 }
 
-fn parse_resume_args(args: &[String]) -> Result<CliAction, String> {
+fn parse_resume_args(
+    args: &[String],
+    model: &str,
+    output_format: CliOutputFormat,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
+) -> Result<CliAction, String> {
     let (session_path, command_tokens): (PathBuf, &[String]) = match args.first() {
         None => (PathBuf::from(LATEST_SESSION_REFERENCE), &[]),
         Some(first) if looks_like_slash_command_token(first) => {
@@ -736,6 +765,22 @@ fn parse_resume_args(args: &[String]) -> Result<CliAction, String> {
         }
         Some(first) => (PathBuf::from(first), &args[1..]),
     };
+
+    if command_tokens.first().map(String::as_str) == Some("prompt") {
+        let prompt = command_tokens[1..].join(" ");
+        if prompt.trim().is_empty() {
+            return Err("--resume prompt requires a prompt string".to_string());
+        }
+        return Ok(CliAction::ResumePrompt {
+            session_path,
+            prompt,
+            model: resolve_model_alias(model).to_string(),
+            output_format,
+            allowed_tools,
+            permission_mode,
+        });
+    }
+
     let mut commands = Vec::new();
     let mut current_command = String::new();
 
@@ -2348,6 +2393,44 @@ impl LiveCli {
         Ok(cli)
     }
 
+    fn from_saved_session(
+        session_path: &Path,
+        model: String,
+        allowed_tools: Option<AllowedToolSet>,
+        permission_mode: PermissionMode,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let resolved_path = if session_path.exists() {
+            session_path.to_path_buf()
+        } else {
+            resolve_session_reference(&session_path.display().to_string())?.path
+        };
+        let system_prompt = build_system_prompt()?;
+        let session_state = Session::load_from_path(&resolved_path)?;
+        let session = SessionHandle {
+            id: session_state.session_id.clone(),
+            path: resolved_path,
+        };
+        let runtime = build_runtime(
+            session_state.with_persistence_path(session.path.clone()),
+            &session.id,
+            model.clone(),
+            system_prompt.clone(),
+            true,
+            false,
+            allowed_tools.clone(),
+            permission_mode,
+            None,
+        )?;
+        Ok(Self {
+            model,
+            allowed_tools,
+            permission_mode,
+            system_prompt,
+            runtime,
+            session,
+        })
+    }
+
     fn startup_banner(&self) -> String {
         let cwd = env::current_dir().map_or_else(
             |_| "<unknown>".to_string(),
@@ -2497,6 +2580,8 @@ impl LiveCli {
             json!({
                 "message": final_assistant_text(&summary),
                 "model": self.model,
+                "session_id": self.session.id,
+                "session_path": self.session.path,
                 "iterations": summary.iterations,
                 "auto_compaction": summary.auto_compaction.map(|event| json!({
                     "removed_messages": event.removed_message_count,
@@ -6102,6 +6187,14 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "      Shorthand non-interactive prompt mode")?;
     writeln!(
         out,
+        "  claw --resume SESSION [--output-format text|json] prompt TEXT"
+    )?;
+    writeln!(
+        out,
+        "      Continue a saved session with one non-interactive turn"
+    )?;
+    writeln!(
+        out,
         "  claw --resume [SESSION.jsonl|session-id|latest] [/status] [/compact] [...]"
     )?;
     writeln!(
@@ -6808,6 +6901,43 @@ mod tests {
             CliAction::ResumeSession {
                 session_path: PathBuf::from("session.jsonl"),
                 commands: vec!["/compact".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_resume_prompt_with_runtime_flags() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec![
+            "--model".to_string(),
+            "gemma4".to_string(),
+            "--output-format".to_string(),
+            "json".to_string(),
+            "--permission-mode".to_string(),
+            "workspace-write".to_string(),
+            "--allowedTools".to_string(),
+            "read,write,bash".to_string(),
+            "--resume".to_string(),
+            "session-123".to_string(),
+            "prompt".to_string(),
+            "continue".to_string(),
+            "the task".to_string(),
+        ];
+        assert_eq!(
+            parse_args(&args).expect("resume prompt should parse"),
+            CliAction::ResumePrompt {
+                session_path: PathBuf::from("session-123"),
+                prompt: "continue the task".to_string(),
+                model: "gemma-4-31b-it".to_string(),
+                output_format: CliOutputFormat::Json,
+                allowed_tools: Some(
+                    ["bash", "read_file", "write_file"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                ),
+                permission_mode: PermissionMode::WorkspaceWrite,
             }
         );
     }

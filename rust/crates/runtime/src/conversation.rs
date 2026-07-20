@@ -300,6 +300,10 @@ where
     ) -> Result<TurnSummary, RuntimeError> {
         let user_input = user_input.into();
         self.record_turn_started(&user_input);
+        // Compact before the request as well as after it. The previous
+        // post-turn-only behavior could submit an oversized request when the
+        // provider context was smaller than the default compaction threshold.
+        let pre_turn_auto_compaction = self.maybe_auto_compact_before_turn(&user_input);
         self.session
             .push_user_text(user_input)
             .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -469,7 +473,7 @@ where
             }
         }
 
-        let auto_compaction = self.maybe_auto_compact();
+        let auto_compaction = pre_turn_auto_compaction.or_else(|| self.maybe_auto_compact());
 
         let summary = TurnSummary {
             assistant_messages,
@@ -533,6 +537,35 @@ where
             return None;
         }
 
+        self.session = result.compacted_session;
+        Some(AutoCompactionEvent {
+            removed_message_count: result.removed_message_count,
+        })
+    }
+
+    fn maybe_auto_compact_before_turn(&mut self, user_input: &str) -> Option<AutoCompactionEvent> {
+        let mut pending_session = self.session.clone();
+        // Directly extend the in-memory clone so its configured persistence
+        // path is never touched during estimation.
+        pending_session
+            .messages
+            .push(ConversationMessage::user_text(user_input));
+        if estimate_session_tokens(&pending_session)
+            < self.auto_compaction_input_tokens_threshold as usize
+        {
+            return None;
+        }
+
+        let result = compact_session(
+            &self.session,
+            CompactionConfig {
+                max_estimated_tokens: 0,
+                ..CompactionConfig::default()
+            },
+        );
+        if result.removed_message_count == 0 {
+            return None;
+        }
         self.session = result.compacted_session;
         Some(AutoCompactionEvent {
             removed_message_count: result.removed_message_count,
@@ -1516,6 +1549,62 @@ mod tests {
             })
         );
         assert_eq!(runtime.session().messages[0].role, MessageRole::System);
+    }
+
+    #[test]
+    fn compacts_before_submitting_a_request_that_crosses_threshold() {
+        struct InspectApi;
+        impl ApiClient for InspectApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                assert_eq!(request.messages[0].role, MessageRole::System);
+                assert!(request
+                    .messages
+                    .last()
+                    .is_some_and(|message| message.role == MessageRole::User));
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::Usage(TokenUsage {
+                        input_tokens: 20,
+                        output_tokens: 4,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    }),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut session = Session::new();
+        for index in 0..6 {
+            session.messages.push(if index % 2 == 0 {
+                crate::session::ConversationMessage::user_text(format!(
+                    "old user message {index} with enough text"
+                ))
+            } else {
+                crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: format!("old assistant message {index} with enough text"),
+                }])
+            });
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            InspectApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(20);
+
+        let summary = runtime
+            .run_turn("new request", None)
+            .expect("turn should succeed after pre-turn compaction");
+        assert_eq!(
+            summary.auto_compaction,
+            Some(AutoCompactionEvent {
+                removed_message_count: 2,
+            })
+        );
     }
 
     #[test]
