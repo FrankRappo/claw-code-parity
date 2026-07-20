@@ -66,6 +66,27 @@ class ProjectStoreTests(unittest.TestCase):
 
 
 class RunnerTests(unittest.TestCase):
+    def test_agent_environment_excludes_bridge_credentials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner = bridge.ClawRunner(test_config(root))
+            with mock.patch.dict(
+                bridge.os.environ,
+                {
+                    "PATH": "/usr/bin:/bin",
+                    "HOME": "/home/clawrun",
+                    "CLAW_BRIDGE_TOKEN": "must-not-leak",
+                    "UNRELATED_SECRET": "must-not-leak",
+                },
+                clear=True,
+            ):
+                environment = runner._agent_environment()
+
+            self.assertNotIn("CLAW_BRIDGE_TOKEN", environment)
+            self.assertNotIn("UNRELATED_SECRET", environment)
+            self.assertEqual(environment["HOME"], "/home/clawrun")
+            self.assertEqual(environment["GOOGLE_API_KEY"], "local-test")
+
     def test_first_turn_and_resume_commands(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

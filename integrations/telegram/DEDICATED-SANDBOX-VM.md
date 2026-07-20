@@ -93,9 +93,9 @@ Telegram host reaches it only through the restricted reverse SSH forward. The
 Gemma API is exposed to the sandbox only through a localhost tunnel; it is not
 opened publicly.
 
-Before broad package-install permission is enabled, the bridge should start
-the agent with an explicit environment allowlist so bridge credentials are not
-inherited by Claw or exposed to its shell tools.
+Before broad package-install permission is enabled, the bridge starts the agent
+with an explicit environment allowlist so bridge credentials are not inherited
+by Claw or exposed directly to its shell tools.
 
 ## Storage and session compatibility
 

@@ -322,6 +322,49 @@ class ClawRunner:
             command.extend(["prompt", prompt])
         return command
 
+    def _agent_environment(self) -> dict[str, str]:
+        """Build a minimal child environment without bridge credentials."""
+
+        environment = {
+            key: value
+            for key in (
+                "HOME",
+                "USER",
+                "LOGNAME",
+                "SHELL",
+                "PATH",
+                "LANG",
+                "LC_ALL",
+                "LC_CTYPE",
+                "TZ",
+                "TMPDIR",
+                "XDG_CONFIG_HOME",
+                "XDG_CACHE_HOME",
+                "SSL_CERT_FILE",
+                "SSL_CERT_DIR",
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "NO_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "no_proxy",
+            )
+            if (value := os.environ.get(key))
+        }
+        environment.update(
+            {
+                "GOOGLE_BASE_URL": self.config.gemma_base_url,
+                "GOOGLE_API_KEY": self.config.gemma_api_key,
+                "CLAW_GEMMA_MAX_OUTPUT_TOKENS": str(
+                    self.config.gemma_max_output_tokens
+                ),
+                "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS": str(
+                    self.config.auto_compact_input_tokens
+                ),
+            }
+        )
+        return environment
+
     @staticmethod
     def _session_signature(
         project: dict[str, Any],
@@ -411,19 +454,7 @@ class ClawRunner:
         if not self.config.claw_binary.is_file():
             raise BridgeError("Claw binary is unavailable", HTTPStatus.SERVICE_UNAVAILABLE)
         session_before = self._session_signature(project)
-        environment = os.environ.copy()
-        environment.update(
-            {
-                "GOOGLE_BASE_URL": self.config.gemma_base_url,
-                "GOOGLE_API_KEY": self.config.gemma_api_key,
-                "CLAW_GEMMA_MAX_OUTPUT_TOKENS": str(
-                    self.config.gemma_max_output_tokens
-                ),
-                "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS": str(
-                    self.config.auto_compact_input_tokens
-                ),
-            }
-        )
+        environment = self._agent_environment()
         with self._capacity:
             process = subprocess.Popen(
                 self._command(project, prompt),
