@@ -46,6 +46,12 @@ context is automatically compacted using
 `CLAW_AUTO_COMPACT_INPUT_TOKENS` to roughly 65–70% of the verified Gemma context
 per slot.
 
+The bridge example caps each individual model completion at 1024 tokens. This
+does not cap the project session and does not prevent multi-step tool loops; it
+prevents a simple Telegram turn from spending minutes draining an unused 4096-
+token completion. Raise it explicitly for workloads that need longer single
+responses.
+
 ## Test
 
 ```bash

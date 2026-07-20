@@ -133,7 +133,7 @@ class BridgeConfig:
             ),
             gemma_api_key=os.environ.get("GOOGLE_API_KEY", "local-gemma"),
             gemma_max_output_tokens=max(
-                1, int(os.environ.get("CLAW_GEMMA_MAX_OUTPUT_TOKENS", "4096"))
+                1, int(os.environ.get("CLAW_GEMMA_MAX_OUTPUT_TOKENS", "1024"))
             ),
             ocr_timeout=max(10, int(os.environ.get("CLAW_OCR_TIMEOUT", "180"))),
             ocr_languages=os.environ.get("CLAW_OCR_LANGUAGES", "rus+eng"),
