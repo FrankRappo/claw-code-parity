@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::fs;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -16,13 +17,16 @@ use super::{Provider, ProviderFuture};
 
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
-pub const DEFAULT_GOOGLE_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/openai/";
+pub const DEFAULT_GOOGLE_BASE_URL: &str =
+    "https://generativelanguage.googleapis.com/v1beta/openai/";
 pub const DEFAULT_GROQ_BASE_URL: &str = "https://api.groq.com/openai/v1";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
 const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(2);
 const DEFAULT_MAX_RETRIES: u32 = 2;
+const CLAW_SYSTEM_PROMPT_ENV: &str = "CLAW_SYSTEM_PROMPT";
+const CLAW_SYSTEM_PROMPT_FILE_ENV: &str = "CLAW_SYSTEM_PROMPT_FILE";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenAiCompatConfig {
@@ -670,7 +674,7 @@ struct ErrorBody {
 
 fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatConfig) -> Value {
     let mut messages = Vec::new();
-    if let Some(system) = request.system.as_ref().filter(|value| !value.is_empty()) {
+    if let Some(system) = effective_system_prompt(request.system.as_deref()) {
         messages.push(json!({
             "role": "system",
             "content": system,
@@ -700,6 +704,39 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
     }
 
     payload
+}
+
+fn effective_system_prompt(request_system: Option<&str>) -> Option<String> {
+    let request_system = request_system
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let injected_system = injected_system_prompt();
+
+    match (injected_system, request_system) {
+        (Some(injected), Some(request)) => Some(format!("{injected}\n\n{request}")),
+        (Some(injected), None) => Some(injected),
+        (None, Some(request)) => Some(request.to_string()),
+        (None, None) => None,
+    }
+}
+
+fn injected_system_prompt() -> Option<String> {
+    if let Ok(path) = std::env::var(CLAW_SYSTEM_PROMPT_FILE_ENV) {
+        let path = path.trim();
+        if !path.is_empty() {
+            if let Ok(value) = fs::read_to_string(path) {
+                let value = value.trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+
+    std::env::var(CLAW_SYSTEM_PROMPT_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn translate_message(message: &InputMessage) -> Vec<Value> {
@@ -808,9 +845,7 @@ fn normalize_response(
         content.push(OutputContentBlock::Text { text });
     }
     for (idx, tool_call) in choice.message.tool_calls.into_iter().enumerate() {
-        let id = tool_call
-            .id
-            .unwrap_or_else(|| format!("tool_call_{idx}"));
+        let id = tool_call.id.unwrap_or_else(|| format!("tool_call_{idx}"));
         content.push(OutputContentBlock::ToolUse {
             id,
             name: tool_call.function.name,
@@ -993,6 +1028,7 @@ mod tests {
         ToolResultContentBlock,
     };
     use serde_json::json;
+    use std::fs;
     use std::sync::{Mutex, OnceLock};
 
     #[test]
@@ -1033,6 +1069,77 @@ mod tests {
         assert_eq!(payload["messages"][2]["role"], json!("tool"));
         assert_eq!(payload["tools"][0]["type"], json!("function"));
         assert_eq!(payload["tool_choice"], json!("auto"));
+    }
+
+    #[test]
+    fn injected_system_prompt_env_is_prepended_to_request_system() {
+        let _lock = env_lock();
+        std::env::set_var("CLAW_SYSTEM_PROMPT", "deployment persona");
+        std::env::remove_var("CLAW_SYSTEM_PROMPT_FILE");
+
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "gemma4".to_string(),
+                max_tokens: 64,
+                messages: vec![InputMessage::user_text("hello")],
+                system: Some("Claw tool instructions".to_string()),
+                tools: None,
+                tool_choice: None,
+                stream: false,
+            },
+            OpenAiCompatConfig::google(),
+        );
+
+        assert_eq!(payload["messages"][0]["role"], json!("system"));
+        assert_eq!(
+            payload["messages"][0]["content"],
+            json!("deployment persona\n\nClaw tool instructions")
+        );
+        assert_eq!(payload["messages"][1]["role"], json!("user"));
+
+        std::env::remove_var("CLAW_SYSTEM_PROMPT");
+    }
+
+    #[test]
+    fn injected_system_prompt_file_is_preferred_and_hot_reloaded() {
+        let _lock = env_lock();
+        let path = std::env::temp_dir().join(format!(
+            "claw-system-prompt-{}-{}.txt",
+            std::process::id(),
+            unique_test_suffix()
+        ));
+        fs::write(&path, "file persona v1").expect("write prompt v1");
+        std::env::set_var("CLAW_SYSTEM_PROMPT_FILE", &path);
+        std::env::set_var("CLAW_SYSTEM_PROMPT", "fallback persona");
+
+        let make_payload = || {
+            build_chat_completion_request(
+                &MessageRequest {
+                    model: "gemma4".to_string(),
+                    max_tokens: 64,
+                    messages: vec![InputMessage::user_text("hello")],
+                    system: None,
+                    tools: None,
+                    tool_choice: None,
+                    stream: false,
+                },
+                OpenAiCompatConfig::google(),
+            )
+        };
+
+        assert_eq!(
+            make_payload()["messages"][0]["content"],
+            json!("file persona v1")
+        );
+        fs::write(&path, "file persona v2").expect("write prompt v2");
+        assert_eq!(
+            make_payload()["messages"][0]["content"],
+            json!("file persona v2")
+        );
+
+        std::env::remove_var("CLAW_SYSTEM_PROMPT_FILE");
+        std::env::remove_var("CLAW_SYSTEM_PROMPT");
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -1127,6 +1234,13 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
             .expect("env lock")
+    }
+
+    fn unique_test_suffix() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos()
     }
 
     #[test]

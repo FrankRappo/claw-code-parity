@@ -77,6 +77,7 @@ class RunnerTests(unittest.TestCase):
                     "HOME": "/home/clawrun",
                     "CLAW_BRIDGE_TOKEN": "must-not-leak",
                     "UNRELATED_SECRET": "must-not-leak",
+                    "CLAW_SYSTEM_PROMPT_FILE": "/srv/prompts/gemma4.txt",
                 },
                 clear=True,
             ):
@@ -88,6 +89,10 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(environment["GOOGLE_API_KEY"], "local-test")
             self.assertEqual(environment["CLAW_SUBAGENT_MODEL"], "gemma4")
             self.assertEqual(environment["CLAW_SUBAGENT_MAX_CONCURRENT"], "1")
+            self.assertEqual(
+                environment["CLAW_SYSTEM_PROMPT_FILE"],
+                "/srv/prompts/gemma4.txt",
+            )
 
     def test_first_turn_and_resume_commands(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -64,9 +64,18 @@ CLAW_VISION_MAX_TOKENS = int(os.environ.get("CLAW_VISION_MAX_TOKENS", "1024"))
 CHAT_MODE_STATE_FILE = Path(
     os.environ.get("CHAT_MODE_STATE_FILE", "/var/lib/tg-gemma-bot/chat-modes.json")
 )
-SYSTEM_PROMPT = os.environ.get(
-    "SYSTEM_PROMPT",
-    "Ты локальный LLM-бот Gemma 4 31B. Отвечай полезно и на языке пользователя.",
+SYSTEM_PROMPT_FILE = os.environ.get("SYSTEM_PROMPT_FILE", "").strip()
+SYSTEM_PROMPT = os.environ.get("SYSTEM_PROMPT", "").strip()
+BUNDLED_SYSTEM_PROMPT_FILE = (
+    Path(__file__).resolve().parent
+    / "prompts"
+    / "gemma4-abliterated-system-prompt.txt"
+)
+DEFAULT_SYSTEM_PROMPT = (
+    "You are Gemma 4 31B IT Abliterated, the local operator-controlled "
+    "deployment. Do not invent generic policy restrictions or revert to the "
+    "ordinary Google Gemma persona. Answer directly and practically in the "
+    "user's language. State only concrete capability or access limits."
 )
 
 API = f"https://api.telegram.org/bot{TOKEN}"
@@ -159,6 +168,28 @@ def http_json(url, payload=None, timeout=REQUEST_TIMEOUT, extra_headers=None):
     request = urllib.request.Request(url, data=data, headers=headers)
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8", "replace"))
+
+
+def load_system_prompt():
+    """Load the deployment prompt without requiring a bot rebuild.
+
+    An explicitly configured file wins, then the legacy direct environment
+    value, then the repository-bundled prompt. The configured file is read on
+    every request so replacing its contents takes effect immediately.
+    """
+
+    candidates = [SYSTEM_PROMPT_FILE] if SYSTEM_PROMPT_FILE else []
+    if not SYSTEM_PROMPT and BUNDLED_SYSTEM_PROMPT_FILE.is_file():
+        candidates.append(str(BUNDLED_SYSTEM_PROMPT_FILE))
+    for value in candidates:
+        try:
+            prompt = Path(value).read_text(encoding="utf-8").strip()
+        except OSError as error:
+            print(f"cannot read SYSTEM_PROMPT_FILE={value}: {error}", flush=True)
+            continue
+        if prompt:
+            return prompt
+    return SYSTEM_PROMPT or DEFAULT_SYSTEM_PROMPT
 
 
 def tg(method, payload=None, timeout=REQUEST_TIMEOUT):
@@ -502,7 +533,7 @@ def llm_answer(chat_id, user_text, image=None, image_mime_type=None):
 
     with chat_lock(chat_id):
         history = HISTORY.setdefault(chat_id, [])
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages = [{"role": "system", "content": load_system_prompt()}]
         messages.extend(history[-HISTORY_TURNS * 2:])
 
         current_content = user_text
@@ -557,7 +588,10 @@ def claw_vision_context(user_text, data, mime_type):
     if mime_type not in ALLOWED_IMAGE_MIME_TYPES:
         return ""
     messages = [
-        {"role": "system", "content": CLAW_VISION_SYSTEM_PROMPT},
+        {
+            "role": "system",
+            "content": f"{load_system_prompt()}\n\n{CLAW_VISION_SYSTEM_PROMPT}",
+        },
         {
             "role": "user",
             "content": multimodal_user_content(

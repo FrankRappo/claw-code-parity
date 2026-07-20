@@ -348,6 +348,11 @@ class ClawRunner:
                 "http_proxy",
                 "https_proxy",
                 "no_proxy",
+                # Deployment persona is intentionally inherited by the Claw
+                # process and every built-in Agent child. The file contains no
+                # credentials and is read by the provider on every model call.
+                "CLAW_SYSTEM_PROMPT_FILE",
+                "CLAW_SYSTEM_PROMPT",
             )
             if (value := os.environ.get(key))
         }

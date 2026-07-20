@@ -1,5 +1,7 @@
 import io
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from integrations.telegram import telegram_claw_bot as bot
@@ -157,6 +159,27 @@ class LlmPayloadTests(unittest.TestCase):
             captured["payload"]["chat_template_kwargs"]["enable_thinking"],
             bot.ENABLE_THINKING,
         )
+
+    def test_system_prompt_file_is_preferred_and_hot_reloaded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "system-prompt.txt"
+            path.write_text("deployment prompt v1", encoding="utf-8")
+            with mock.patch.object(bot, "SYSTEM_PROMPT_FILE", str(path)), mock.patch.object(
+                bot,
+                "SYSTEM_PROMPT",
+                "legacy fallback",
+            ):
+                self.assertEqual(bot.load_system_prompt(), "deployment prompt v1")
+                path.write_text("deployment prompt v2", encoding="utf-8")
+                self.assertEqual(bot.load_system_prompt(), "deployment prompt v2")
+
+    def test_system_prompt_environment_is_fallback_for_missing_file(self):
+        with mock.patch.object(bot, "SYSTEM_PROMPT_FILE", "/missing/prompt.txt"), mock.patch.object(
+            bot,
+            "SYSTEM_PROMPT",
+            "legacy fallback",
+        ):
+            self.assertEqual(bot.load_system_prompt(), "legacy fallback")
 
 
 class ExistingBotBehaviorTests(unittest.TestCase):

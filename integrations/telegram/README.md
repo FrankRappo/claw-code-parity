@@ -43,6 +43,12 @@ running process group. A future approval-button mode would require a separate
 asynchronous stdin/permission protocol and is not mixed with the current
 `danger-full-access` deployment.
 
+The local Gemma deployment prompt is injected as a real OpenAI-compatible
+`role=system` message for ordinary Telegram chat, Claw, Vision preprocessing,
+and the built-in child Agent. It is file-backed and hot-reloaded on each model
+request. The mechanism, historical patch lineage, rebuild steps, and deployment
+checks are documented in [`SYSTEM_PROMPT.md`](../../SYSTEM_PROMPT.md).
+
 The top-level Claw session may use the `Agent` tool to launch one background
 sub-agent on the same Gemma deployment. The bridge injects `gemma4` as the
 sub-agent default and limits active sub-agents to one per top-level process.
