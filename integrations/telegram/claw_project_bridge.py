@@ -31,6 +31,21 @@ JSON_CONTENT_TYPE = "application/json; charset=utf-8"
 PROJECT_NAME_LIMIT = 80
 PROMPT_LIMIT = 64 * 1024
 VISION_CONTEXT_LIMIT = 16 * 1024
+OCR_CONTEXT_LIMIT = 24 * 1024
+OCR_HINTS = (
+    "ocr",
+    "текст",
+    "прочит",
+    "распозн",
+    "номер",
+    "код",
+    "дата",
+    "сумм",
+    "скрин",
+    "документ",
+    "ошиб",
+    "таблиц",
+)
 SUPPORTED_ATTACHMENTS = {
     "image/jpeg": (".jpg", b"\xff\xd8\xff"),
     "image/png": (".png", b"\x89PNG\r\n\x1a\n"),
@@ -65,6 +80,8 @@ class BridgeConfig:
     gemma_base_url: str
     gemma_api_key: str
     gemma_max_output_tokens: int
+    ocr_timeout: int
+    ocr_languages: str
 
     @classmethod
     def from_env(cls) -> "BridgeConfig":
@@ -118,6 +135,8 @@ class BridgeConfig:
             gemma_max_output_tokens=max(
                 1, int(os.environ.get("CLAW_GEMMA_MAX_OUTPUT_TOKENS", "4096"))
             ),
+            ocr_timeout=max(10, int(os.environ.get("CLAW_OCR_TIMEOUT", "180"))),
+            ocr_languages=os.environ.get("CLAW_OCR_LANGUAGES", "rus+eng"),
         )
 
 
@@ -437,6 +456,7 @@ class BridgeApplication:
         attachment_path: Path | None,
         mime_type: str | None,
         vision_context: str,
+        ocr_context: str,
     ) -> str:
         sections = [text.strip() or "Проанализируй переданное вложение."]
         if attachment_path:
@@ -452,7 +472,89 @@ class BridgeApplication:
                 "Предварительный анализ Gemma Vision (проверь по исходному файлу, "
                 "если нужна точность):\n" + vision_context[:VISION_CONTEXT_LIMIT]
             )
+        if ocr_context:
+            sections.append(
+                "Автоматически извлечённый локальный OCR/текстовый слой "
+                "(сверяй с исходным файлом):\n" + ocr_context[:OCR_CONTEXT_LIMIT]
+            )
         return "\n\n".join(sections)
+
+    @staticmethod
+    def should_run_ocr(text: str) -> bool:
+        lowered = text.casefold()
+        return any(hint in lowered for hint in OCR_HINTS)
+
+    def extract_attachment_text(
+        self, text: str, path: Path | None, mime_type: str | None
+    ) -> str:
+        """Extract text without asking the model to decide whether OCR is needed."""
+
+        if path is None:
+            return ""
+        try:
+            if mime_type in {"image/png", "image/jpeg"}:
+                if not self.should_run_ocr(text):
+                    return ""
+                command = [
+                    "tesseract",
+                    str(path),
+                    "stdout",
+                    "-l",
+                    self.config.ocr_languages,
+                    "--psm",
+                    "6",
+                ]
+                result = subprocess.run(
+                    command,
+                    text=True,
+                    capture_output=True,
+                    timeout=self.config.ocr_timeout,
+                    check=False,
+                )
+                return result.stdout.strip() if result.returncode == 0 else ""
+
+            if mime_type == "application/pdf":
+                text_layer = subprocess.run(
+                    ["pdftotext", str(path), "-"],
+                    text=True,
+                    capture_output=True,
+                    timeout=self.config.ocr_timeout,
+                    check=False,
+                )
+                if text_layer.returncode == 0 and text_layer.stdout.strip():
+                    return text_layer.stdout.strip()
+                if not self.should_run_ocr(text):
+                    return ""
+                searchable = path.with_name(path.stem + "-ocr.pdf")
+                ocr = subprocess.run(
+                    [
+                        "ocrmypdf",
+                        "--skip-text",
+                        "--output-type",
+                        "pdf",
+                        "-l",
+                        self.config.ocr_languages,
+                        str(path),
+                        str(searchable),
+                    ],
+                    text=True,
+                    capture_output=True,
+                    timeout=self.config.ocr_timeout,
+                    check=False,
+                )
+                if ocr.returncode != 0 or not searchable.exists():
+                    return ""
+                extracted = subprocess.run(
+                    ["pdftotext", str(searchable), "-"],
+                    text=True,
+                    capture_output=True,
+                    timeout=self.config.ocr_timeout,
+                    check=False,
+                )
+                return extracted.stdout.strip() if extracted.returncode == 0 else ""
+        except (OSError, subprocess.TimeoutExpired) as error:
+            print(f"attachment OCR warning: {error!r}", flush=True)
+        return ""
 
     @staticmethod
     def append_audit(project: dict[str, Any], record: dict[str, Any]) -> None:
@@ -473,8 +575,11 @@ class BridgeApplication:
             attachment = payload.get("attachment")
             attachment_path = self.save_attachment(project, attachment)
             mime_type = attachment.get("mime_type") if isinstance(attachment, dict) else None
+            ocr_context = self.extract_attachment_text(
+                text, attachment_path, mime_type
+            )
             prompt = self.effective_prompt(
-                text, attachment_path, mime_type, vision_context
+                text, attachment_path, mime_type, vision_context, ocr_context
             )
             started = time.monotonic()
             result = self.runner.run_turn(chat_id, project, prompt)

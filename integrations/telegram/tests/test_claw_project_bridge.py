@@ -30,6 +30,8 @@ def test_config(root: Path) -> bridge.BridgeConfig:
         gemma_base_url="http://127.0.0.1:18080/v1",
         gemma_api_key="local-test",
         gemma_max_output_tokens=4096,
+        ocr_timeout=30,
+        ocr_languages="rus+eng",
     )
 
 
@@ -96,10 +98,44 @@ class ApplicationTests(unittest.TestCase):
             )
             self.assertEqual(path.read_bytes(), PNG)
             prompt = application.effective_prompt(
-                "Прочитай код", path, "image/png", "На изображении код 4827"
+                "Прочитай код",
+                path,
+                "image/png",
+                "На изображении код 4827",
+                "OCR TOOL OK 4827",
             )
             self.assertIn("Tesseract/OCRmyPDF", prompt)
             self.assertIn("4827", prompt)
+            self.assertIn("локальный OCR", prompt)
+
+    def test_ocr_runs_automatically_for_text_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            application = bridge.BridgeApplication(test_config(root))
+            path = root / "fixture.png"
+            path.write_bytes(PNG)
+            completed = mock.Mock(returncode=0, stdout="OCR TOOL OK 4827\n")
+            with mock.patch.object(
+                bridge.subprocess, "run", return_value=completed
+            ) as run:
+                text = application.extract_attachment_text(
+                    "Прочитай точный код", path, "image/png"
+                )
+            self.assertEqual(text, "OCR TOOL OK 4827")
+            self.assertEqual(run.call_args.args[0][0], "tesseract")
+
+    def test_ocr_is_skipped_for_non_text_image_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            application = bridge.BridgeApplication(test_config(root))
+            path = root / "fixture.png"
+            path.write_bytes(PNG)
+            with mock.patch.object(bridge.subprocess, "run") as run:
+                text = application.extract_attachment_text(
+                    "Какие цвета преобладают?", path, "image/png"
+                )
+            self.assertEqual(text, "")
+            run.assert_not_called()
 
     def test_rejects_attachment_signature_mismatch(self):
         with tempfile.TemporaryDirectory() as directory:

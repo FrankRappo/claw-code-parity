@@ -14,8 +14,10 @@ deployment without adding a separate OCR menu.
   stored Claw session ID on the next message.
 
 Images and PDFs are attached to the active workspace. Images receive a Gemma
-Vision preprocessing pass, while Claw can invoke installed Tesseract/OCRmyPDF
-when exact OCR is useful. Users simply forward the file into the same chat.
+Vision preprocessing pass. When the request asks to read text, numbers, errors,
+tables, or document fields, the bridge runs local Tesseract before invoking the
+agent. PDFs use their text layer first and fall back to OCRmyPDF when needed.
+Users simply forward the file into the same chat.
 
 ## Components
 
