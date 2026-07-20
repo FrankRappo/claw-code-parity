@@ -104,7 +104,8 @@ class ApplicationTests(unittest.TestCase):
                 "На изображении код 4827",
                 "OCR TOOL OK 4827",
             )
-            self.assertIn("Tesseract/OCRmyPDF", prompt)
+            self.assertIn("OCR уже выполнен", prompt)
+            self.assertIn("Не запускай OCR повторно", prompt)
             self.assertIn("4827", prompt)
             self.assertIn("локальный OCR", prompt)
 

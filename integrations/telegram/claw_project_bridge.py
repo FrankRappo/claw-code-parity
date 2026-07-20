@@ -460,12 +460,19 @@ class BridgeApplication:
     ) -> str:
         sections = [text.strip() or "Проанализируй переданное вложение."]
         if attachment_path:
+            ocr_instruction = (
+                "Локальный OCR уже выполнен и приведён ниже. Не запускай OCR "
+                "повторно, если пользователь явно не просит перепроверку."
+                if ocr_context
+                else "Если требуется точное распознавание текста, используй "
+                "установленный Tesseract/OCRmyPDF автоматически. Не проси "
+                "отдельный OCR-режим."
+            )
             sections.append(
                 "В текущий проект добавлено вложение:\n"
                 f"- путь: {attachment_path}\n"
                 f"- MIME: {mime_type}\n"
-                "Если требуется точное распознавание текста, используй установленный "
-                "Tesseract/OCRmyPDF автоматически. Не проси отдельный OCR-режим."
+                + ocr_instruction
             )
         if vision_context:
             sections.append(
