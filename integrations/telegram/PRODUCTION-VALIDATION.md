@@ -30,6 +30,7 @@ public addresses, private paths, model weights, or Telegram chat identifiers.
 | Parallel projects | Two first turns completed concurrently in 24.113 s with different session IDs and different session files. |
 | Parallel resume | Both projects recalled their own distinct markers concurrently in 16.658 s; session IDs and files remained unchanged. |
 | Service health | Bridge active, model tunnel active, bridge restart count 0 after final code deployment. |
+| Lost CLI stdout recovery | If a resumed turn is persisted but its final JSON stdout is lost, the bridge returns the newly persisted assistant text instead of reporting a false failure. It never replays an unchanged older answer. |
 
 The OCR agent turn completed in 69.182 s on the deployed hardware. That test
 validates behavior, not a per-request latency target; the 1024-token completion

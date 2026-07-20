@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import hmac
 import json
 import os
@@ -321,9 +322,95 @@ class ClawRunner:
             command.extend(["prompt", prompt])
         return command
 
+    @staticmethod
+    def _session_signature(
+        project: dict[str, Any],
+    ) -> tuple[int, int, int, str] | None:
+        session_path = str(project.get("session_path") or "")
+        if not session_path:
+            return None
+        try:
+            path = Path(session_path)
+            stat = path.stat()
+            lines = path.read_bytes().splitlines()
+        except OSError:
+            return None
+        tail_digest = hashlib.sha256(lines[-1]).hexdigest() if lines else ""
+        return stat.st_mtime_ns, stat.st_size, len(lines), tail_digest
+
+    @staticmethod
+    def _recover_persisted_result(
+        project: dict[str, Any], before: tuple[int, int, int, str] | None
+    ) -> dict[str, Any] | None:
+        """Recover a completed resumed turn if CLI stdout was lost.
+
+        Claw persists the JSONL session before writing its JSON result to
+        stdout. A terminal/signal race can therefore leave a valid completed
+        turn on disk while the bridge receives no result. Only recover when an
+        existing exact session file changed during this process; otherwise an
+        older assistant reply could be returned incorrectly.
+        """
+
+        session_path = str(project.get("session_path") or "")
+        session_id = str(project.get("session_id") or "")
+        if not session_path or not session_id or before is None:
+            return None
+        path = Path(session_path)
+        try:
+            stat = path.stat()
+            raw_lines = path.read_bytes().splitlines()
+            tail_digest = hashlib.sha256(raw_lines[-1]).hexdigest() if raw_lines else ""
+            after = (stat.st_mtime_ns, stat.st_size, len(raw_lines), tail_digest)
+            if after == before:
+                return None
+            if len(raw_lines) > before[2]:
+                candidate_lines = raw_lines[before[2] :]
+            elif tail_digest != before[3]:
+                # Auto-compaction may rewrite the complete JSONL file and
+                # reduce its record count. A changed tail is still evidence
+                # that this invocation persisted a new final record.
+                candidate_lines = raw_lines
+            else:
+                # Metadata or timestamps changed, but the prior final record
+                # did not. Never replay an older assistant response.
+                return None
+        except OSError:
+            return None
+
+        for raw_line in reversed(candidate_lines):
+            try:
+                record = json.loads(raw_line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if not isinstance(record, dict) or record.get("type") != "message":
+                continue
+            message = record.get("message")
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            blocks = message.get("blocks")
+            if not isinstance(blocks, list):
+                continue
+            text = "".join(
+                str(block.get("text") or "")
+                for block in blocks
+                if isinstance(block, dict) and block.get("type") == "text"
+            )
+            if not text:
+                continue
+            return {
+                "message": text,
+                "session_id": session_id,
+                "session_path": session_path,
+                "usage": message.get("usage"),
+                "auto_compaction": None,
+                "recovered_from_session": True,
+            }
+        return None
+
     def run_turn(self, chat_id: str, project: dict[str, Any], prompt: str) -> dict[str, Any]:
         if not self.config.claw_binary.is_file():
             raise BridgeError("Claw binary is unavailable", HTTPStatus.SERVICE_UNAVAILABLE)
+        session_before = self._session_signature(project)
         environment = os.environ.copy()
         environment.update(
             {
@@ -376,6 +463,18 @@ class ClawRunner:
                 continue
             if isinstance(result, dict) and "message" in result:
                 return result
+        recovered = self._recover_persisted_result(project, session_before)
+        if recovered is not None:
+            print(
+                "Claw stdout contained no JSON; recovered completed turn from session",
+                flush=True,
+            )
+            return recovered
+        print(
+            "Claw output protocol error: "
+            f"stdout_chars={len(stdout)} stderr_chars={len(stderr)}",
+            flush=True,
+        )
         raise BridgeError("Claw returned no JSON result", HTTPStatus.BAD_GATEWAY)
 
     def _terminate(self, process: subprocess.Popen[str], first_signal: signal.Signals) -> None:

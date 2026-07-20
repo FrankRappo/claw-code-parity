@@ -87,6 +87,94 @@ class RunnerTests(unittest.TestCase):
             )
             self.assertIn("workspace-write", resumed)
 
+    def test_recovers_completed_turn_from_changed_session_when_stdout_is_lost(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            session = root / "session.jsonl"
+            session.write_text(
+                json.dumps({"type": "session_meta", "session_id": "session-42"})
+                + "\n",
+                encoding="utf-8",
+            )
+            fake_claw = root / "claw"
+            fake_claw.write_text(
+                """#!/usr/bin/env python3
+import json
+import sys
+
+path = sys.argv[sys.argv.index("--resume") + 1]
+record = {
+    "type": "message",
+    "message": {
+        "role": "assistant",
+        "blocks": [{"type": "text", "text": "Восстановленный ответ"}],
+        "usage": {"output_tokens": 3},
+    },
+}
+with open(path, "a", encoding="utf-8") as stream:
+    stream.write(json.dumps(record, ensure_ascii=False) + "\\n")
+print("diagnostic without json")
+""",
+                encoding="utf-8",
+            )
+            fake_claw.chmod(0o755)
+            runner = bridge.ClawRunner(test_config(root))
+            result = runner.run_turn(
+                "7",
+                {
+                    "workspace": str(root),
+                    "session_id": "session-42",
+                    "session_path": str(session),
+                },
+                "continue",
+            )
+
+            self.assertEqual(result["message"], "Восстановленный ответ")
+            self.assertEqual(result["session_id"], "session-42")
+            self.assertTrue(result["recovered_from_session"])
+
+    def test_does_not_replay_old_session_reply_when_stdout_is_lost(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            session = root / "session.jsonl"
+            session.write_text(
+                json.dumps(
+                    {
+                        "type": "message",
+                        "message": {
+                            "role": "assistant",
+                            "blocks": [{"type": "text", "text": "Старый ответ"}],
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            fake_claw = root / "claw"
+            fake_claw.write_text(
+                """#!/usr/bin/env python3
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[sys.argv.index("--resume") + 1])
+path.touch()
+print("diagnostic-without-json")
+"""
+            )
+            fake_claw.chmod(0o755)
+            runner = bridge.ClawRunner(test_config(root))
+
+            with self.assertRaisesRegex(bridge.BridgeError, "no JSON"):
+                runner.run_turn(
+                    "7",
+                    {
+                        "workspace": str(root),
+                        "session_id": "session-42",
+                        "session_path": str(session),
+                    },
+                    "continue",
+                )
+
 
 class ApplicationTests(unittest.TestCase):
     def test_attachment_validation_and_effective_prompt(self):
