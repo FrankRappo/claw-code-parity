@@ -1688,13 +1688,24 @@ fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, String> {
     match request.send() {
         Ok(response) => {
             let status = response.status().as_u16();
-            let body = response.text().unwrap_or_default();
+            let body = match response.text() {
+                Ok(body) => body,
+                Err(error) => {
+                    return to_pretty_json(json!({
+                        "url": input.url,
+                        "method": method,
+                        "status_code": status,
+                        "error": format!("failed to read response body: {error}"),
+                        "success": false
+                    }));
+                }
+            };
             to_pretty_json(json!({
                 "url": input.url,
                 "method": method,
                 "status_code": status,
                 "body": body,
-                "success": status >= 200 && status < 300
+                "success": (200..300).contains(&status)
             }))
         }
         Err(e) => to_pretty_json(json!({
@@ -1739,8 +1750,10 @@ fn from_value<T: for<'de> Deserialize<'de>>(input: &Value) -> Result<T, String> 
 }
 
 fn run_bash(input: BashCommandInput) -> Result<String, String> {
-    if let Some(output) = workspace_test_branch_preflight(&input.command) {
-        return serde_json::to_string_pretty(&output).map_err(|error| error.to_string());
+    if !unrestricted_deployment_enabled() {
+        if let Some(output) = workspace_test_branch_preflight(&input.command) {
+            return serde_json::to_string_pretty(&output).map_err(|error| error.to_string());
+        }
     }
     serde_json::to_string_pretty(&execute_bash(input).map_err(|error| error.to_string())?)
         .map_err(|error| error.to_string())
@@ -2991,7 +3004,115 @@ const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
 const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
 static ACTIVE_SUBAGENTS: AtomicUsize = AtomicUsize::new(0);
 
-struct ActiveSubagentPermit;
+struct ActiveSubagentPermit {
+    global_lock: Option<GlobalSubagentLock>,
+}
+
+struct GlobalSubagentLock {
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+}
+
+impl GlobalSubagentLock {
+    fn acquire_from_env() -> Result<Option<Self>, String> {
+        let Some(path) = std::env::var("CLAW_SUBAGENT_LOCK_FILE")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(None);
+        };
+        Self::acquire_at(std::path::Path::new(&path)).map(Some)
+    }
+
+    fn acquire_at(path: &std::path::Path) -> Result<Self, String> {
+        use std::io::{BufRead as _, Read as _};
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                format!("failed to create global sub-agent lock directory: {error}")
+            })?;
+        }
+        let mut child = std::process::Command::new("flock")
+            .arg("--exclusive")
+            .arg("--nonblock")
+            .arg(path)
+            .args(["sh", "-c", "printf 'LOCKED\\n'; cat >/dev/null"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("failed to start global sub-agent flock holder: {error}"))?;
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| String::from("global sub-agent flock holder has no stdout"))?;
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut handshake = String::new();
+        if let Err(error) = reader.read_line(&mut handshake) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "failed to read global sub-agent lock handshake: {error}"
+            ));
+        }
+        drop(reader);
+
+        if handshake.trim() != "LOCKED" {
+            let mut stderr = String::new();
+            if let Some(mut pipe) = child.stderr.take() {
+                let _ = pipe.read_to_string(&mut stderr);
+            }
+            let status = child.wait().ok();
+            if status.and_then(|value| value.code()) == Some(1) {
+                return Err(String::from(
+                    "global sub-agent concurrency limit reached (1/1); wait for the running agent",
+                ));
+            }
+            return Err(format!(
+                "global sub-agent flock holder failed{}",
+                if stderr.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", stderr.trim())
+                }
+            ));
+        }
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| String::from("global sub-agent flock holder has no stdin"))?;
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("failed to inspect global sub-agent flock holder: {error}"))?
+        {
+            return Err(format!(
+                "global sub-agent flock holder exited unexpectedly with {status}"
+            ));
+        }
+
+        Ok(Self {
+            child,
+            stdin: Some(stdin),
+        })
+    }
+}
+
+impl Drop for GlobalSubagentLock {
+    fn drop(&mut self) {
+        self.stdin.take();
+        for _ in 0..50 {
+            if self.child.try_wait().ok().flatten().is_some() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
 
 impl ActiveSubagentPermit {
     fn acquire() -> Result<Self, String> {
@@ -3013,7 +3134,16 @@ impl ActiveSubagentPermit {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Ok(Self),
+                Ok(_) => {
+                    let global_lock = match GlobalSubagentLock::acquire_from_env() {
+                        Ok(lock) => lock,
+                        Err(error) => {
+                            ACTIVE_SUBAGENTS.fetch_sub(1, Ordering::AcqRel);
+                            return Err(error);
+                        }
+                    };
+                    return Ok(Self { global_lock });
+                }
                 Err(current) => active = current,
             }
         }
@@ -3022,6 +3152,7 @@ impl ActiveSubagentPermit {
 
 impl Drop for ActiveSubagentPermit {
     fn drop(&mut self) {
+        self.global_lock.take();
         ACTIVE_SUBAGENTS.fetch_sub(1, Ordering::AcqRel);
     }
 }
@@ -4902,7 +5033,7 @@ mod tests {
         execute_agent_with_spawn, execute_tool, final_assistant_text, mvp_tool_specs,
         permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
         resolve_agent_model, run_task_packet, AgentInput, AgentJob, GlobalToolRegistry,
-        LaneEventName, LaneFailureClass, SubagentToolExecutor,
+        GlobalSubagentLock, LaneEventName, LaneFailureClass, SubagentToolExecutor,
     };
     use api::OutputContentBlock;
     use runtime::{
@@ -5838,6 +5969,22 @@ mod tests {
     }
 
     #[test]
+    fn global_subagent_lock_allows_only_one_holder_and_releases_on_drop() {
+        let path = temp_path("global-subagent.lock");
+        let first = GlobalSubagentLock::acquire_at(&path).expect("first lock should succeed");
+        let error = GlobalSubagentLock::acquire_at(&path)
+            .err()
+            .expect("second lock should be rejected");
+        assert!(error.contains("global sub-agent concurrency limit reached"));
+
+        drop(first);
+        let second =
+            GlobalSubagentLock::acquire_at(&path).expect("released lock should be reusable");
+        drop(second);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn agent_fake_runner_can_persist_completion_and_failure() {
         let _guard = env_lock()
             .lock()
@@ -6350,6 +6497,20 @@ mod tests {
         assert_eq!(
             output_json["structuredContent"][0]["data"]["missingCommits"][0],
             "fix: unblock workspace tests"
+        );
+
+        std::env::set_var("CLAW_UNRESTRICTED", "1");
+        let unrestricted = execute_tool(
+            "bash",
+            &json!({ "command": "printf 'unrestricted ok'; # cargo test --workspace" }),
+        )
+        .expect("unrestricted mode should bypass branch preflight");
+        std::env::remove_var("CLAW_UNRESTRICTED");
+        let unrestricted: serde_json::Value = serde_json::from_str(&unrestricted).expect("json");
+        assert_eq!(unrestricted["stdout"], "unrestricted ok");
+        assert_ne!(
+            unrestricted["returnCodeInterpretation"],
+            "preflight_blocked:branch_divergence"
         );
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");

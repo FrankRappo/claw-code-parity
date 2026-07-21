@@ -22,6 +22,7 @@ def test_config(root: Path) -> bridge.BridgeConfig:
         model="gemma4",
         allowed_tools=None,
         permission_mode="danger-full-access",
+        unrestricted=True,
         turn_timeout=30,
         max_concurrent=2,
         max_body_bytes=1 << 20,
@@ -39,13 +40,17 @@ class BridgeConfigTests(unittest.TestCase):
     def test_default_configuration_exposes_the_full_tool_registry(self):
         with mock.patch.dict(
             bridge.os.environ,
-            {"CLAW_BRIDGE_TOKEN": "x" * 32},
+            {
+                "CLAW_BRIDGE_TOKEN": "x" * 32,
+                "CLAW_UNRESTRICTED": "1",
+            },
             clear=True,
         ):
             config = bridge.BridgeConfig.from_env()
 
         self.assertIsNone(config.allowed_tools)
         self.assertEqual(config.permission_mode, "danger-full-access")
+        self.assertTrue(config.unrestricted)
         self.assertEqual(config.gemma_max_output_tokens, 32000)
         self.assertEqual(config.auto_compact_input_tokens, 110000)
         self.assertIsNone(config.turn_timeout)
@@ -68,6 +73,21 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertTrue(bridge.configured_tool_enabled(None, "Agent"))
         self.assertTrue(bridge.configured_tool_enabled("read,Agent,bash", "Agent"))
         self.assertFalse(bridge.configured_tool_enabled("read,bash", "Agent"))
+
+    def test_restricted_profile_does_not_enable_unrestricted_runtime(self):
+        with mock.patch.dict(
+            bridge.os.environ,
+            {"CLAW_BRIDGE_TOKEN": "x" * 32},
+            clear=True,
+        ):
+            config = bridge.BridgeConfig.from_env()
+            environment = bridge.ClawRunner(config)._agent_environment()
+
+        self.assertFalse(config.unrestricted)
+        self.assertEqual(config.permission_mode, "workspace-write")
+        self.assertEqual(config.allowed_tools, "Read,Glob,Grep")
+        self.assertNotIn("CLAW_UNRESTRICTED", environment)
+        self.assertNotIn("CLAW_SUBAGENT_LOCK_FILE", environment)
 
 
 class ProjectStoreTests(unittest.TestCase):
@@ -130,6 +150,10 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(environment["CLAW_SUBAGENT_MAX_CONCURRENT"], "1")
             self.assertEqual(environment["CLAW_UNRESTRICTED"], "1")
             self.assertEqual(
+                environment["CLAW_SUBAGENT_LOCK_FILE"],
+                str(root / "state" / "claw-subagent.lock"),
+            )
+            self.assertEqual(
                 environment["CLAW_SYSTEM_PROMPT_FILE"],
                 "/srv/prompts/gemma4.txt",
             )
@@ -169,6 +193,26 @@ class RunnerTests(unittest.TestCase):
 
             index = command.index("--allowedTools")
             self.assertEqual(command[index + 1], "read,bash")
+
+    def test_stop_tombstone_prevents_a_not_yet_registered_turn(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_claw = root / "claw"
+            fake_claw.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            fake_claw.chmod(0o755)
+            runner = bridge.ClawRunner(test_config(root))
+            self.assertFalse(runner.stop("7", ("operation-1",)))
+
+            with mock.patch.object(bridge.subprocess, "Popen") as popen:
+                with self.assertRaisesRegex(bridge.BridgeError, "was stopped"):
+                    runner.run_turn(
+                        "7",
+                        {"workspace": str(root), "session_id": None},
+                        "continue",
+                        "operation-1",
+                    )
+
+            popen.assert_not_called()
 
     def test_recovers_completed_turn_from_changed_session_when_stdout_is_lost(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -344,12 +388,18 @@ class ApplicationTests(unittest.TestCase):
                 application.runner, "run_turn", return_value=fake_result
             ) as run_turn:
                 response = application.message(
-                    {"chat_id": 7, "user_id": 8, "text": "Сделай задачу"}
+                    {
+                        "chat_id": 7,
+                        "user_id": 8,
+                        "text": "Сделай задачу",
+                        "operation_id": "operation-99",
+                    }
                 )
             self.assertEqual(response["message"], "Готово")
             project = application.store.active_project("7")
             self.assertEqual(project["session_id"], "session-99")
             run_turn.assert_called_once()
+            self.assertEqual(run_turn.call_args.args[3], "operation-99")
             transcript = Path(project["workspace"]) / "telegram-transcript.jsonl"
             record = json.loads(transcript.read_text(encoding="utf-8"))
             self.assertEqual(record["text"], "Сделай задачу")

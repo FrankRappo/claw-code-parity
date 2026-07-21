@@ -111,10 +111,23 @@ impl McpClientTransport {
 
 impl McpStdioTransport {
     #[must_use]
-    pub fn resolved_tool_call_timeout_ms(&self) -> u64 {
-        self.tool_call_timeout_ms
-            .unwrap_or(DEFAULT_MCP_TOOL_CALL_TIMEOUT_MS)
+    pub fn resolved_tool_call_timeout_ms(&self) -> Option<u64> {
+        self.resolved_tool_call_timeout_ms_for_mode(unrestricted_deployment_enabled())
     }
+
+    fn resolved_tool_call_timeout_ms_for_mode(&self, unrestricted: bool) -> Option<u64> {
+        self.tool_call_timeout_ms
+            .or_else(|| (!unrestricted).then_some(DEFAULT_MCP_TOOL_CALL_TIMEOUT_MS))
+    }
+}
+
+fn unrestricted_deployment_enabled() -> bool {
+    std::env::var("CLAW_UNRESTRICTED").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 impl McpClientAuth {
@@ -138,7 +151,26 @@ mod tests {
         McpStdioServerConfig, McpWebSocketServerConfig, ScopedMcpServerConfig,
     };
 
-    use super::{McpClientAuth, McpClientBootstrap, McpClientTransport};
+    use super::{
+        McpClientAuth, McpClientBootstrap, McpClientTransport, McpStdioTransport,
+        DEFAULT_MCP_TOOL_CALL_TIMEOUT_MS,
+    };
+
+    #[test]
+    fn unrestricted_stdio_transport_has_no_implicit_tool_timeout() {
+        let transport = McpStdioTransport {
+            command: "mcp-server".to_string(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            tool_call_timeout_ms: None,
+        };
+
+        assert_eq!(
+            transport.resolved_tool_call_timeout_ms_for_mode(false),
+            Some(DEFAULT_MCP_TOOL_CALL_TIMEOUT_MS)
+        );
+        assert_eq!(transport.resolved_tool_call_timeout_ms_for_mode(true), None);
+    }
 
     #[test]
     fn bootstraps_stdio_servers_into_transport_targets() {

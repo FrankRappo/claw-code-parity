@@ -58,9 +58,9 @@ checks are documented in [`SYSTEM_PROMPT.md`](../../SYSTEM_PROMPT.md).
 The top-level Claw session may use the `Agent` tool to launch one background
 sub-agent on the same Gemma deployment. The bridge injects `gemma4` as the
 sub-agent default, gives every child role the complete built-in tool registry,
-and keeps exactly one global active-child permit. A child can see `Agent`, but a
-recursive launch is rejected while that permit is occupied. This matches the
-two available Gemma slots: parent plus one child.
+and keeps exactly one cross-process active-child lock. A child can see `Agent`,
+but a recursive or second-process launch is rejected while that lock is
+occupied. This matches the two available Gemma slots: parent plus one child.
 
 ## Claw patch
 

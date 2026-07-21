@@ -23,8 +23,9 @@ public addresses, private paths, model weights, or Telegram chat identifiers.
 - Claw commands are automatically approved only inside the disposable VM.
   `/permissions` reports this policy; `/stop` remains available at any time.
 - A top-level Claw turn may launch one Gemma-backed background `Agent`. Every
-  child role receives the complete built-in tool registry. The single global
-  active-child permit prevents recursive fan-out from exceeding two slots.
+  child role receives the complete built-in tool registry. A shared OS advisory
+  `flock` permits only one child across all top-level Claw processes, releases
+  automatically after a crashed owner, and prevents recursive fan-out.
 - Automatic compaction begins at 110000 input tokens for the measured 163840-
   token Gemma slot.
 - Claw now runs on one dedicated, disposable, GPU-less sandbox VM. The Telegram
@@ -56,7 +57,7 @@ public addresses, private paths, model weights, or Telegram chat identifiers.
 | Post-migration automatic OCR | A PNG attachment passed through the reverse-forwarded bridge, local OCR extracted the test number, and the agent returned that exact number. |
 | Network access | Public HTTPS, explicit HTTP, and routed private-network access are required in unrestricted mode. |
 | Long Telegram output | Unit fixtures reconstructed a multi-chunk response character-for-character, verified every chunk stayed below 3900 characters, and kept the keyboard only on the final message. The same sender is used by Gemma and Claw. |
-| Sub-agent policy | The `Agent` tool uses the deployment's `gemma4` default, exposes the complete built-in tool set to every child role, and retains one global active-child permit. |
+| Sub-agent policy | The `Agent` tool uses the deployment's `gemma4` default, exposes the complete built-in tool set to every child role, and retains one cross-process active-child lock. |
 | Deployed long-output smoke | The installed bot reconstructed a five-message fixture without character loss; the largest chunk was exactly 3900 characters, only the first replied to the source message, and only the last carried the keyboard. |
 | Deployed sub-agent E2E | A parent Claw turn launched one `Explore` Agent without specifying a model, waited for it, read its marker, and returned the expected parent marker in 80.907 s. The persisted child manifest reported `model=gemma4`, `status=completed`, and no error. |
 

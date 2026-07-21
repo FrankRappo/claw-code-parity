@@ -1,4 +1,5 @@
 import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -115,6 +116,9 @@ class ImageDownloadTests(unittest.TestCase):
 class LlmPayloadTests(unittest.TestCase):
     def setUp(self):
         bot.HISTORY.clear()
+        bot.CLAW_OPERATION_EPOCHS.clear()
+        bot.ACTIVE_CLAW_OPERATIONS.clear()
+        bot.ACTIVE_VISION_PROCESSES.clear()
 
     def test_multimodal_payload_places_image_first_and_does_not_store_base64(self):
         captured = {}
@@ -160,6 +164,46 @@ class LlmPayloadTests(unittest.TestCase):
             bot.ENABLE_THINKING,
         )
 
+    def test_claw_vision_preprocessing_has_no_automatic_timeout(self):
+        process = mock.Mock()
+        process.communicate.return_value = (
+            json.dumps(
+                {"content": "vision result", "usage": {}, "elapsed": 0.1}
+            ),
+            "",
+        )
+        process.returncode = 0
+        with mock.patch.object(bot.subprocess, "Popen", return_value=process) as popen:
+            result = bot.claw_vision_context(
+                100, 0, "operation-1", "inspect", PNG, "image/png"
+            )
+
+        self.assertEqual(result, "vision result")
+        self.assertEqual(popen.call_args.args[0][-1], "--claw-vision-worker")
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        request = json.loads(process.communicate.call_args.args[0])
+        self.assertEqual(request["user_text"], "inspect")
+        self.assertEqual(request["mime_type"], "image/png")
+        self.assertEqual(process.communicate.call_args.kwargs["timeout"], None)
+
+    def test_stop_terminates_vision_and_invalidates_pending_local_work(self):
+        process = mock.Mock()
+        process.pid = 1234
+        process.poll.return_value = None
+        process.wait.return_value = None
+        bot.ACTIVE_CLAW_OPERATIONS[100] = {"operation-1"}
+        bot.ACTIVE_VISION_PROCESSES[100] = {"operation-1": process}
+
+        with mock.patch.object(bot.os, "killpg") as killpg:
+            operation_ids, vision_stopped = bot.cancel_claw_operation(100)
+
+        self.assertEqual(operation_ids, ("operation-1",))
+        self.assertTrue(vision_stopped)
+        self.assertEqual(bot.CLAW_OPERATION_EPOCHS[100], 1)
+        killpg.assert_called_once_with(1234, bot.signal.SIGTERM)
+        with self.assertRaises(bot.ClawOperationStopped):
+            bot.ensure_claw_operation_active(100, 0)
+
     def test_system_prompt_file_is_preferred_and_hot_reloaded(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "system-prompt.txt"
@@ -187,6 +231,9 @@ class ExistingBotBehaviorTests(unittest.TestCase):
         bot.HISTORY.clear()
         bot.TOKEN_LIMITS.clear()
         bot.CHAT_MODES.clear()
+        bot.CLAW_OPERATION_EPOCHS.clear()
+        bot.ACTIVE_CLAW_OPERATIONS.clear()
+        bot.ACTIVE_VISION_PROCESSES.clear()
 
     def test_username_allowlist_is_preserved(self):
         with mock.patch.object(bot, "ALLOWED", set()), mock.patch.object(
@@ -283,6 +330,9 @@ class MessageHandlingTests(unittest.TestCase):
     def setUp(self):
         bot.HISTORY.clear()
         bot.CHAT_MODES.clear()
+        bot.CLAW_OPERATION_EPOCHS.clear()
+        bot.ACTIVE_CLAW_OPERATIONS.clear()
+        bot.ACTIVE_VISION_PROCESSES.clear()
 
     def test_photo_without_caption_uses_default_prompt(self):
         message = {
@@ -352,6 +402,9 @@ class ClawModeTests(unittest.TestCase):
     def setUp(self):
         bot.HISTORY.clear()
         bot.CHAT_MODES.clear()
+        bot.CLAW_OPERATION_EPOCHS.clear()
+        bot.ACTIVE_CLAW_OPERATIONS.clear()
+        bot.ACTIVE_VISION_PROCESSES.clear()
 
     def test_keyboard_has_project_controls_and_no_ocr_menu(self):
         labels = [
@@ -444,6 +497,29 @@ class ClawModeTests(unittest.TestCase):
         self.assertTrue(bot.is_control_message({"text": "/stop"}))
         self.assertTrue(bot.is_control_message({"text": "/newclaw Новый"}))
         self.assertFalse(bot.is_control_message({"text": "обычная задача"}))
+
+    def test_stop_reports_local_vision_cancellation_even_if_bridge_is_idle(self):
+        bot.ACTIVE_CLAW_OPERATIONS[10] = {"operation-1"}
+        message = {
+            "chat": {"id": 10},
+            "from": {"id": 20},
+            "message_id": 30,
+            "text": "/stop",
+        }
+        with mock.patch.object(bot, "ALLOWED", set()), mock.patch.object(
+            bot, "ALLOWED_USERNAMES", set()
+        ), mock.patch.object(
+            bot, "claw_request", return_value={"ok": True, "stopped": False}
+        ) as request, mock.patch.object(bot, "send_message") as send:
+            bot.handle_message(message)
+
+        self.assertIn("остановлена", send.call_args.args[1])
+        self.assertEqual(bot.CLAW_OPERATION_EPOCHS[10], 1)
+        request.assert_called_once_with(
+            "/v1/stop",
+            {"chat_id": 10, "operation_ids": ("operation-1",)},
+            timeout=15,
+        )
 
 
 if __name__ == "__main__":

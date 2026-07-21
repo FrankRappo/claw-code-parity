@@ -70,6 +70,7 @@ class BridgeConfig:
     model: str
     allowed_tools: str | None
     permission_mode: str
+    unrestricted: bool
     turn_timeout: int | None
     max_concurrent: int
     max_body_bytes: int
@@ -86,12 +87,21 @@ class BridgeConfig:
         token = os.environ.get("CLAW_BRIDGE_TOKEN", "").strip()
         if len(token) < 32:
             raise SystemExit("CLAW_BRIDGE_TOKEN must contain at least 32 characters")
+        unrestricted = os.environ.get("CLAW_UNRESTRICTED", "").strip().casefold() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         configured_tools = os.environ.get("CLAW_ALLOWED_TOOLS", "").strip()
-        allowed_tools = (
-            None
-            if configured_tools.casefold() in {"", "*", "all", "unrestricted"}
-            else configured_tools
-        )
+        if configured_tools:
+            allowed_tools = (
+                None
+                if configured_tools.casefold() in {"*", "all", "unrestricted"}
+                else configured_tools
+            )
+        else:
+            allowed_tools = None if unrestricted else "Read,Glob,Grep"
         configured_turn_timeout = int(os.environ.get("CLAW_TURN_TIMEOUT", "0"))
         configured_ocr_timeout = int(os.environ.get("CLAW_OCR_TIMEOUT", "0"))
         return cls(
@@ -119,8 +129,10 @@ class BridgeConfig:
             model=os.environ.get("CLAW_MODEL", "gemma4"),
             allowed_tools=allowed_tools,
             permission_mode=os.environ.get(
-                "CLAW_PERMISSION_MODE", "danger-full-access"
+                "CLAW_PERMISSION_MODE",
+                "danger-full-access" if unrestricted else "workspace-write",
             ),
+            unrestricted=unrestricted,
             turn_timeout=(
                 None if configured_turn_timeout <= 0 else max(10, configured_turn_timeout)
             ),
@@ -157,6 +169,29 @@ def validated_chat_id(value: Any) -> str:
         return str(int(value))
     except (TypeError, ValueError) as error:
         raise BridgeError("chat_id must be an integer") from error
+
+
+def validated_operation_id(value: Any) -> str | None:
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        raise BridgeError("operation_id must be a string")
+    operation_id = value.strip()
+    if not operation_id or len(operation_id) > 256:
+        raise BridgeError("operation_id must contain 1 to 256 characters")
+    return operation_id
+
+
+def validated_operation_ids(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise BridgeError("operation_ids must be an array")
+    return tuple(
+        operation_id
+        for item in value
+        if (operation_id := validated_operation_id(item)) is not None
+    )
 
 
 def clean_project_name(value: Any) -> str:
@@ -306,6 +341,8 @@ class ClawRunner:
         self._capacity = threading.BoundedSemaphore(config.max_concurrent)
         self._active_lock = threading.Lock()
         self._active: dict[str, subprocess.Popen[str]] = {}
+        self._active_operation_ids: dict[str, str] = {}
+        self._cancelled_operation_ids: dict[str, set[str]] = {}
 
     def _command(self, project: dict[str, Any], prompt: str) -> list[str]:
         command = [
@@ -344,12 +381,19 @@ class ClawRunner:
                 # This is the only deployment-level capability limit: parent
                 # plus one child exactly fills the two Gemma inference slots.
                 "CLAW_SUBAGENT_MAX_CONCURRENT": "1",
-                "CLAW_UNRESTRICTED": "1",
                 "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS": str(
                     self.config.auto_compact_input_tokens
                 ),
             }
         )
+        if self.config.unrestricted:
+            environment["CLAW_UNRESTRICTED"] = "1"
+            environment["CLAW_SUBAGENT_LOCK_FILE"] = str(
+                self.config.state_file.parent / "claw-subagent.lock"
+            )
+        else:
+            environment.pop("CLAW_UNRESTRICTED", None)
+            environment.pop("CLAW_SUBAGENT_LOCK_FILE", None)
         return environment
 
     @staticmethod
@@ -437,28 +481,44 @@ class ClawRunner:
             }
         return None
 
-    def run_turn(self, chat_id: str, project: dict[str, Any], prompt: str) -> dict[str, Any]:
+    def run_turn(
+        self,
+        chat_id: str,
+        project: dict[str, Any],
+        prompt: str,
+        operation_id: str | None = None,
+    ) -> dict[str, Any]:
         if not self.config.claw_binary.is_file():
             raise BridgeError("Claw binary is unavailable", HTTPStatus.SERVICE_UNAVAILABLE)
         session_before = self._session_signature(project)
         environment = self._agent_environment()
         with self._capacity:
-            process = subprocess.Popen(
-                self._command(project, prompt),
-                cwd=project["workspace"],
-                env=environment,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                start_new_session=True,
-            )
             with self._active_lock:
+                cancelled = self._cancelled_operation_ids.get(chat_id, set())
+                if operation_id and operation_id in cancelled:
+                    cancelled.discard(operation_id)
+                    if not cancelled:
+                        self._cancelled_operation_ids.pop(chat_id, None)
+                    raise BridgeError("Claw operation was stopped", HTTPStatus.CONFLICT)
                 if chat_id in self._active:
-                    process.kill()
                     raise BridgeError(
                         "this project already has a running turn", HTTPStatus.CONFLICT
                     )
+                # Spawn and registration share the same lock as stop(). This
+                # closes the last check-to-registration race: stop either
+                # tombstones the operation first or observes its process.
+                process = subprocess.Popen(
+                    self._command(project, prompt),
+                    cwd=project["workspace"],
+                    env=environment,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True,
+                )
                 self._active[chat_id] = process
+                if operation_id:
+                    self._active_operation_ids[chat_id] = operation_id
             try:
                 stdout, stderr = process.communicate(timeout=self.config.turn_timeout)
             except subprocess.TimeoutExpired as error:
@@ -470,6 +530,13 @@ class ClawRunner:
             finally:
                 with self._active_lock:
                     self._active.pop(chat_id, None)
+                    active_operation_id = self._active_operation_ids.pop(chat_id, None)
+                    if active_operation_id:
+                        cancelled = self._cancelled_operation_ids.get(chat_id)
+                        if cancelled is not None:
+                            cancelled.discard(active_operation_id)
+                            if not cancelled:
+                                self._cancelled_operation_ids.pop(chat_id, None)
 
         if process.returncode != 0:
             message = stderr.strip() or stdout.strip() or f"exit code {process.returncode}"
@@ -515,8 +582,12 @@ class ClawRunner:
         except ProcessLookupError:
             pass
 
-    def stop(self, chat_id: str) -> bool:
+    def stop(self, chat_id: str, operation_ids: tuple[str, ...] = ()) -> bool:
         with self._active_lock:
+            if operation_ids:
+                self._cancelled_operation_ids.setdefault(chat_id, set()).update(
+                    operation_ids
+                )
             process = self._active.get(chat_id)
         if process is None or process.poll() is not None:
             return False
@@ -695,6 +766,7 @@ class BridgeApplication:
         chat_id = validated_chat_id(payload.get("chat_id"))
         text = str(payload.get("text") or "")
         vision_context = str(payload.get("vision_context") or "")
+        operation_id = validated_operation_id(payload.get("operation_id"))
         with self.chat_lock(chat_id):
             project = self.store.active_project(chat_id, create=True)
             assert project is not None
@@ -708,7 +780,7 @@ class BridgeApplication:
                 text, attachment_path, mime_type, vision_context, ocr_context
             )
             started = time.monotonic()
-            result = self.runner.run_turn(chat_id, project, prompt)
+            result = self.runner.run_turn(chat_id, project, prompt, operation_id)
             session_id = str(result.get("session_id") or "")
             session_path = str(result.get("session_path") or "")
             if not session_id or not session_path:
@@ -861,7 +933,13 @@ def make_handler(application: BridgeApplication):
                         "project": public_project(project) if project else None,
                     }
                 elif self.path == "/v1/stop":
-                    result = {"ok": True, "stopped": application.runner.stop(chat_id)}
+                    result = {
+                        "ok": True,
+                        "stopped": application.runner.stop(
+                            chat_id,
+                            validated_operation_ids(payload.get("operation_ids")),
+                        ),
+                    }
                 elif self.path == "/v1/status":
                     project = application.store.active_project(chat_id)
                     result = {
@@ -871,6 +949,7 @@ def make_handler(application: BridgeApplication):
                         "auto_compact_input_tokens": application.config.auto_compact_input_tokens,
                         "max_concurrent": application.config.max_concurrent,
                         "permission_mode": application.config.permission_mode,
+                        "unrestricted": application.config.unrestricted,
                         "agents_enabled": configured_tool_enabled(
                             application.config.allowed_tools, "Agent"
                         ),

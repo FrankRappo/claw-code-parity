@@ -28,6 +28,27 @@ const MCP_LIST_TOOLS_TIMEOUT_MS: u64 = 300;
 #[cfg(not(test))]
 const MCP_LIST_TOOLS_TIMEOUT_MS: u64 = 30_000;
 
+fn implicit_mcp_timeout(timeout_ms: u64) -> Option<u64> {
+    implicit_mcp_timeout_for_mode(timeout_ms, unrestricted_deployment_enabled())
+}
+
+const fn implicit_mcp_timeout_for_mode(timeout_ms: u64, unrestricted: bool) -> Option<u64> {
+    if unrestricted {
+        None
+    } else {
+        Some(timeout_ms)
+    }
+}
+
+fn unrestricted_deployment_enabled() -> bool {
+    std::env::var("CLAW_UNRESTRICTED").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum JsonRpcId {
@@ -754,7 +775,10 @@ impl McpServerManager {
         JsonRpcId::Number(id)
     }
 
-    fn tool_call_timeout_ms(&self, server_name: &str) -> Result<u64, McpServerManagerError> {
+    fn tool_call_timeout_ms(
+        &self,
+        server_name: &str,
+    ) -> Result<Option<u64>, McpServerManagerError> {
         let server =
             self.servers
                 .get(server_name)
@@ -824,7 +848,7 @@ impl McpServerManager {
                 Self::run_process_request(
                     server_name,
                     "tools/list",
-                    MCP_LIST_TOOLS_TIMEOUT_MS,
+                    implicit_mcp_timeout(MCP_LIST_TOOLS_TIMEOUT_MS),
                     process.list_tools(
                         request_id,
                         Some(McpListToolsParams {
@@ -892,7 +916,7 @@ impl McpServerManager {
                 Self::run_process_request(
                     server_name,
                     "resources/list",
-                    MCP_LIST_TOOLS_TIMEOUT_MS,
+                    implicit_mcp_timeout(MCP_LIST_TOOLS_TIMEOUT_MS),
                     process.list_resources(
                         request_id,
                         Some(McpListResourcesParams {
@@ -954,7 +978,7 @@ impl McpServerManager {
                 Self::run_process_request(
                     server_name,
                     "resources/read",
-                    MCP_LIST_TOOLS_TIMEOUT_MS,
+                    implicit_mcp_timeout(MCP_LIST_TOOLS_TIMEOUT_MS),
                     process.read_resource(
                         request_id,
                         McpReadResourceParams {
@@ -1015,30 +1039,40 @@ impl McpServerManager {
     async fn run_process_request<T, F>(
         server_name: &str,
         method: &'static str,
-        timeout_ms: u64,
+        timeout_ms: Option<u64>,
         future: F,
     ) -> Result<T, McpServerManagerError>
     where
         F: Future<Output = io::Result<T>>,
     {
-        match timeout(Duration::from_millis(timeout_ms), future).await {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(error)) if error.kind() == io::ErrorKind::InvalidData => {
+        let result = if let Some(timeout_ms) = timeout_ms {
+            match timeout(Duration::from_millis(timeout_ms), future).await {
+                Ok(result) => result,
+                Err(_) => {
+                    return Err(McpServerManagerError::Timeout {
+                        server_name: server_name.to_string(),
+                        method,
+                        timeout_ms,
+                    });
+                }
+            }
+        } else {
+            future.await
+        };
+
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
                 Err(McpServerManagerError::InvalidResponse {
                     server_name: server_name.to_string(),
                     method,
                     details: error.to_string(),
                 })
             }
-            Ok(Err(source)) => Err(McpServerManagerError::Transport {
+            Err(source) => Err(McpServerManagerError::Transport {
                 server_name: server_name.to_string(),
                 method,
                 source,
-            }),
-            Err(_) => Err(McpServerManagerError::Timeout {
-                server_name: server_name.to_string(),
-                method,
-                timeout_ms,
             }),
         }
     }
@@ -1092,7 +1126,7 @@ impl McpServerManager {
                 Self::run_process_request(
                     server_name,
                     "initialize",
-                    MCP_INITIALIZE_TIMEOUT_MS,
+                    implicit_mcp_timeout(MCP_INITIALIZE_TIMEOUT_MS),
                     process.initialize(request_id, default_initialize_params()),
                 )
                 .await
@@ -1425,13 +1459,19 @@ mod tests {
     use crate::mcp_client::McpClientBootstrap;
 
     use super::{
-        spawn_mcp_stdio_process, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
-        McpInitializeClientInfo, McpInitializeParams, McpInitializeResult, McpInitializeServerInfo,
-        McpListToolsResult, McpReadResourceParams, McpReadResourceResult, McpServerManager,
-        McpServerManagerError, McpStdioProcess, McpTool, McpToolCallParams,
-        unsupported_server_failed_server,
+        implicit_mcp_timeout_for_mode, spawn_mcp_stdio_process, unsupported_server_failed_server,
+        JsonRpcId, JsonRpcRequest, JsonRpcResponse, McpInitializeClientInfo, McpInitializeParams,
+        McpInitializeResult, McpInitializeServerInfo, McpListToolsResult, McpReadResourceParams,
+        McpReadResourceResult, McpServerManager, McpServerManagerError, McpStdioProcess, McpTool,
+        McpToolCallParams,
     };
     use crate::McpLifecyclePhase;
+
+    #[test]
+    fn unrestricted_mode_removes_implicit_mcp_lifecycle_timeouts() {
+        assert_eq!(implicit_mcp_timeout_for_mode(30_000, false), Some(30_000));
+        assert_eq!(implicit_mcp_timeout_for_mode(30_000, true), None);
+    }
 
     fn temp_dir() -> PathBuf {
         static NEXT_TEMP_DIR_ID: AtomicU64 = AtomicU64::new(0);

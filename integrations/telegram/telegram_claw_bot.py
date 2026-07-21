@@ -10,6 +10,7 @@ import base64
 import concurrent.futures
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -61,6 +62,7 @@ CLAW_BRIDGE_URL = os.environ.get(
 CLAW_BRIDGE_TOKEN = os.environ.get("CLAW_BRIDGE_TOKEN", "").strip()
 CLAW_REQUEST_TIMEOUT = int(os.environ.get("CLAW_REQUEST_TIMEOUT", "0"))
 CLAW_VISION_MAX_TOKENS = int(os.environ.get("CLAW_VISION_MAX_TOKENS", "32000"))
+CLAW_VISION_REQUEST_TIMEOUT = int(os.environ.get("CLAW_VISION_REQUEST_TIMEOUT", "0"))
 CHAT_MODE_STATE_FILE = Path(
     os.environ.get("CHAT_MODE_STATE_FILE", "/var/lib/tg-gemma-bot/chat-modes.json")
 )
@@ -85,6 +87,10 @@ TOKEN_LIMITS = {}
 CHAT_LOCKS = {}
 CHAT_MODES = {}
 STATE_LOCK = threading.Lock()
+CLAW_OPERATION_LOCK = threading.Lock()
+CLAW_OPERATION_EPOCHS = {}
+ACTIVE_CLAW_OPERATIONS = {}
+ACTIVE_VISION_PROCESSES = {}
 EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=BOT_MAX_CONCURRENT_REQUESTS,
     thread_name_prefix="tg-gemma",
@@ -144,6 +150,68 @@ class ImageInputError(ValueError):
 
 class ClawBridgeError(RuntimeError):
     """A user-safe error returned by the local Claw project bridge."""
+
+
+class ClawOperationStopped(RuntimeError):
+    """A Claw operation cancelled explicitly through `/stop`."""
+
+
+def begin_claw_operation(chat_id):
+    """Register local preprocessing and return its cancellation identity."""
+
+    with CLAW_OPERATION_LOCK:
+        epoch = CLAW_OPERATION_EPOCHS.get(chat_id, 0)
+        operation_id = f"{os.getpid()}-{time.monotonic_ns()}-{threading.get_ident()}"
+        ACTIVE_CLAW_OPERATIONS.setdefault(chat_id, set()).add(operation_id)
+        return epoch, operation_id
+
+
+def finish_claw_operation(chat_id, operation_id):
+    with CLAW_OPERATION_LOCK:
+        active = ACTIVE_CLAW_OPERATIONS.get(chat_id)
+        if active is None:
+            return
+        active.discard(operation_id)
+        if not active:
+            ACTIVE_CLAW_OPERATIONS.pop(chat_id, None)
+
+
+def ensure_claw_operation_active(chat_id, epoch):
+    with CLAW_OPERATION_LOCK:
+        current = CLAW_OPERATION_EPOCHS.get(chat_id, 0)
+    if current != epoch:
+        raise ClawOperationStopped("Claw operation was stopped")
+
+
+def _terminate_process_group(process):
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+        process.wait(timeout=3)
+        return
+    except (ProcessLookupError, subprocess.TimeoutExpired):
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def cancel_claw_operation(chat_id):
+    """Invalidate local work and terminate an active Vision subprocess."""
+
+    with CLAW_OPERATION_LOCK:
+        CLAW_OPERATION_EPOCHS[chat_id] = CLAW_OPERATION_EPOCHS.get(chat_id, 0) + 1
+        operation_ids = tuple(sorted(ACTIVE_CLAW_OPERATIONS.get(chat_id, set())))
+        processes = tuple(ACTIVE_VISION_PROCESSES.get(chat_id, {}).values())
+    for process in processes:
+        _terminate_process_group(process)
+    return operation_ids, bool(processes)
 
 
 def main_keyboard():
@@ -585,10 +653,8 @@ def claw_request(path, payload, timeout=CLAW_REQUEST_TIMEOUT):
     return response
 
 
-def claw_vision_context(user_text, data, mime_type):
-    if mime_type not in ALLOWED_IMAGE_MIME_TYPES:
-        return ""
-    messages = [
+def _claw_vision_messages(user_text, data, mime_type):
+    return [
         {
             "role": "system",
             "content": f"{load_system_prompt()}\n\n{CLAW_VISION_SYSTEM_PROMPT}",
@@ -602,12 +668,100 @@ def claw_vision_context(user_text, data, mime_type):
             ),
         },
     ]
-    content, usage, elapsed = llm_chat(
-        messages,
-        max_tokens=CLAW_VISION_MAX_TOKENS,
-        temperature=0,
-        timeout=max(REQUEST_TIMEOUT, 600),
+
+
+def _claw_vision_worker_main():
+    """Run unbounded Vision inference in a process `/stop` can terminate."""
+
+    protocol_stream = sys.stdout
+    try:
+        request = json.load(sys.stdin)
+        data = base64.b64decode(request["data_base64"], validate=True)
+        # Keep the stdout protocol machine-readable even if prompt loading or
+        # a future helper emits diagnostics with print().
+        sys.stdout = sys.stderr
+        content, usage, elapsed = llm_chat(
+            _claw_vision_messages(
+                str(request.get("user_text") or ""),
+                data,
+                str(request["mime_type"]),
+            ),
+            max_tokens=CLAW_VISION_MAX_TOKENS,
+            temperature=0,
+            timeout=CLAW_VISION_REQUEST_TIMEOUT,
+        )
+        json.dump(
+            {"content": content, "usage": usage, "elapsed": elapsed},
+            protocol_stream,
+            ensure_ascii=False,
+        )
+        protocol_stream.flush()
+        return 0
+    except Exception as error:
+        print(f"Claw Vision worker failed: {error!r}", file=sys.stderr, flush=True)
+        return 1
+    finally:
+        sys.stdout = protocol_stream
+
+
+def claw_vision_context(
+    chat_id,
+    operation_epoch,
+    operation_id,
+    user_text,
+    data,
+    mime_type,
+):
+    if mime_type not in ALLOWED_IMAGE_MIME_TYPES:
+        return ""
+    ensure_claw_operation_active(chat_id, operation_epoch)
+    process = subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), "--claw-vision-worker"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
     )
+    with CLAW_OPERATION_LOCK:
+        if CLAW_OPERATION_EPOCHS.get(chat_id, 0) != operation_epoch:
+            cancelled_before_registration = True
+        else:
+            ACTIVE_VISION_PROCESSES.setdefault(chat_id, {})[operation_id] = process
+            cancelled_before_registration = False
+    if cancelled_before_registration:
+        _terminate_process_group(process)
+        raise ClawOperationStopped("Claw operation was stopped")
+
+    request = json.dumps(
+        {
+            "user_text": user_text,
+            "data_base64": base64.b64encode(data).decode("ascii"),
+            "mime_type": mime_type,
+        },
+        ensure_ascii=False,
+    )
+    try:
+        stdout, stderr = process.communicate(request, timeout=None)
+    finally:
+        with CLAW_OPERATION_LOCK:
+            active = ACTIVE_VISION_PROCESSES.get(chat_id)
+            if active is not None and active.get(operation_id) is process:
+                active.pop(operation_id, None)
+                if not active:
+                    ACTIVE_VISION_PROCESSES.pop(chat_id, None)
+
+    ensure_claw_operation_active(chat_id, operation_epoch)
+    if process.returncode != 0:
+        detail = stderr.strip().splitlines()[-1] if stderr.strip() else "unknown error"
+        raise RuntimeError(f"Claw Vision worker failed: {detail[-1000:]}")
+    try:
+        result = json.loads(stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("Claw Vision worker returned invalid JSON") from error
+    content = str(result.get("content") or "")
+    usage = result.get("usage") or {}
+    elapsed = float(result.get("elapsed") or 0)
     print(
         f"Claw attachment vision preprocessing elapsed={elapsed:.2f}s usage={usage}",
         flush=True,
@@ -615,8 +769,27 @@ def claw_vision_context(user_text, data, mime_type):
     return content
 
 
-def claw_answer(chat_id, user_id, text, attachment=None, attachment_data=None):
-    payload = {"chat_id": chat_id, "user_id": user_id, "text": text}
+def claw_answer(
+    chat_id,
+    user_id,
+    text,
+    attachment=None,
+    attachment_data=None,
+    operation_epoch=None,
+    operation_id=None,
+):
+    if operation_epoch is None:
+        with CLAW_OPERATION_LOCK:
+            operation_epoch = CLAW_OPERATION_EPOCHS.get(chat_id, 0)
+    if operation_id is None:
+        operation_id = f"direct-{os.getpid()}-{time.monotonic_ns()}"
+    ensure_claw_operation_active(chat_id, operation_epoch)
+    payload = {
+        "chat_id": chat_id,
+        "user_id": user_id,
+        "text": text,
+        "operation_id": operation_id,
+    }
     if attachment is not None and attachment_data is not None:
         mime_type = attachment["declared_mime_type"]
         payload["attachment"] = {
@@ -626,12 +799,26 @@ def claw_answer(chat_id, user_id, text, attachment=None, attachment_data=None):
         }
         try:
             payload["vision_context"] = claw_vision_context(
-                text, attachment_data, mime_type
+                chat_id,
+                operation_epoch,
+                operation_id,
+                text,
+                attachment_data,
+                mime_type,
             )
+        except ClawOperationStopped:
+            raise
         except Exception as error:
             print("Claw Vision preprocessing warning:", repr(error), flush=True)
             payload["vision_context"] = ""
-    return claw_request("/v1/message", payload)["message"]
+    ensure_claw_operation_active(chat_id, operation_epoch)
+    try:
+        response = claw_request("/v1/message", payload)
+    except ClawBridgeError:
+        ensure_claw_operation_active(chat_id, operation_epoch)
+        raise
+    ensure_claw_operation_active(chat_id, operation_epoch)
+    return response["message"]
 
 
 def claw_projects_text(chat_id):
@@ -859,16 +1046,30 @@ def handle_message(message):
             send_message(chat_id, f"Не удалось открыть проект: {error}", reply_to=message_id)
         return
     if text in {"⛔ Остановить Claw", "/stop"} or text.startswith("/stop "):
+        operation_ids, vision_stopped = cancel_claw_operation(chat_id)
+        local_stopped = bool(operation_ids) or vision_stopped
         try:
-            response = claw_request("/v1/stop", {"chat_id": chat_id}, timeout=15)
+            response = claw_request(
+                "/v1/stop",
+                {"chat_id": chat_id, "operation_ids": operation_ids},
+                timeout=15,
+            )
+            stopped = local_stopped or response.get("stopped")
             result = (
                 "Текущая операция Claw остановлена. Проект и завершённый контекст сохранены."
-                if response.get("stopped")
+                if stopped
                 else "У Claw сейчас нет выполняющейся операции."
             )
             send_message(chat_id, result, reply_to=message_id)
         except ClawBridgeError as error:
-            send_message(chat_id, f"Не удалось остановить Claw: {error}", reply_to=message_id)
+            if local_stopped:
+                send_message(
+                    chat_id,
+                    "Локальная подготовка Claw остановлена; bridge сейчас недоступен.",
+                    reply_to=message_id,
+                )
+            else:
+                send_message(chat_id, f"Не удалось остановить Claw: {error}", reply_to=message_id)
         return
     if text in {"❌ Закрыть проект", "/closeclaw"} or text.startswith("/closeclaw "):
         try:
@@ -908,9 +1109,11 @@ def handle_message(message):
             chat_id,
             "Claw работает внутри отдельной одноразовой VM в режиме "
             "danger-full-access: команды и установка пакетов выполняются автоматически, "
-            "без промежуточного подтверждения в Telegram. Остановить текущую операцию "
-            "можно кнопкой «⛔ Остановить Claw» или /stop. Доступа к VM120, "
-            "гипервизору, Telegram-токену и GitHub write-ключу у агента нет.",
+            "без промежуточного подтверждения в Telegram. Доступны публичные и частные "
+            "сети, полный набор инструментов и переменные окружения сервиса, включая "
+            "настроенные рабочие credentials. Остановить текущую операцию можно кнопкой "
+            "«⛔ Остановить Claw» или /stop. Граница изоляции — сама VM; доступ к "
+            "гипервизору предоставляется только если он отдельно настроен в окружении.",
             reply_to=message_id,
         )
         return
@@ -944,6 +1147,9 @@ def handle_message(message):
         return
 
     send_typing(chat_id)
+    operation_identity = (
+        begin_claw_operation(chat_id) if current_mode == MODE_CLAW else None
+    )
     try:
         attachment_data = None
         attachment_mime_type = None
@@ -963,6 +1169,8 @@ def handle_message(message):
                 text,
                 attachment=attachment,
                 attachment_data=attachment_data,
+                operation_epoch=(operation_identity[0] if operation_identity else None),
+                operation_id=(operation_identity[1] if operation_identity else None),
             )
         else:
             answer = llm_answer(
@@ -974,6 +1182,8 @@ def handle_message(message):
         send_message(chat_id, answer, reply_to=message_id)
     except ImageInputError as error:
         send_message(chat_id, str(error), reply_to=message_id)
+    except ClawOperationStopped:
+        return
     except Exception as error:
         print("ERROR handling message:", repr(error), flush=True)
         traceback.print_exc()
@@ -982,6 +1192,9 @@ def handle_message(message):
             "Ошибка при запросе к локальной модели или Claw. Подробности записаны в журнал сервиса.",
             reply_to=message_id,
         )
+    finally:
+        if operation_identity is not None:
+            finish_claw_operation(chat_id, operation_identity[1])
 
 
 def is_control_message(message):
@@ -1078,4 +1291,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--claw-vision-worker"]:
+        sys.exit(_claw_vision_worker_main())
     sys.exit(main())

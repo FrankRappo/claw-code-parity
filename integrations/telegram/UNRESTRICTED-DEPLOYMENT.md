@@ -20,17 +20,19 @@ tool, environment, or output-truncation blockers.
 | Private IPv4 egress denial | The production UFW deny rules are removed. | Internal HTTP, SSH, Git, API, DNS, model, and administration endpoints must be reachable when routed. |
 | Forced HTTP-to-HTTPS rewrite | `WebFetch` preserves an explicitly supplied `http://` URL. | Internal services and development endpoints often expose HTTP only. |
 | Native-web result, redirect, and wall-clock caps | Web fetch returns the complete normalized body, search returns every parsed hit, redirects are not count-limited, requests have no automatic wall-clock cutoff, and `RemoteTrigger` returns the complete response body. | Native tools should be useful without immediately falling back to shell commands; `/stop` is the operator-controlled cancellation path. |
+| Implicit MCP lifecycle/tool-call timeouts | MCP initialize, discovery, resource, and tool calls have no implicit cutoff in unrestricted mode; an explicitly configured MCP tool timeout is still honored. | Long-running MCP automation must not be terminated by a hidden default. |
+| Stale-branch workspace-test preflight | The preflight is bypassed when `CLAW_UNRESTRICTED=1`. | Branch freshness may be useful advice, but it must not suppress an explicitly requested command in this profile. |
 | Bash output capped at 16 KiB | stdout and stderr are returned in full. | Build logs, test reports, API responses, and diagnostics were losing decisive tail content. |
 | File read/write and search result caps | The 10 MiB file caps and default glob/grep result caps are disabled in unrestricted mode. | Large generated files and repository-wide analysis must remain available. |
 | Project instruction prompt capped at 4,000/12,000 characters | All discovered instruction files are included in full in unrestricted mode. | The user requires the complete prompt, not a silently truncated subset. |
 | Bridge prompt and Vision/OCR text slicing | Prompt, Vision context, and OCR text are forwarded in full. | Relevant input must not disappear before reaching Claw. |
-| Claw, Telegram-to-Claw, and OCR wall-clock cutoffs | `CLAW_TURN_TIMEOUT=0`, `CLAW_REQUEST_TIMEOUT=0`, and `CLAW_OCR_TIMEOUT=0` keep work open until completion or operator cancellation. | Builds, package installation, OCR, child work, and long tool loops can exceed a fixed wall-clock timeout. |
+| Claw, Telegram-to-Claw, Vision, and OCR wall-clock cutoffs | `CLAW_TURN_TIMEOUT=0`, `CLAW_REQUEST_TIMEOUT=0`, `CLAW_VISION_REQUEST_TIMEOUT=0`, and `CLAW_OCR_TIMEOUT=0` keep work open until completion or operator cancellation. | Builds, package installation, Vision/OCR, child work, and long tool loops can exceed a fixed wall-clock timeout. |
 
 ## Limits retained because they are physical or protocol requirements
 
 | Retained behavior | Value | Technical reason |
 |---|---:|---|
-| Simultaneously active built-in child Agents | **1** | The server has exactly two inference slots: parent plus one child. The global permit also prevents recursive fan-out from exceeding those slots. |
+| Simultaneously active built-in child Agents | **1** | The server has exactly two inference slots: parent plus one child. A shared OS advisory `flock` enforces this across separate top-level Claw processes, releases automatically if a process dies, and also prevents recursive fan-out. |
 | Simultaneous top-level bridge turns | **2** | Matches the same two physical model slots. Extra chats wait rather than overcommitting inference. |
 | Claw completion ceiling | **32,000 tokens** | Matches the current default Opus completion budget in Claw Code. It is only a ceiling; EOS still ends short answers normally. |
 | Automatic compaction input point | **110,000 tokens** | Measured for a 163,840-token slot. It preserves room for the complete system/project prompt, all tool schemas/results, and up to 32,000 output tokens. |
