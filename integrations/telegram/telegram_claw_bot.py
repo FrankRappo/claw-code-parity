@@ -923,6 +923,47 @@ def progress_phase_text(phase):
     }.get(str(phase or ""), str(phase or "неизвестно"))
 
 
+def is_claw_progress_question(text):
+    """Recognize natural-language status questions without steering the turn."""
+
+    normalized = " ".join(
+        "".join(
+            character if character.isalnum() else " "
+            for character in str(text or "").casefold().replace("ё", "е")
+        ).split()
+    )
+    words = set(normalized.split())
+    if not words:
+        return False
+    if "что" in words and words.intersection(
+        {"делаешь", "делает", "делаете", "делают", "происходит"}
+    ):
+        return True
+    if "чем" in words and words.intersection(
+        {
+            "занят",
+            "занята",
+            "заняты",
+            "занимаешься",
+            "занимается",
+            "остановился",
+            "остановилась",
+        }
+    ):
+        return True
+    if "где" in words and words.intersection({"остановился", "остановилась"}):
+        return True
+    if words.intersection({"завис", "зависла", "зависло", "повис", "повисла"}) and (
+        "не" in words or "ли" in words
+    ):
+        return True
+    if words.intersection({"прогресс", "статус"}) and len(words) <= 10:
+        return True
+    if "как" in words and any(word.startswith("продвига") for word in words):
+        return True
+    return False
+
+
 def claw_progress_text(chat_id):
     response = claw_request("/v1/progress", {"chat_id": chat_id}, timeout=15)
     if not response.get("running") and not response.get("paused"):
@@ -1361,6 +1402,17 @@ def handle_message(message):
             )
         except ClawBridgeError:
             pass
+
+    if current_mode == MODE_CLAW and is_claw_progress_question(text):
+        try:
+            send_message(chat_id, claw_progress_text(chat_id), reply_to=message_id)
+        except ClawBridgeError as error:
+            send_message(
+                chat_id,
+                f"Не удалось получить ход работы Claw: {error}",
+                reply_to=message_id,
+            )
+        return
 
     if current_mode == MODE_CLAW and claw_operation_active:
         if attachment is not None:

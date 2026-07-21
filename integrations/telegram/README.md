@@ -10,7 +10,9 @@ deployment without adding a separate OCR menu.
 - **Stop** interrupts only the running operation; completed context remains.
 - **Progress** (`/progress` or **📊 Ход работы**) reports the current model/tool
   phase, elapsed time, last phase change, matching child Agents, and whether the
-  turn may be stalled.
+  turn may be stalled. Natural questions such as «что ты сейчас делаешь?»,
+  «на чём остановился?» and «не завис ли?» return the same live progress without
+  interrupting or steering the active turn.
 - An ordinary text message during a running turn is a live steering update: the
   current process is interrupted, its durable state is checkpointed, and the
   same project resumes with the correction. `/next TEXT` queues work without

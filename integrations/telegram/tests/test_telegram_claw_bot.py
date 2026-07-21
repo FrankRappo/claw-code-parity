@@ -558,6 +558,46 @@ class ClawModeTests(unittest.TestCase):
         )
         self.assertIn("Уточнение принято", send.call_args.args[1])
 
+    def test_natural_progress_question_does_not_interrupt_the_active_turn(self):
+        progress = {
+            "ok": True,
+            "running": True,
+            "health": "working",
+            "elapsed_seconds": 73,
+            "last_activity_seconds": 4,
+            "phase": "tool",
+            "tool_name": "Bash",
+            "detail": "проверяет сетевую конфигурацию",
+            "agents": [],
+        }
+        for text in (
+            "что ты сейцас делаешь ?",
+            "Такинапиши ответь на вопрос на чем остановился",
+            "ты не повис?",
+        ):
+            with self.subTest(text=text):
+                bot.CHAT_MODES[10] = bot.MODE_CLAW
+                bot.ACTIVE_CLAW_OPERATIONS[10] = {"operation-1"}
+                message = {
+                    "chat": {"id": 10},
+                    "from": {"id": 20},
+                    "message_id": 30,
+                    "text": text,
+                }
+                with mock.patch.object(bot, "ALLOWED", set()), mock.patch.object(
+                    bot, "ALLOWED_USERNAMES", set()
+                ), mock.patch.object(bot, "claw_answer") as answer, mock.patch.object(
+                    bot, "claw_request", return_value=progress
+                ) as request, mock.patch.object(bot, "send_message") as send:
+                    bot.handle_message(message)
+
+                answer.assert_not_called()
+                request.assert_called_once_with(
+                    "/v1/progress", {"chat_id": 10}, timeout=15
+                )
+                self.assertIn("проверяет сетевую конфигурацию", send.call_args.args[1])
+                self.assertNotIn("Уточнение принято", send.call_args.args[1])
+
     def test_begin_claw_operation_is_atomic_per_chat(self):
         first = bot.begin_claw_operation(10)
         second = bot.begin_claw_operation(10)
