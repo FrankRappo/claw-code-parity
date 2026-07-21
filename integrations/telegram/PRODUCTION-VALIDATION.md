@@ -97,6 +97,21 @@ and are not in the live request path. The former special-case private-network
 exception is obsolete because unrestricted production now permits routed
 private egress generally.
 
+## Operational follow-up: storage monitoring
+
+Durable session archives, event journals, attachment history, and rollback
+checkpoints are intentionally not deleted automatically. This preserves
+lossless recovery, but disk consumption grows with long-running projects.
+
+Add host monitoring and alerts for both free filesystem space and per-project
+`.claw/` growth. Alert before the VM falls below 20% free space or 25 GiB,
+whichever threshold is reached first. A future retention command may export and
+verify old immutable generations before pruning them, but it must never remove
+the active session, latest recovery checkpoint, current plan/project memory, or
+the archive chain required by that checkpoint. Until such a verified retention
+workflow exists, cleanup remains an explicit operator action rather than a
+silent automatic policy.
+
 ## Incident: persisted turn with missing CLI stdout
 
 On 2026-07-21 Telegram reported `Claw returned no JSON result` for one resumed
