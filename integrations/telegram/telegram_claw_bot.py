@@ -806,6 +806,7 @@ def claw_answer(
     attachment_data=None,
     operation_epoch=None,
     operation_id=None,
+    preserve_plan=False,
 ):
     if operation_epoch is None:
         with CLAW_OPERATION_LOCK:
@@ -819,6 +820,8 @@ def claw_answer(
         "text": text,
         "operation_id": operation_id,
     }
+    if preserve_plan:
+        payload["preserve_plan"] = True
     if attachment is not None and attachment_data is not None:
         mime_type = attachment["declared_mime_type"]
         payload["attachment"] = {
@@ -1363,6 +1366,7 @@ def handle_message(message):
                         restart_prompt,
                         operation_epoch=operation_identity[0],
                         operation_id=operation_identity[1],
+                        preserve_plan=True,
                     )
                     send_message(chat_id, answer, reply_to=message_id)
                 finally:

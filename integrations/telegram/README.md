@@ -77,6 +77,10 @@ explicit no-progress escalation rules, not task-duration timeouts.
 `.claw/project-memory.json` stores corrections with
 provenance/TTL, `.claw/events.jsonl` is an append-only audit journal, and
 `.claw/checkpoints/` holds non-destructive Git/untracked recovery points.
+`/continue` preserves this existing plan during service-restart recovery rather
+than replacing it with a synthetic recovery plan. `/stop` also tombstones the
+bridge's active operation when the Telegram process no longer has its local ID,
+so an interrupted recovered turn cannot enter the retry loop.
 
 The parent and child expose the complete built-in tool registry, including
 `WebFetch`, `WebSearch`, `RemoteTrigger`, `MCP`, `ToolSearch`, shell, filesystem,

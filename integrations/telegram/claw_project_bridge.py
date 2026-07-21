@@ -1521,11 +1521,14 @@ class ClawRunner:
 
     def stop(self, chat_id: str, operation_ids: tuple[str, ...] = ()) -> bool:
         with self._active_lock:
-            if operation_ids:
-                self._cancelled_operation_ids.setdefault(chat_id, set()).update(
-                    operation_ids
-                )
             turn = self._active.get(chat_id)
+            cancellation_ids = operation_ids
+            if not cancellation_ids and turn is not None:
+                cancellation_ids = (turn.operation_id,)
+            if cancellation_ids:
+                self._cancelled_operation_ids.setdefault(chat_id, set()).update(
+                    cancellation_ids
+                )
         if turn is None or turn.process.poll() is not None:
             return False
         self._terminate(turn.process, signal.SIGINT)
@@ -1953,7 +1956,8 @@ class BridgeApplication:
                 text, attachment_path, mime_type, vision_context, ocr_context
             )
             create_project_checkpoint(project, "before operator turn")
-            self.ensure_autonomous_plan(project, text, operation_id)
+            if payload.get("preserve_plan") is not True:
+                self.ensure_autonomous_plan(project, text, operation_id)
             started = time.monotonic()
             result = self.runner.run_turn(chat_id, project, prompt, operation_id)
             session_id = str(result.get("session_id") or "")

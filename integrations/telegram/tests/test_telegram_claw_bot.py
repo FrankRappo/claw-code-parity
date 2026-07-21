@@ -716,6 +716,7 @@ class ClawModeTests(unittest.TestCase):
         )
         answer.assert_called_once()
         self.assertEqual(answer.call_args.args[:3], (10, 20, "recover persisted task"))
+        self.assertTrue(answer.call_args.kwargs["preserve_plan"])
         self.assertEqual(send.call_args.args[1], "recovered answer")
         self.assertNotIn(10, bot.ACTIVE_CLAW_OPERATIONS)
 

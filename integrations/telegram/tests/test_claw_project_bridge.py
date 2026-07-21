@@ -1,5 +1,6 @@
 import base64
 import json
+import signal
 import tempfile
 import threading
 import time
@@ -641,6 +642,27 @@ print(json.dumps({"message": "done", "session_id": "session-1"}))
 
             popen.assert_not_called()
 
+    def test_stop_without_client_operation_id_cancels_the_active_turn(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner = bridge.ClawRunner(test_config(root))
+            process = mock.Mock()
+            process.poll.return_value = None
+            runner._active["7"] = bridge.ActiveTurn(
+                process=process,
+                started_at=time.time(),
+                progress_file=root / "progress.json",
+                operation_id="bridge-operation",
+            )
+
+            with mock.patch.object(runner, "_terminate") as terminate:
+                self.assertTrue(runner.stop("7"))
+
+            terminate.assert_called_once_with(process, signal.SIGINT)
+            self.assertIn(
+                "bridge-operation", runner._cancelled_operation_ids["7"]
+            )
+
     def test_recovers_completed_turn_from_changed_session_when_stdout_is_lost(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -749,6 +771,36 @@ class ApplicationTests(unittest.TestCase):
             self.assertEqual(
                 plan["todos"][0]["idempotencyKey"], "operation-1"
             )
+
+    def test_recovery_message_preserves_the_existing_durable_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            application = bridge.BridgeApplication(test_config(root))
+            application.store.new_project("7", "Recovery")
+            fake_result = {
+                "message": "Recovered",
+                "session_id": "session-99",
+                "session_path": "/sessions/session-99.jsonl",
+                "usage": None,
+                "auto_compaction": None,
+            }
+
+            with mock.patch.object(
+                application, "ensure_autonomous_plan"
+            ) as ensure_plan, mock.patch.object(
+                application.runner, "run_turn", return_value=fake_result
+            ):
+                application.message(
+                    {
+                        "chat_id": 7,
+                        "user_id": 8,
+                        "text": "recover durable task",
+                        "operation_id": "operation-1",
+                        "preserve_plan": True,
+                    }
+                )
+
+            ensure_plan.assert_not_called()
 
     def test_attachment_validation_and_effective_prompt(self):
         with tempfile.TemporaryDirectory() as directory:
