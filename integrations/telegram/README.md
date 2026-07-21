@@ -11,8 +11,8 @@ deployment without adding a separate OCR menu.
 - **Progress** (`/progress` or **📊 Ход работы**) reports the current model/tool
   phase, elapsed time, last phase change, matching child Agents, and whether the
   turn may be stalled. Natural questions such as «что ты сейчас делаешь?»,
-  «на чём остановился?» and «не завис ли?» use a separate read-only Gemma
-  observer. It receives a bounded summary of the durable plan, latest
+  «на чём остановился?», «опиши эту задачу» and «не завис ли?» use a separate
+  read-only Gemma observer. It receives a bounded summary of the durable plan, latest
   checkpoint, recent events, and last tool, then answers naturally without
   interrupting or steering the active turn. If both model slots are busy, the
   bot returns the technical progress immediately instead of queueing observer

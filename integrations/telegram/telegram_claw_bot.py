@@ -967,6 +967,17 @@ def is_claw_progress_question(text):
         return True
     if "как" in words and any(word.startswith("продвига") for word in words):
         return True
+    describes = any(
+        word.startswith(("опиш", "расскаж", "объясн")) for word in words
+    )
+    activity = any(
+        word.startswith(("задач", "работ", "процесс", "действ")) for word in words
+    )
+    current_reference = any(
+        word.startswith(("эт", "текущ", "данн", "сво")) for word in words
+    )
+    if describes and activity and current_reference:
+        return True
     return False
 
 

@@ -582,6 +582,8 @@ class ClawModeTests(unittest.TestCase):
             "что ты сейцас делаешь ?",
             "Такинапиши ответь на вопрос на чем остановился",
             "ты не повис?",
+            "опиши эту задачу",
+            "расскажи о текущей работе",
         ):
             with self.subTest(text=text):
                 bot.CHAT_MODES[10] = bot.MODE_CLAW
@@ -616,6 +618,8 @@ class ClawModeTests(unittest.TestCase):
                 observer.assert_called_once()
                 self.assertIn("Сейчас я проверяю маршрутизацию", send.call_args.args[1])
                 self.assertNotIn("Уточнение принято", send.call_args.args[1])
+
+        self.assertFalse(bot.is_claw_progress_question("Опиши конфигурацию Hysteria 2"))
 
     def test_natural_progress_question_falls_back_when_all_model_slots_are_busy(self):
         bot.CHAT_MODES[10] = bot.MODE_CLAW
