@@ -23,6 +23,7 @@ const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_
 pub struct ApiRequest {
     pub system_prompt: Vec<String>,
     pub messages: Vec<ConversationMessage>,
+    pub forced_tool: Option<String>,
 }
 
 /// Streamed events emitted while processing a single assistant turn.
@@ -136,6 +137,7 @@ pub struct ConversationRuntime<C, T> {
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     session_tracer: Option<SessionTracer>,
+    next_forced_tool: Option<String>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -185,6 +187,7 @@ where
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
             session_tracer: None,
+            next_forced_tool: None,
         }
     }
 
@@ -219,6 +222,11 @@ where
     pub fn with_session_tracer(mut self, session_tracer: SessionTracer) -> Self {
         self.session_tracer = Some(session_tracer);
         self
+    }
+
+    /// Force one named tool on the next provider request only.
+    pub fn force_tool_for_next_request(&mut self, tool_name: impl Into<String>) {
+        self.next_forced_tool = Some(tool_name.into());
     }
 
     fn run_pre_tool_use_hook(&mut self, tool_name: &str, input: &str) -> HookRunResult {
@@ -326,6 +334,7 @@ where
             let request = ApiRequest {
                 system_prompt: self.system_prompt.clone(),
                 messages: self.session.messages.clone(),
+                forced_tool: self.next_forced_tool.take(),
             };
             let events = match self.api_client.stream(request) {
                 Ok(events) => events,
@@ -957,6 +966,56 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn forced_tool_applies_only_to_the_next_provider_request() {
+        struct ForcedToolApi {
+            call_count: usize,
+        }
+
+        impl ApiClient for ForcedToolApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.call_count += 1;
+                match self.call_count {
+                    1 => {
+                        assert_eq!(request.forced_tool.as_deref(), Some("Agent"));
+                        Ok(vec![
+                            AssistantEvent::ToolUse {
+                                id: "tool-1".to_string(),
+                                name: "echo".to_string(),
+                                input: "delegated".to_string(),
+                            },
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    2 => {
+                        assert_eq!(request.forced_tool, None);
+                        Ok(vec![
+                            AssistantEvent::TextDelta("done".to_string()),
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    _ => unreachable!("extra API call"),
+                }
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            ForcedToolApi { call_count: 0 },
+            StaticToolExecutor::new().register("echo", |input| Ok(input.to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+        runtime.force_tool_for_next_request("Agent");
+
+        let summary = runtime
+            .run_turn("delegate this", None)
+            .expect("forced tool turn should succeed");
+
+        assert_eq!(summary.iterations, 2);
+        assert_eq!(summary.tool_results.len(), 1);
     }
 
     #[test]

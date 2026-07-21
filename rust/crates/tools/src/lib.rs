@@ -3495,13 +3495,26 @@ impl ApiClient for ProviderRuntimeClient {
                 input_schema: spec.input_schema,
             })
             .collect::<Vec<_>>();
+        let tool_choice = if tools.is_empty() {
+            None
+        } else if let Some(name) = request.forced_tool.as_deref().filter(|name| {
+            tools
+                .iter()
+                .any(|tool| tool.name.eq_ignore_ascii_case(name))
+        }) {
+            Some(ToolChoice::Tool {
+                name: name.to_string(),
+            })
+        } else {
+            Some(ToolChoice::Auto)
+        };
         let message_request = MessageRequest {
             model: self.model.clone(),
             max_tokens: max_tokens_for_model(&self.model),
             messages: convert_messages(&request.messages),
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
             tools: (!tools.is_empty()).then_some(tools),
-            tool_choice: (!self.allowed_tools.is_empty()).then_some(ToolChoice::Auto),
+            tool_choice,
             stream: true,
         };
 

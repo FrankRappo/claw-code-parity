@@ -693,6 +693,199 @@ fn filter_tool_specs(
     tool_registry.definitions(allowed_tools)
 }
 
+fn tool_choice_for_request(
+    tools: Option<&[ToolDefinition]>,
+    forced_tool: Option<&str>,
+) -> Option<ToolChoice> {
+    let tools = tools.filter(|tools| !tools.is_empty())?;
+    forced_tool
+        .filter(|name| {
+            tools
+                .iter()
+                .any(|tool| tool.name.eq_ignore_ascii_case(name))
+        })
+        .map_or_else(
+            || Some(ToolChoice::Auto),
+            |name| {
+                Some(ToolChoice::Tool {
+                    name: name.to_string(),
+                })
+            },
+        )
+}
+
+fn delegation_intent_tokens(input: &str) -> Vec<String> {
+    input
+        .to_lowercase()
+        .replace('ё', "е")
+        .replace("don't", "dont")
+        .chars()
+        .map(|ch| if ch.is_alphanumeric() { ch } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+fn is_agent_intent_token(token: &str) -> bool {
+    matches!(
+        token,
+        "agent"
+            | "agents"
+            | "subagent"
+            | "subagents"
+            | "агент"
+            | "агента"
+            | "агенту"
+            | "агентом"
+            | "агенте"
+            | "агенты"
+            | "агентов"
+            | "агентам"
+            | "агентами"
+            | "субагент"
+            | "субагента"
+            | "субагенту"
+            | "субагентом"
+    )
+}
+
+fn delegation_marker_is_negated(tokens: &[String], marker_index: usize) -> bool {
+    tokens[marker_index.saturating_sub(2)..marker_index]
+        .iter()
+        .any(|token| {
+            matches!(
+                token.as_str(),
+                "не" | "ни" | "никогда" | "not" | "dont" | "no"
+            )
+        })
+}
+
+fn delegation_request_is_question_like(input: &str, tokens: &[String]) -> bool {
+    input.contains('?')
+        || tokens.iter().any(|token| token == "ли")
+        || tokens.first().is_some_and(|token| {
+            matches!(
+                token.as_str(),
+                "как"
+                    | "почему"
+                    | "зачем"
+                    | "что"
+                    | "кто"
+                    | "можно"
+                    | "может"
+                    | "умеет"
+                    | "способен"
+                    | "how"
+                    | "why"
+                    | "what"
+                    | "can"
+                    | "could"
+                    | "would"
+                    | "does"
+                    | "is"
+            )
+        })
+}
+
+fn delegation_request_is_meta_discussion(tokens: &[String]) -> bool {
+    tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "фраза"
+                | "формулировка"
+                | "слово"
+                | "означает"
+                | "значит"
+                | "термин"
+                | "phrase"
+                | "word"
+                | "mean"
+                | "means"
+        )
+    })
+}
+
+fn explicit_agent_delegation_intent(input: &str) -> bool {
+    let tokens = delegation_intent_tokens(input);
+    if tokens.is_empty() {
+        return false;
+    }
+
+    let question_like = delegation_request_is_question_like(input, &tokens);
+    if question_like && delegation_request_is_meta_discussion(&tokens) {
+        return false;
+    }
+
+    let hard_markers = [
+        "пусть",
+        "запусти",
+        "запускай",
+        "создай",
+        "подключи",
+        "поручи",
+        "делегируй",
+        "попроси",
+        "назначь",
+        "отправь",
+        "используй",
+        "дай",
+        "launch",
+        "start",
+        "spawn",
+        "create",
+        "ask",
+        "assign",
+        "delegate",
+        "use",
+        "have",
+        "let",
+    ];
+    let soft_markers = [
+        "должен",
+        "должна",
+        "должны",
+        "нужно",
+        "надо",
+        "хочу",
+        "хотим",
+        "must",
+        "should",
+    ];
+
+    tokens.iter().enumerate().any(|(agent_index, token)| {
+        if !is_agent_intent_token(token) {
+            return false;
+        }
+        if agent_index > 0
+            && matches!(
+                tokens[agent_index - 1].as_str(),
+                "без" | "without" | "user" | "ssh" | "http" | "browser"
+            )
+        {
+            return false;
+        }
+
+        let start = agent_index.saturating_sub(6);
+        let end = (agent_index + 7).min(tokens.len());
+        let window = &tokens[start..end];
+        let hard_match = window.iter().enumerate().any(|(offset, marker)| {
+            hard_markers.contains(&marker.as_str())
+                && !delegation_marker_is_negated(&tokens, start + offset)
+        });
+        if hard_match {
+            return true;
+        }
+        if question_like {
+            return false;
+        }
+        window.iter().enumerate().any(|(offset, marker)| {
+            soft_markers.contains(&marker.as_str())
+                && !delegation_marker_is_negated(&tokens, start + offset)
+        })
+    })
+}
+
 fn parse_system_prompt_args(args: &[String]) -> Result<CliAction, String> {
     let mut cwd = env::current_dir().map_err(|error| error.to_string())?;
     let mut date = DEFAULT_DATE.to_string();
@@ -2516,6 +2709,9 @@ impl LiveCli {
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
+        if explicit_agent_delegation_intent(input) {
+            runtime.force_tool_for_next_request("Agent");
+        }
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
         spinner.tick(
@@ -2569,6 +2765,9 @@ impl LiveCli {
 
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
+        if explicit_agent_delegation_intent(input) {
+            runtime.force_tool_for_next_request("Agent");
+        }
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
@@ -5183,15 +5382,17 @@ impl ApiClient for AnthropicRuntimeClient {
         if let Some(progress_reporter) = &self.progress_reporter {
             progress_reporter.mark_model_phase();
         }
+        let tools = self
+            .enable_tools
+            .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref()));
+        let tool_choice = tool_choice_for_request(tools.as_deref(), request.forced_tool.as_deref());
         let message_request = MessageRequest {
             model: self.model.clone(),
             max_tokens: max_tokens_for_model(&self.model),
             messages: convert_messages(&request.messages),
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
-            tools: self
-                .enable_tools
-                .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
-            tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
+            tools,
+            tool_choice,
             stream: true,
         };
 
@@ -6351,27 +6552,28 @@ mod tests {
     use super::{
         build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
         create_managed_session_handle, delete_merged_local_branches_in, describe_tool_progress,
-        filter_tool_specs, format_bughunter_report, format_commit_preflight_report,
-        format_commit_skipped_report, format_compact_report, format_cost_report,
-        format_internal_prompt_progress_line, format_issue_report, format_model_report,
-        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
-        format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
-        format_tool_result, format_ultraplan_report, format_unknown_slash_command,
-        format_unknown_slash_command_message, git_ref_exists_in, normalize_permission_mode,
-        parse_args, parse_git_status_branch, parse_git_status_metadata_for,
-        parse_git_workspace_summary, parse_git_worktrees, parse_hook_args, parse_recent_commits,
-        permission_policy, permission_policy_for_deployment, print_help_to, push_output_block,
-        render_config_report,
-        render_diff_report, render_diff_report_for, render_hook_list_report_for,
-        render_memory_report, render_merged_runtime_config_json, render_repl_help,
-        render_resume_usage, resolve_model_alias, resolve_session_reference, response_to_events,
+        explicit_agent_delegation_intent, filter_tool_specs, format_bughunter_report,
+        format_commit_preflight_report, format_commit_skipped_report, format_compact_report,
+        format_cost_report, format_internal_prompt_progress_line, format_issue_report,
+        format_model_report, format_model_switch_report, format_permissions_report,
+        format_permissions_switch_report, format_pr_report, format_resume_report,
+        format_status_report, format_tool_call_start, format_tool_result, format_ultraplan_report,
+        format_unknown_slash_command, format_unknown_slash_command_message, git_ref_exists_in,
+        normalize_permission_mode, parse_args, parse_git_status_branch,
+        parse_git_status_metadata_for, parse_git_workspace_summary, parse_git_worktrees,
+        parse_hook_args, parse_recent_commits, permission_policy, permission_policy_for_deployment,
+        print_help_to, push_output_block, render_config_report, render_diff_report,
+        render_diff_report_for, render_hook_list_report_for, render_memory_report,
+        render_merged_runtime_config_json, render_repl_help, render_resume_usage,
+        resolve_model_alias, resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command,
-        slash_command_completion_candidates_with_sessions, status_context, validate_no_args,
-        write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitBranchFreshness,
-        GitCommitEntry, GitWorkspaceSummary, GitWorktreeEntry, InternalPromptProgressEvent,
-        InternalPromptProgressState, LiveCli, SlashCommand, StatusUsage, DEFAULT_MODEL,
+        slash_command_completion_candidates_with_sessions, status_context, tool_choice_for_request,
+        validate_no_args, write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor,
+        GitBranchFreshness, GitCommitEntry, GitWorkspaceSummary, GitWorktreeEntry,
+        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, SlashCommand,
+        StatusUsage, DEFAULT_MODEL,
     };
-    use api::{MessageResponse, OutputContentBlock, Usage};
+    use api::{MessageResponse, OutputContentBlock, ToolChoice, ToolDefinition, Usage};
     use plugins::{
         PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
     };
@@ -6417,6 +6619,68 @@ mod tests {
             .expect("time should be after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("rusty-claude-cli-{nanos}"))
+    }
+
+    #[test]
+    fn detects_explicit_agent_delegation_intent_by_meaning() {
+        for prompt in [
+            "Запусти агента, чтобы он проверил сайт",
+            "Пусть агент посмотрит, на какой платформе работает сайт",
+            "Поручи эту проверку агенту",
+            "Агент должен исследовать проект",
+            "Нужно, чтобы агент сделал аудит",
+            "Не делай сам, пусть агент проверит",
+            "Have an agent inspect the deployment",
+            "Delegate this review to an agent",
+        ] {
+            assert!(
+                explicit_agent_delegation_intent(prompt),
+                "expected delegation intent for: {prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn ignores_negated_informational_and_non_claw_agent_mentions() {
+        for prompt in [
+            "Не запускай агента, проверь сам",
+            "Проверь без агента",
+            "Как запустить агента?",
+            "Может ли агент проверить сайт?",
+            "Что умеет агент",
+            "Что означает фраза «запусти агента»?",
+            "Почему агент не запустился",
+            "Используй user-agent браузера",
+            "Do not launch an agent",
+            "Can an agent inspect this?",
+            "Run this without an agent",
+        ] {
+            assert!(
+                !explicit_agent_delegation_intent(prompt),
+                "unexpected delegation intent for: {prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn forced_tool_choice_requires_the_tool_to_be_available() {
+        let tools = vec![ToolDefinition {
+            name: "Agent".to_string(),
+            description: None,
+            input_schema: json!({"type": "object"}),
+        }];
+
+        assert_eq!(
+            tool_choice_for_request(Some(&tools), Some("Agent")),
+            Some(ToolChoice::Tool {
+                name: "Agent".to_string()
+            })
+        );
+        assert_eq!(
+            tool_choice_for_request(Some(&tools), Some("WebFetch")),
+            Some(ToolChoice::Auto)
+        );
+        assert_eq!(tool_choice_for_request(None, Some("Agent")), None);
     }
 
     fn git(args: &[&str], cwd: &Path) {
