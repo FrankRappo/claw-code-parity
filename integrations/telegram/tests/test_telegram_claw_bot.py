@@ -569,6 +569,14 @@ class ClawModeTests(unittest.TestCase):
             "tool_name": "Bash",
             "detail": "проверяет сетевую конфигурацию",
             "agents": [],
+            "observer_context": {
+                "plan": {
+                    "completed": 1,
+                    "total": 3,
+                    "current": "Проверить маршрутизацию",
+                },
+                "last_tool": "Bash",
+            },
         }
         for text in (
             "что ты сейцас делаешь ?",
@@ -588,15 +596,62 @@ class ClawModeTests(unittest.TestCase):
                     bot, "ALLOWED_USERNAMES", set()
                 ), mock.patch.object(bot, "claw_answer") as answer, mock.patch.object(
                     bot, "claw_request", return_value=progress
-                ) as request, mock.patch.object(bot, "send_message") as send:
+                ) as request, mock.patch.object(
+                    bot, "observer_slot_available", return_value=True
+                ), mock.patch.object(
+                    bot,
+                    "llm_chat",
+                    return_value=(
+                        "Сейчас я проверяю маршрутизацию через Bash; выполнен 1 из 3 пунктов.",
+                        {},
+                        0.1,
+                    ),
+                ) as observer, mock.patch.object(bot, "send_message") as send:
                     bot.handle_message(message)
 
                 answer.assert_not_called()
                 request.assert_called_once_with(
                     "/v1/progress", {"chat_id": 10}, timeout=15
                 )
-                self.assertIn("проверяет сетевую конфигурацию", send.call_args.args[1])
+                observer.assert_called_once()
+                self.assertIn("Сейчас я проверяю маршрутизацию", send.call_args.args[1])
                 self.assertNotIn("Уточнение принято", send.call_args.args[1])
+
+    def test_natural_progress_question_falls_back_when_all_model_slots_are_busy(self):
+        bot.CHAT_MODES[10] = bot.MODE_CLAW
+        bot.ACTIVE_CLAW_OPERATIONS[10] = {"operation-1"}
+        progress = {
+            "ok": True,
+            "running": True,
+            "health": "working",
+            "elapsed_seconds": 73,
+            "last_activity_seconds": 4,
+            "phase": "tool",
+            "tool_name": "Bash",
+            "detail": "проверяет сетевую конфигурацию",
+            "agents": [],
+        }
+        message = {
+            "chat": {"id": 10},
+            "from": {"id": 20},
+            "message_id": 30,
+            "text": "что конкретно делаешь?",
+        }
+        with mock.patch.object(bot, "ALLOWED", set()), mock.patch.object(
+            bot, "ALLOWED_USERNAMES", set()
+        ), mock.patch.object(
+            bot, "claw_request", return_value=progress
+        ) as request, mock.patch.object(
+            bot, "observer_slot_available", return_value=False
+        ), mock.patch.object(bot, "llm_chat") as observer, mock.patch.object(
+            bot, "send_message"
+        ) as send:
+            bot.handle_message(message)
+
+        request.assert_called_once_with("/v1/progress", {"chat_id": 10}, timeout=15)
+        observer.assert_not_called()
+        self.assertIn("проверяет сетевую конфигурацию", send.call_args.args[1])
+        self.assertIn("слота Gemma заняты", send.call_args.args[1])
 
     def test_begin_claw_operation_is_atomic_per_chat(self):
         first = bot.begin_claw_operation(10)

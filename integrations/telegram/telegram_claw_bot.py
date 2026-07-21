@@ -63,6 +63,12 @@ CLAW_BRIDGE_TOKEN = os.environ.get("CLAW_BRIDGE_TOKEN", "").strip()
 CLAW_REQUEST_TIMEOUT = int(os.environ.get("CLAW_REQUEST_TIMEOUT", "0"))
 CLAW_VISION_MAX_TOKENS = int(os.environ.get("CLAW_VISION_MAX_TOKENS", "32000"))
 CLAW_VISION_REQUEST_TIMEOUT = int(os.environ.get("CLAW_VISION_REQUEST_TIMEOUT", "0"))
+CLAW_OBSERVER_MAX_TOKENS = max(
+    64, int(os.environ.get("CLAW_OBSERVER_MAX_TOKENS", "512"))
+)
+CLAW_OBSERVER_REQUEST_TIMEOUT = max(
+    10, int(os.environ.get("CLAW_OBSERVER_REQUEST_TIMEOUT", "90"))
+)
 CHAT_MODE_STATE_FILE = Path(
     os.environ.get("CHAT_MODE_STATE_FILE", "/var/lib/tg-gemma-bot/chat-modes.json")
 )
@@ -964,8 +970,7 @@ def is_claw_progress_question(text):
     return False
 
 
-def claw_progress_text(chat_id):
-    response = claw_request("/v1/progress", {"chat_id": chat_id}, timeout=15)
+def claw_progress_text_from_response(response):
     if not response.get("running") and not response.get("paused"):
         return "🟢 Claw готов: выполняющейся задачи нет."
 
@@ -1000,6 +1005,89 @@ def claw_progress_text(chat_id):
     if response.get("latest_checkpoint"):
         lines.append(f"Последний checkpoint: {response.get('latest_checkpoint')}")
     return "\n".join(lines)
+
+
+def claw_progress_text(chat_id):
+    response = claw_request("/v1/progress", {"chat_id": chat_id}, timeout=15)
+    return claw_progress_text_from_response(response)
+
+
+def observer_slot_available():
+    """Fail closed so a status question never queues behind two busy model slots."""
+
+    try:
+        slots = http_json(f"{LLM_BASE_URL}/slots", timeout=3)
+    except Exception:
+        return False
+    return isinstance(slots, list) and any(
+        isinstance(slot, dict) and not slot.get("is_processing") for slot in slots
+    )
+
+
+def claw_observer_answer(user_text, progress):
+    """Ask the same Gemma deployment to narrate read-only durable progress."""
+
+    technical = claw_progress_text_from_response(progress)
+    if not progress.get("running") and not progress.get("paused"):
+        return technical
+    if not observer_slot_available():
+        return technical + "\n\nObserver не запущен: оба слота Gemma заняты."
+
+    context = {
+        key: progress.get(key)
+        for key in (
+            "running",
+            "paused",
+            "health",
+            "phase",
+            "detail",
+            "tool_name",
+            "elapsed_seconds",
+            "last_activity_seconds",
+            "agents",
+            "queue",
+            "latest_checkpoint",
+            "observer_context",
+        )
+    }
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Ты read-only observer активной задачи Claw Code. Ответь по-русски "
+                "от первого лица, кратко и конкретно: что сейчас выполняется, на каком "
+                "пункте план и что было последним подтверждённым действием. Используй "
+                "только переданный live/durable контекст; если факта нет, прямо скажи, "
+                "что он неизвестен. Не предлагай новую задачу, не изменяй план, не вызывай "
+                "инструменты и не утверждай, что текущий процесс остановлен."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Вопрос оператора: {user_text}\n\n"
+                "Текущий read-only контекст:\n"
+                + json.dumps(context, ensure_ascii=False, sort_keys=True)
+            ),
+        },
+    ]
+    try:
+        content, usage, elapsed = llm_chat(
+            messages,
+            CLAW_OBSERVER_MAX_TOKENS,
+            temperature=0.2,
+            timeout=CLAW_OBSERVER_REQUEST_TIMEOUT,
+        )
+    except Exception as error:
+        print(f"Claw observer fallback: {error!r}", flush=True)
+        return technical + "\n\nObserver Gemma недоступен; показан технический статус."
+    if not content:
+        return technical + "\n\nObserver Gemma вернул пустой ответ; показан технический статус."
+    print(
+        f"Claw observer answered elapsed={elapsed:.2f}s usage={usage}",
+        flush=True,
+    )
+    return content
 
 
 def claw_queue_text(chat_id):
@@ -1405,7 +1493,13 @@ def handle_message(message):
 
     if current_mode == MODE_CLAW and is_claw_progress_question(text):
         try:
-            send_message(chat_id, claw_progress_text(chat_id), reply_to=message_id)
+            progress = claw_request("/v1/progress", {"chat_id": chat_id}, timeout=15)
+            send_typing(chat_id)
+            send_message(
+                chat_id,
+                claw_observer_answer(text, progress),
+                reply_to=message_id,
+            )
         except ClawBridgeError as error:
             send_message(
                 chat_id,

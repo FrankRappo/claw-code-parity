@@ -121,6 +121,78 @@ class ProjectStoreTests(unittest.TestCase):
             self.assertEqual(project["name"], "../../escape")
             self.assertTrue(Path(project["workspace"]).is_relative_to(root / "projects"))
 
+    def test_observer_context_summarizes_durable_state_without_tool_secrets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            claw = workspace / ".claw"
+            sessions = claw / "sessions"
+            sessions.mkdir(parents=True)
+            (claw / "plan.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "todos": [
+                            {
+                                "content": "Собрать конфигурацию",
+                                "activeForm": "Собираю конфигурацию",
+                                "status": "completed",
+                                "evidence": "config written",
+                            },
+                            {
+                                "content": "Проверить маршрутизацию",
+                                "activeForm": "Проверяю маршрутизацию",
+                                "status": "in_progress",
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (claw / "events.jsonl").write_text(
+                json.dumps({"event": "turn_started", "timestamp": "t1"})
+                + "\n"
+                + json.dumps({"event": "plan_updated", "timestamp": "t2"})
+                + "\n",
+                encoding="utf-8",
+            )
+            session = sessions / "session-observer.jsonl"
+            session.write_text(
+                json.dumps(
+                    {
+                        "type": "message",
+                        "message": {
+                            "role": "assistant",
+                            "blocks": [
+                                {
+                                    "type": "tool_use",
+                                    "name": "Bash",
+                                    "input": "API_TOKEN=must-not-leak curl example",
+                                }
+                            ],
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            project = {
+                "workspace": str(workspace),
+                "session_path": str(session),
+            }
+
+            context = bridge.project_observer_context(project)
+
+            self.assertEqual(context["plan"]["completed"], 1)
+            self.assertEqual(context["plan"]["total"], 2)
+            self.assertEqual(context["plan"]["current"], "Проверяю маршрутизацию")
+            self.assertEqual(context["last_tool"], "Bash")
+            self.assertEqual(
+                [item["event"] for item in context["recent_events"]],
+                ["turn_started", "plan_updated"],
+            )
+            self.assertNotIn("must-not-leak", json.dumps(context))
+
 
 class RunnerTests(unittest.TestCase):
     def test_agent_environment_inherits_all_credentials_and_enables_unrestricted_mode(self):

@@ -216,6 +216,116 @@ def append_project_event(project: dict[str, Any], event: str, **fields: Any) -> 
     path.chmod(0o600)
 
 
+def _tail_text_lines(path: Path, limit: int, max_bytes: int = 256 * 1024) -> list[str]:
+    """Read a bounded tail without loading an indefinitely growing journal."""
+
+    try:
+        with path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            remaining = min(stream.tell(), max_bytes)
+            chunks = []
+            newlines = 0
+            while remaining > 0 and newlines <= limit:
+                size = min(8192, remaining)
+                remaining -= size
+                stream.seek(remaining)
+                chunk = stream.read(size)
+                chunks.append(chunk)
+                newlines += chunk.count(b"\n")
+    except OSError:
+        return []
+    data = b"".join(reversed(chunks)).decode("utf-8", "replace")
+    return data.splitlines()[-limit:]
+
+
+def project_observer_context(project: dict[str, Any]) -> dict[str, Any]:
+    """Return bounded, read-only durable facts for a separate Gemma observer."""
+
+    workspace = Path(project["workspace"])
+    claw = workspace / ".claw"
+    try:
+        plan_value = json.loads((claw / "plan.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        plan_value = {}
+    todos = (
+        plan_value.get("todos", [])
+        if isinstance(plan_value, dict)
+        else plan_value
+        if isinstance(plan_value, list)
+        else []
+    )
+    todos = [item for item in todos if isinstance(item, dict)]
+    current = next(
+        (item for item in todos if item.get("status") == "in_progress"),
+        next((item for item in todos if item.get("status") == "pending"), None),
+    )
+    current_text = ""
+    if current is not None:
+        current_text = str(current.get("activeForm") or current.get("content") or "")[
+            :PROGRESS_DETAIL_LIMIT
+        ]
+
+    recent_events = []
+    for raw in _tail_text_lines(claw / "events.jsonl", 8):
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        recent_events.append(
+            {
+                "event": str(event.get("event") or "")[:80],
+                "timestamp": str(event.get("timestamp") or "")[:40],
+            }
+        )
+
+    last_tool = None
+    last_assistant_text = None
+    session_path = str(project.get("session_path") or "")
+    if session_path:
+        for raw in reversed(_tail_text_lines(Path(session_path), 200)):
+            try:
+                record = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            message = record.get("message") if isinstance(record, dict) else None
+            if not isinstance(message, dict):
+                continue
+            blocks = message.get("blocks")
+            if not isinstance(blocks, list):
+                continue
+            if last_tool is None:
+                for block in reversed(blocks):
+                    if not isinstance(block, dict):
+                        continue
+                    name = block.get("name") or block.get("tool_name")
+                    if block.get("type") in {"tool_use", "tool_result"} and name:
+                        last_tool = str(name)[:64]
+                        break
+            if last_assistant_text is None and message.get("role") == "assistant":
+                text = "".join(
+                    str(block.get("text") or "")
+                    for block in blocks
+                    if isinstance(block, dict) and block.get("type") == "text"
+                ).strip()
+                if text:
+                    last_assistant_text = text[:PROGRESS_DETAIL_LIMIT]
+            if last_tool is not None and last_assistant_text is not None:
+                break
+
+    return {
+        "plan": {
+            "completed": sum(item.get("status") == "completed" for item in todos),
+            "total": len(todos),
+            "current": current_text or None,
+        },
+        "last_tool": last_tool,
+        "last_assistant_text": last_assistant_text,
+        "recent_events": recent_events,
+    }
+
+
 def append_project_correction(
     project: dict[str, Any], text: str, source_message_id: Any = None
 ) -> None:
@@ -1975,6 +2085,9 @@ def make_handler(application: BridgeApplication):
                         "ok": True,
                         **application.runner.progress(chat_id),
                         **control,
+                        "observer_context": (
+                            project_observer_context(project) if project is not None else {}
+                        ),
                     }
                 elif self.path == "/v1/status":
                     project = application.store.active_project(chat_id)

@@ -62,6 +62,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_TARGET: Option<&str> = option_env!("TARGET");
 const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
 const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
+const OPERATION_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
 const LEGACY_SESSION_EXTENSION: &str = "json";
 const LATEST_SESSION_REFERENCE: &str = "latest";
@@ -4896,6 +4897,12 @@ struct OperationProgressReporter {
     shared: Arc<OperationProgressShared>,
 }
 
+#[derive(Debug)]
+struct OperationProgressHeartbeat {
+    stop: Option<Sender<()>>,
+    handle: Option<JoinHandle<()>>,
+}
+
 impl OperationProgressReporter {
     fn from_env() -> Option<Self> {
         let path = env::var_os("CLAW_PROGRESS_FILE").map(PathBuf::from)?;
@@ -4923,6 +4930,10 @@ impl OperationProgressReporter {
         self.write_update("model", None, None, false);
     }
 
+    fn refresh_model_heartbeat(&self) {
+        self.write_update_if_current("model", None, None, false, Some("model"));
+    }
+
     fn mark_text_phase(&self) {
         self.write_update("answer", None, None, true);
     }
@@ -4944,11 +4955,25 @@ impl OperationProgressReporter {
         detail: Option<&str>,
         only_on_phase_change: bool,
     ) {
+        self.write_update_if_current(phase, tool_name, detail, only_on_phase_change, None);
+    }
+
+    fn write_update_if_current(
+        &self,
+        phase: &str,
+        tool_name: Option<&str>,
+        detail: Option<&str>,
+        only_on_phase_change: bool,
+        expected_current_phase: Option<&str>,
+    ) {
         let mut state = self
             .shared
             .state
             .lock()
             .expect("operation progress state poisoned");
+        if expected_current_phase.is_some_and(|expected| state.phase != expected) {
+            return;
+        }
         if only_on_phase_change && state.phase == phase {
             return;
         }
@@ -4991,6 +5016,37 @@ impl OperationProgressReporter {
             let _ = fs::rename(&temporary, &self.shared.path);
         }
         let _ = fs::remove_file(temporary);
+    }
+}
+
+impl OperationProgressHeartbeat {
+    fn start(reporter: OperationProgressReporter) -> Self {
+        let (stop, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || loop {
+            match receiver.recv_timeout(OPERATION_PROGRESS_HEARTBEAT_INTERVAL) {
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Timeout) => reporter.refresh_model_heartbeat(),
+            }
+        });
+        Self {
+            stop: Some(stop),
+            handle: Some(handle),
+        }
+    }
+
+    fn stop(&mut self) {
+        if let Some(sender) = self.stop.take() {
+            let _ = sender.send(());
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for OperationProgressHeartbeat {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -5599,6 +5655,10 @@ impl ApiClient for AnthropicRuntimeClient {
         if let Some(progress_reporter) = &self.operation_progress_reporter {
             progress_reporter.mark_model_phase();
         }
+        let _operation_progress_heartbeat = self
+            .operation_progress_reporter
+            .clone()
+            .map(OperationProgressHeartbeat::start);
         let tools = self
             .enable_tools
             .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref()));
@@ -6948,6 +7008,36 @@ mod tests {
         assert_eq!(agent["phase"], "agent");
         assert_eq!(agent["detail"], "Проверить сайт");
         assert!(!agent.to_string().contains("private details"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn operation_progress_model_heartbeat_does_not_overwrite_a_newer_phase() {
+        let root = temp_dir().join("operation-progress-heartbeat");
+        std::fs::create_dir_all(&root).expect("progress root");
+        let path = root.join("progress.json");
+        let reporter = OperationProgressReporter::new(path.clone(), "operation-1");
+
+        reporter.mark_model_phase();
+        let first: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("first model progress"))
+                .expect("valid first progress");
+        reporter.refresh_model_heartbeat();
+        let refreshed: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&path).expect("refreshed model progress"),
+        )
+        .expect("valid refreshed progress");
+        assert_eq!(refreshed["phase"], "model");
+        assert!(refreshed["sequence"].as_u64() > first["sequence"].as_u64());
+
+        reporter.mark_tool_phase("Bash", r#"{"command":"true"}"#);
+        reporter.refresh_model_heartbeat();
+        let tool: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("tool progress"))
+                .expect("valid tool progress");
+        assert_eq!(tool["phase"], "tool");
+        assert_eq!(tool["tool_name"], "Bash");
 
         let _ = std::fs::remove_dir_all(root);
     }

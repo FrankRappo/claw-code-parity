@@ -11,8 +11,12 @@ deployment without adding a separate OCR menu.
 - **Progress** (`/progress` or **📊 Ход работы**) reports the current model/tool
   phase, elapsed time, last phase change, matching child Agents, and whether the
   turn may be stalled. Natural questions such as «что ты сейчас делаешь?»,
-  «на чём остановился?» and «не завис ли?» return the same live progress without
-  interrupting or steering the active turn.
+  «на чём остановился?» and «не завис ли?» use a separate read-only Gemma
+  observer. It receives a bounded summary of the durable plan, latest
+  checkpoint, recent events, and last tool, then answers naturally without
+  interrupting or steering the active turn. If both model slots are busy, the
+  bot returns the technical progress immediately instead of queueing observer
+  work behind the active task.
 - An ordinary text message during a running turn is a live steering update: the
   current process is interrupted, its durable state is checkpointed, and the
   same project resumes with the correction. `/next TEXT` queues work without
@@ -55,6 +59,9 @@ Control commands use a separate Telegram worker pool, so `/progress`, `/status`,
 occupies the normal request pool. Live steering is process-boundary safe rather
 than stdin injection: the correction is written atomically, the old process
 group is interrupted, and a resumed process applies the correction.
+Long model-prefill and generation phases refresh a 15-second operation
+heartbeat, so the stalled indicator reflects a lost runtime heartbeat rather
+than merely a long but healthy Gemma request.
 
 Every operator turn owns a durable, versioned plan in `.claw/plan.json` and may
 finish only when all items are complete and a verification item contains
