@@ -27,13 +27,11 @@ Users simply forward the file into the same chat.
   templates;
 - `tests/`: dependency-free unit tests.
 
-The source configuration defaults to `workspace-write`. It also uses an
-explicit tool allowlist, argument arrays instead of a shell, per-chat
-serialization, a global concurrency limit, process groups for interruption,
-atomic state writes, attachment signature checks, and a separate project
-transcript. The production dedicated-VM deployment intentionally overrides the
-permission mode to `danger-full-access` and permits `sudo`; the whole disposable
-VM, rather than the process sandbox, is the security boundary.
+The dedicated-VM profile defaults to `danger-full-access`, omits
+`--allowedTools`, sets `CLAW_UNRESTRICTED=1`, and passes the complete service
+environment to Claw. It keeps per-chat serialization, two physical top-level
+model slots, process groups for `/stop`, atomic state writes, attachment
+signature checks, and a separate project transcript.
 
 The Telegram deployment is persistent but not a live terminal TTY. Every
 Telegram message starts or resumes one non-interactive Claw turn. In the
@@ -43,11 +41,13 @@ running process group. A future approval-button mode would require a separate
 asynchronous stdin/permission protocol and is not mixed with the current
 `danger-full-access` deployment.
 
-The parent Claw allowlist includes `WebFetch` and `WebSearch` in addition to
-`bash`, so requests for current public information do not depend on an
-interactive shell approval. Public internet is available; the guest firewall
-continues to deny private-network egress, and the process environment continues
-to omit bridge, Telegram, cluster, and general GitHub credentials.
+The parent and child expose the complete built-in tool registry, including
+`WebFetch`, `WebSearch`, `RemoteTrigger`, `MCP`, `ToolSearch`, shell, filesystem,
+notebook, task, team, worker, and LSP tools. Public and private network access is
+available, explicit HTTP URLs are preserved, and configured credentials are
+inherited. Permission rules, blocking hooks, runtime sandbox layers, and the
+dedicated unit's process restrictions are bypassed only when
+`CLAW_UNRESTRICTED=1` is present.
 
 The local Gemma deployment prompt is injected as a real OpenAI-compatible
 `role=system` message for ordinary Telegram chat, Claw, Vision preprocessing,
@@ -57,10 +57,10 @@ checks are documented in [`SYSTEM_PROMPT.md`](../../SYSTEM_PROMPT.md).
 
 The top-level Claw session may use the `Agent` tool to launch one background
 sub-agent on the same Gemma deployment. The bridge injects `gemma4` as the
-sub-agent default and limits active sub-agents to one per top-level process.
-Sub-agents do not receive `Agent`, so recursion stops after one level. This
-matches the two available Gemma slots: parent plus one child. Other Telegram
-projects may still queue while both slots are occupied.
+sub-agent default, gives every child role the complete built-in tool registry,
+and keeps exactly one global active-child permit. A child can see `Agent`, but a
+recursive launch is rejected while that permit is occupied. This matches the
+two available Gemma slots: parent plus one child.
 
 ## Claw patch
 
@@ -84,13 +84,16 @@ completed turns, so exact verbatim details far back in the project should be
 written to project files when they must be preserved losslessly. An interrupted
 in-flight turn is not promised to persist; all previously completed turns do.
 
-The bridge caps each individual model completion at 4096 tokens. This does not
-cap the project session and does not prevent multi-step tool loops. Telegram
+The bridge uses a 32000-token completion ceiling, matching the current Claw Code
+default Opus budget. It is not a target length: normal responses stop naturally.
+The 110000 automatic-compaction point is unchanged. Telegram
 responses are divided on paragraph/newline/word boundaries into ordered chunks
 of at most 3900 characters, with no character loss, for both ordinary Gemma and
-Claw. The ordinary Gemma default is also 4096 output tokens; `/tokens` may raise
-one chat to 8192. These are generation safety limits, not Telegram truncation:
-all text actually returned by the model is sent.
+Claw. The ordinary Gemma chat remains separately configured at 4096 by default
+and up to 8192 through `/tokens`.
+
+The complete removal/retention rationale is recorded in
+[`UNRESTRICTED-DEPLOYMENT.md`](UNRESTRICTED-DEPLOYMENT.md).
 
 The Gemma server profile, capacity measurements, rejected larger contexts, and
 ordinary Gemma Telegram bot are maintained in
@@ -115,8 +118,10 @@ sudo systemctl enable --now claw-telegram-bridge.service
 
 On a dedicated disposable VM only, install
 `systemd/claw-telegram-bridge-sandbox.conf` as a systemd drop-in and set
-`CLAW_PERMISSION_MODE=danger-full-access`. Do not use that override on a shared
-or credential-bearing host. Install the model tunnel from
+`CLAW_PERMISSION_MODE=danger-full-access` and `CLAW_UNRESTRICTED=1`. Optional
+operator credentials belong in `/etc/claw-agent-credentials.env`, mode `0600`,
+and are inherited by Claw. Do not use this profile on a shared or untrusted
+host. Install the model tunnel from
 `systemd/gemma-api-tunnel.service` and its external environment file before the
 bridge; install the reverse tunnel last, after local bridge health succeeds.
 

@@ -181,7 +181,7 @@ pub fn read_file(
 
     // Check file size before reading
     let metadata = fs::metadata(&absolute_path)?;
-    if metadata.len() > MAX_READ_SIZE {
+    if !unrestricted_deployment_enabled() && metadata.len() > MAX_READ_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -222,7 +222,7 @@ pub fn read_file(
 
 /// Replaces a file's contents and returns patch metadata.
 pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
-    if content.len() > MAX_WRITE_SIZE {
+    if !unrestricted_deployment_enabled() && content.len() > MAX_WRITE_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -324,10 +324,15 @@ pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOu
             .map(Reverse)
     });
 
-    let truncated = matches.len() > 100;
+    let result_limit = if unrestricted_deployment_enabled() {
+        usize::MAX
+    } else {
+        100
+    };
+    let truncated = matches.len() > result_limit;
     let filenames = matches
         .into_iter()
-        .take(100)
+        .take(result_limit)
         .map(|path| path.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
 
@@ -493,7 +498,13 @@ fn apply_limit<T>(
 ) -> (Vec<T>, Option<usize>, Option<usize>) {
     let offset_value = offset.unwrap_or(0);
     let mut items = items.into_iter().skip(offset_value).collect::<Vec<_>>();
-    let explicit_limit = limit.unwrap_or(250);
+    let explicit_limit = limit.unwrap_or_else(|| {
+        if unrestricted_deployment_enabled() {
+            0
+        } else {
+            250
+        }
+    });
     if explicit_limit == 0 {
         return (items, None, (offset_value > 0).then_some(offset_value));
     }
@@ -505,6 +516,15 @@ fn apply_limit<T>(
         truncated.then_some(explicit_limit),
         (offset_value > 0).then_some(offset_value),
     )
+}
+
+fn unrestricted_deployment_enabled() -> bool {
+    std::env::var("CLAW_UNRESTRICTED").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 fn make_patch(original: &str, updated: &str) -> Vec<StructuredPatchHunk> {

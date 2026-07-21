@@ -20,8 +20,8 @@ def test_config(root: Path) -> bridge.BridgeConfig:
         projects_root=root / "projects",
         claw_binary=root / "claw",
         model="gemma4",
-        allowed_tools="read,write,bash",
-        permission_mode="workspace-write",
+        allowed_tools=None,
+        permission_mode="danger-full-access",
         turn_timeout=30,
         max_concurrent=2,
         max_body_bytes=1 << 20,
@@ -36,7 +36,7 @@ def test_config(root: Path) -> bridge.BridgeConfig:
 
 
 class BridgeConfigTests(unittest.TestCase):
-    def test_default_tool_allowlist_includes_public_web_tools(self):
+    def test_default_configuration_exposes_the_full_tool_registry(self):
         with mock.patch.dict(
             bridge.os.environ,
             {"CLAW_BRIDGE_TOKEN": "x" * 32},
@@ -44,11 +44,30 @@ class BridgeConfigTests(unittest.TestCase):
         ):
             config = bridge.BridgeConfig.from_env()
 
-        tools = set(config.allowed_tools.split(","))
-        self.assertIn("WebFetch", tools)
-        self.assertIn("WebSearch", tools)
-        self.assertIn("bash", tools)
-        self.assertIn("Agent", tools)
+        self.assertIsNone(config.allowed_tools)
+        self.assertEqual(config.permission_mode, "danger-full-access")
+        self.assertEqual(config.gemma_max_output_tokens, 32000)
+        self.assertEqual(config.auto_compact_input_tokens, 110000)
+        self.assertIsNone(config.turn_timeout)
+        self.assertIsNone(config.ocr_timeout)
+
+    def test_explicit_tool_allowlist_remains_available_for_other_deployments(self):
+        with mock.patch.dict(
+            bridge.os.environ,
+            {
+                "CLAW_BRIDGE_TOKEN": "x" * 32,
+                "CLAW_ALLOWED_TOOLS": "read,bash",
+            },
+            clear=True,
+        ):
+            config = bridge.BridgeConfig.from_env()
+
+        self.assertEqual(config.allowed_tools, "read,bash")
+
+    def test_unrestricted_registry_reports_agent_enabled_without_an_allowlist(self):
+        self.assertTrue(bridge.configured_tool_enabled(None, "Agent"))
+        self.assertTrue(bridge.configured_tool_enabled("read,Agent,bash", "Agent"))
+        self.assertFalse(bridge.configured_tool_enabled("read,bash", "Agent"))
 
 
 class ProjectStoreTests(unittest.TestCase):
@@ -82,7 +101,7 @@ class ProjectStoreTests(unittest.TestCase):
 
 
 class RunnerTests(unittest.TestCase):
-    def test_agent_environment_excludes_bridge_credentials(self):
+    def test_agent_environment_inherits_all_credentials_and_enables_unrestricted_mode(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             runner = bridge.ClawRunner(test_config(root))
@@ -91,20 +110,25 @@ class RunnerTests(unittest.TestCase):
                 {
                     "PATH": "/usr/bin:/bin",
                     "HOME": "/home/clawrun",
-                    "CLAW_BRIDGE_TOKEN": "must-not-leak",
-                    "UNRELATED_SECRET": "must-not-leak",
+                    "CLAW_BRIDGE_TOKEN": "bridge-secret",
+                    "TELEGRAM_BOT_TOKEN": "telegram-secret",
+                    "GITHUB_TOKEN": "github-secret",
+                    "UNRELATED_SECRET": "other-secret",
                     "CLAW_SYSTEM_PROMPT_FILE": "/srv/prompts/gemma4.txt",
                 },
                 clear=True,
             ):
                 environment = runner._agent_environment()
 
-            self.assertNotIn("CLAW_BRIDGE_TOKEN", environment)
-            self.assertNotIn("UNRELATED_SECRET", environment)
+            self.assertEqual(environment["CLAW_BRIDGE_TOKEN"], "bridge-secret")
+            self.assertEqual(environment["TELEGRAM_BOT_TOKEN"], "telegram-secret")
+            self.assertEqual(environment["GITHUB_TOKEN"], "github-secret")
+            self.assertEqual(environment["UNRELATED_SECRET"], "other-secret")
             self.assertEqual(environment["HOME"], "/home/clawrun")
             self.assertEqual(environment["GOOGLE_API_KEY"], "local-test")
             self.assertEqual(environment["CLAW_SUBAGENT_MODEL"], "gemma4")
             self.assertEqual(environment["CLAW_SUBAGENT_MAX_CONCURRENT"], "1")
+            self.assertEqual(environment["CLAW_UNRESTRICTED"], "1")
             self.assertEqual(
                 environment["CLAW_SYSTEM_PROMPT_FILE"],
                 "/srv/prompts/gemma4.txt",
@@ -117,6 +141,7 @@ class RunnerTests(unittest.TestCase):
             project = {"workspace": str(root), "session_id": None}
             first = runner._command(project, "hello")
             self.assertEqual(first[-2:], ["prompt", "hello"])
+            self.assertNotIn("--allowedTools", first)
             resumed = runner._command(
                 {
                     "workspace": str(root),
@@ -129,7 +154,21 @@ class RunnerTests(unittest.TestCase):
                 resumed[-4:],
                 ["--resume", "/sessions/session-42.jsonl", "prompt", "continue"],
             )
-            self.assertIn("workspace-write", resumed)
+            self.assertIn("danger-full-access", resumed)
+
+    def test_command_can_still_apply_an_explicit_tool_allowlist(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = test_config(root)
+            config = bridge.BridgeConfig(
+                **{**config.__dict__, "allowed_tools": "read,bash"}
+            )
+            command = bridge.ClawRunner(config)._command(
+                {"workspace": str(root), "session_id": None}, "hello"
+            )
+
+            index = command.index("--allowedTools")
+            self.assertEqual(command[index + 1], "read,bash")
 
     def test_recovers_completed_turn_from_changed_session_when_stdout_is_lost(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -316,14 +355,23 @@ class ApplicationTests(unittest.TestCase):
             self.assertEqual(record["text"], "Сделай задачу")
             self.assertEqual(record["answer"], "Готово")
 
-    def test_prompt_limit_is_enforced_before_starting_claw(self):
+    def test_large_prompt_is_forwarded_without_bridge_truncation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             application = bridge.BridgeApplication(test_config(root))
-            with mock.patch.object(application.runner, "run_turn") as run_turn:
-                with self.assertRaisesRegex(bridge.BridgeError, "too large"):
-                    application.message({"chat_id": 1, "text": "x" * (70 * 1024)})
-            run_turn.assert_not_called()
+            text = "x" * (70 * 1024)
+            with mock.patch.object(
+                application.runner,
+                "run_turn",
+                return_value={
+                    "message": "ok",
+                    "session_id": "session-large",
+                    "session_path": "/sessions/session-large.jsonl",
+                },
+            ) as run_turn:
+                application.message({"chat_id": 1, "text": text})
+
+            self.assertEqual(run_turn.call_args.args[2], text)
 
 
 if __name__ == "__main__":

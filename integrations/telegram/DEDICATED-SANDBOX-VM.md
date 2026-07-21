@@ -14,13 +14,12 @@ For the first migration:
 
 - use one VM shared by all Claw projects;
 - do not add a container per project;
-- do not create a GitHub deploy key;
-- keep GitHub write credentials outside the sandbox;
-- keep the Telegram bot and its token on the Telegram host;
+- load only operator-selected credentials from root-owned files outside Git;
+- pass configured credential variables to Claw and child Agents;
 - keep Gemma inference on the existing GPU servers.
 
-Per-project containers and repository-scoped deploy keys remain explicitly
-deferred upgrades. They must not block the initial VM migration.
+Per-project containers remain a deferred isolation option and are not part of
+the unrestricted deployment contract.
 
 ## Why a separate VM
 
@@ -84,35 +83,23 @@ agent. If Claw receives broad `sudo` so it can install system packages, it can
 modify the VM; the security guarantee is that it cannot modify the shared VM,
 the hypervisor, or the GPU hosts.
 
-The sandbox must not contain:
+The current operator-selected profile permits credentials required for remote
+administration, Git, Telegram, APIs, plugins, and MCP servers. They remain
+outside Git in root-readable systemd environment files, but the bridge passes
+the complete resulting service environment to Claw and child Agents. The bridge
+itself remains bound to loopback and protected by a bearer token; that transport
+authentication does not restrict agent capabilities.
 
-- hypervisor or cluster-administration credentials;
-- SSH keys for the shared VM or GPU hosts;
-- the Telegram bot token;
-- a personal GitHub token or a general-purpose SSH key;
-- unrelated production data or host filesystem mounts.
+The deployed VM intentionally allows Claw to use `sudo`, runs it with
+`danger-full-access`, disables blocking rules/hooks/sandbox layers, and may
+contain operator-supplied credentials. This would be inappropriate on a shared
+or untrusted VM; the owner accepts the dedicated VM as an unrestricted agent
+host.
 
-Required runtime secrets must be minimal, root-readable, and outside Git. The
-bridge remains bound to loopback and protected by a random bearer token. The
-Telegram host reaches it only through the restricted reverse SSH forward. The
-Gemma API is exposed to the sandbox only through a localhost tunnel; it is not
-opened publicly.
-
-Before broad package-install permission is enabled, the bridge starts the agent
-with an explicit environment allowlist so bridge credentials are not inherited
-by Claw or exposed directly to its shell tools.
-
-The deployed VM intentionally allows Claw to use `sudo` and runs it with
-`danger-full-access`. This would be inappropriate on the shared VM. It is
-acceptable here only because the complete VM is the disposable security
-boundary and contains no cluster, Telegram, or general GitHub credential.
-
-The guest firewall denies inbound traffic by default, accepts SSH only from the
-hypervisor management address, and blocks outbound traffic to private IPv4
-ranges after the specific DNS, management SSH, model-tunnel, and reverse-tunnel
-requirements are evaluated. Public internet access remains available for
-package downloads and public repository access. The temporary migration rule
-and key for the shared VM were removed after final synchronization.
+The guest firewall still denies unsolicited inbound traffic and accepts SSH
+only through the managed path. Outbound public and private network traffic is
+allowed so Claw can reach internal HTTP, SSH, Git, API, DNS, model, and
+administration endpoints. The earlier private-IPv4 UFW deny rules are removed.
 
 ## Storage and session compatibility
 
@@ -191,8 +178,8 @@ Cutover is complete only when all of the following pass:
 - two parallel projects have different session IDs/files and do not mix state;
 - automatic screenshot/PDF OCR works without a separate OCR menu;
 - existing migrated projects resume using their exact session files;
-- no Telegram, cluster, hypervisor, or general GitHub credential is visible to
-  the agent process;
+- configured credential variable names are visible to the agent process and can
+  be used without printing their values in validation logs;
 - the shared VM shows no Claw build, package, process, or filesystem changes
   caused by the sandbox test.
 
@@ -228,13 +215,9 @@ handled, but it adds image lifecycle, storage, networking, and session-mount
 complexity. The initial dedicated VM provides the required isolation from the
 shared VM without this overhead.
 
-### Repository-scoped GitHub deploy keys
+### Operator-managed credentials
 
-The initial sandbox has no GitHub write credential. It can clone and fetch
-public repositories; pushes remain in the existing controlled workflow.
-
-If autonomous pushes become necessary, create a separate deploy key for each
-approved repository, grant write access only where required, store the private
-key outside Git with strict permissions, pin host keys, document ownership and
-rotation, and test immediate revocation. Never copy a personal or multi-repo
-credential into the sandbox.
+`/etc/claw-agent-credentials.env` is optional, root-owned, mode `0600`, and
+loaded after the bridge environment. Its variables are intentionally inherited
+by Claw, shell tools, child Agents, plugins, and MCP subprocesses. Credential
+values must never be committed or printed by deployment checks.

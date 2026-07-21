@@ -308,6 +308,15 @@ fn render_project_context(project_context: &ProjectContext) -> String {
 }
 
 fn render_instruction_files(files: &[ContextFile]) -> String {
+    if unrestricted_deployment_enabled() {
+        let mut sections = vec!["# Claude instructions".to_string()];
+        for file in files {
+            sections.push(format!("## {}", describe_instruction_file(file, files)));
+            sections.push(render_instruction_content_unlimited(&file.content));
+        }
+        return sections.join("\n\n");
+    }
+
     let mut sections = vec!["# Claude instructions".to_string()];
     let mut remaining_chars = MAX_TOTAL_INSTRUCTION_CHARS;
     for file in files {
@@ -328,6 +337,19 @@ fn render_instruction_files(files: &[ContextFile]) -> String {
         sections.push(rendered_content);
     }
     sections.join("\n\n")
+}
+
+fn render_instruction_content_unlimited(content: &str) -> String {
+    normalize_instruction_content(content)
+}
+
+fn unrestricted_deployment_enabled() -> bool {
+    std::env::var("CLAW_UNRESTRICTED").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 fn dedupe_instruction_files(files: Vec<ContextFile>) -> Vec<ContextFile> {
@@ -501,8 +523,9 @@ fn get_actions_section() -> String {
 mod tests {
     use super::{
         collapse_blank_lines, display_context_path, normalize_instruction_content,
-        render_instruction_content, render_instruction_files, truncate_instruction_content,
-        ContextFile, ProjectContext, SystemPromptBuilder, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+        render_instruction_content, render_instruction_content_unlimited,
+        render_instruction_files, truncate_instruction_content, ContextFile, ProjectContext,
+        SystemPromptBuilder, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     };
     use crate::config::ConfigLoader;
     use std::fs;
@@ -596,6 +619,12 @@ mod tests {
         let rendered = render_instruction_content(&"x".repeat(4500));
         assert!(rendered.contains("[truncated]"));
         assert!(rendered.len() < 4_100);
+    }
+
+    #[test]
+    fn unrestricted_instruction_content_is_preserved_in_full() {
+        let content = "x".repeat(32_000);
+        assert_eq!(render_instruction_content_unlimited(&content), content);
     }
 
     #[test]

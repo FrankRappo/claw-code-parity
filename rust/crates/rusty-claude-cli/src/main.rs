@@ -4567,10 +4567,12 @@ fn build_runtime_plugin_state_with_loader(
     let plugin_registry = plugin_manager.plugin_registry()?;
     let plugin_hook_config =
         runtime_hook_config_from_plugin_hooks(plugin_registry.aggregated_hooks()?);
-    let feature_config = runtime_config
-        .feature_config()
-        .clone()
-        .with_hooks(runtime_config.hooks().merged(&plugin_hook_config));
+    let hooks = if unrestricted_deployment_enabled() {
+        runtime::RuntimeHookConfig::default()
+    } else {
+        runtime_config.hooks().merged(&plugin_hook_config)
+    };
+    let feature_config = runtime_config.feature_config().clone().with_hooks(hooks);
     let (mcp_state, runtime_tools) = build_runtime_mcp_state(runtime_config)?;
     let tool_registry = GlobalToolRegistry::with_plugin_tools(plugin_registry.aggregated_tools()?)?
         .with_runtime_tools(runtime_tools)?;
@@ -6116,12 +6118,43 @@ fn permission_policy(
     feature_config: &runtime::RuntimeFeatureConfig,
     tool_registry: &GlobalToolRegistry,
 ) -> Result<PermissionPolicy, String> {
+    permission_policy_for_deployment(
+        mode,
+        feature_config,
+        tool_registry,
+        unrestricted_deployment_enabled(),
+    )
+}
+
+fn permission_policy_for_deployment(
+    mode: PermissionMode,
+    feature_config: &runtime::RuntimeFeatureConfig,
+    tool_registry: &GlobalToolRegistry,
+    unrestricted: bool,
+) -> Result<PermissionPolicy, String> {
+    let mut policy = PermissionPolicy::new(if unrestricted {
+        PermissionMode::DangerFullAccess
+    } else {
+        mode
+    });
+    if !unrestricted {
+        policy = policy.with_permission_rules(feature_config.permission_rules());
+    }
     Ok(tool_registry.permission_specs(None)?.into_iter().fold(
-        PermissionPolicy::new(mode).with_permission_rules(feature_config.permission_rules()),
+        policy,
         |policy, (name, required_permission)| {
             policy.with_tool_requirement(name, required_permission)
         },
     ))
+}
+
+fn unrestricted_deployment_enabled() -> bool {
+    env::var("CLAW_UNRESTRICTED").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
@@ -6327,7 +6360,8 @@ mod tests {
         format_unknown_slash_command_message, git_ref_exists_in, normalize_permission_mode,
         parse_args, parse_git_status_branch, parse_git_status_metadata_for,
         parse_git_workspace_summary, parse_git_worktrees, parse_hook_args, parse_recent_commits,
-        permission_policy, print_help_to, push_output_block, render_config_report,
+        permission_policy, permission_policy_for_deployment, print_help_to, push_output_block,
+        render_config_report,
         render_diff_report, render_diff_report_for, render_hook_list_report_for,
         render_memory_report, render_merged_runtime_config_json, render_repl_help,
         render_resume_usage, resolve_model_alias, resolve_session_reference, response_to_events,
@@ -7067,6 +7101,24 @@ mod tests {
         .expect("permission policy should build");
         let required = policy.required_mode_for("plugin_echo");
         assert_eq!(required, PermissionMode::WorkspaceWrite);
+    }
+
+    #[test]
+    fn unrestricted_deployment_forces_danger_full_access() {
+        let feature_config = runtime::RuntimeFeatureConfig::default();
+        let policy = permission_policy_for_deployment(
+            PermissionMode::ReadOnly,
+            &feature_config,
+            &registry_with_plugin_tool(),
+            true,
+        )
+        .expect("unrestricted permission policy should build");
+
+        assert_eq!(policy.active_mode(), PermissionMode::DangerFullAccess);
+        assert!(matches!(
+            policy.authorize("plugin_echo", "{}", None),
+            runtime::PermissionOutcome::Allow
+        ));
     }
 
     #[test]

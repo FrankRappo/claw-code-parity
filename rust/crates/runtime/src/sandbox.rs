@@ -92,6 +92,34 @@ impl SandboxConfig {
         filesystem_mode_override: Option<FilesystemIsolationMode>,
         allowed_mounts_override: Option<Vec<String>>,
     ) -> SandboxRequest {
+        self.resolve_request_for_mode(
+            enabled_override,
+            namespace_override,
+            network_override,
+            filesystem_mode_override,
+            allowed_mounts_override,
+            unrestricted_deployment_enabled(),
+        )
+    }
+
+    fn resolve_request_for_mode(
+        &self,
+        enabled_override: Option<bool>,
+        namespace_override: Option<bool>,
+        network_override: Option<bool>,
+        filesystem_mode_override: Option<FilesystemIsolationMode>,
+        allowed_mounts_override: Option<Vec<String>>,
+        unrestricted: bool,
+    ) -> SandboxRequest {
+        if unrestricted {
+            return SandboxRequest {
+                enabled: false,
+                namespace_restrictions: false,
+                network_isolation: false,
+                filesystem_mode: FilesystemIsolationMode::Off,
+                allowed_mounts: Vec::new(),
+            };
+        }
         SandboxRequest {
             enabled: enabled_override.unwrap_or(self.enabled.unwrap_or(true)),
             namespace_restrictions: namespace_override
@@ -103,6 +131,15 @@ impl SandboxConfig {
             allowed_mounts: allowed_mounts_override.unwrap_or_else(|| self.allowed_mounts.clone()),
         }
     }
+}
+
+fn unrestricted_deployment_enabled() -> bool {
+    env::var("CLAW_UNRESTRICTED").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 #[must_use]
@@ -358,6 +395,32 @@ mod tests {
         assert!(request.network_isolation);
         assert_eq!(request.filesystem_mode, FilesystemIsolationMode::AllowList);
         assert_eq!(request.allowed_mounts, vec!["tmp"]);
+    }
+
+    #[test]
+    fn unrestricted_deployment_forces_every_sandbox_layer_off() {
+        let config = SandboxConfig {
+            enabled: Some(true),
+            namespace_restrictions: Some(true),
+            network_isolation: Some(true),
+            filesystem_mode: Some(FilesystemIsolationMode::AllowList),
+            allowed_mounts: vec!["/workspace".to_string()],
+        };
+
+        let request = config.resolve_request_for_mode(
+            Some(true),
+            Some(true),
+            Some(true),
+            Some(FilesystemIsolationMode::AllowList),
+            Some(vec!["/tmp".to_string()]),
+            true,
+        );
+
+        assert!(!request.enabled);
+        assert!(!request.namespace_restrictions);
+        assert!(!request.network_isolation);
+        assert_eq!(request.filesystem_mode, FilesystemIsolationMode::Off);
+        assert!(request.allowed_mounts.is_empty());
     }
 
     #[test]

@@ -30,9 +30,6 @@ from typing import Any
 
 JSON_CONTENT_TYPE = "application/json; charset=utf-8"
 PROJECT_NAME_LIMIT = 80
-PROMPT_LIMIT = 64 * 1024
-VISION_CONTEXT_LIMIT = 16 * 1024
-OCR_CONTEXT_LIMIT = 24 * 1024
 OCR_HINTS = (
     "ocr",
     "текст",
@@ -71,9 +68,9 @@ class BridgeConfig:
     projects_root: Path
     claw_binary: Path
     model: str
-    allowed_tools: str
+    allowed_tools: str | None
     permission_mode: str
-    turn_timeout: int
+    turn_timeout: int | None
     max_concurrent: int
     max_body_bytes: int
     max_attachment_bytes: int
@@ -81,7 +78,7 @@ class BridgeConfig:
     gemma_base_url: str
     gemma_api_key: str
     gemma_max_output_tokens: int
-    ocr_timeout: int
+    ocr_timeout: int | None
     ocr_languages: str
 
     @classmethod
@@ -89,6 +86,14 @@ class BridgeConfig:
         token = os.environ.get("CLAW_BRIDGE_TOKEN", "").strip()
         if len(token) < 32:
             raise SystemExit("CLAW_BRIDGE_TOKEN must contain at least 32 characters")
+        configured_tools = os.environ.get("CLAW_ALLOWED_TOOLS", "").strip()
+        allowed_tools = (
+            None
+            if configured_tools.casefold() in {"", "*", "all", "unrestricted"}
+            else configured_tools
+        )
+        configured_turn_timeout = int(os.environ.get("CLAW_TURN_TIMEOUT", "0"))
+        configured_ocr_timeout = int(os.environ.get("CLAW_OCR_TIMEOUT", "0"))
         return cls(
             bind_host=os.environ.get("CLAW_BRIDGE_HOST", "127.0.0.1"),
             bind_port=int(os.environ.get("CLAW_BRIDGE_PORT", "19090")),
@@ -112,32 +117,33 @@ class BridgeConfig:
                 )
             ),
             model=os.environ.get("CLAW_MODEL", "gemma4"),
-            allowed_tools=os.environ.get(
-                "CLAW_ALLOWED_TOOLS",
-                "read,write,edit,glob,grep,bash,WebFetch,WebSearch,Agent,Sleep",
-            ),
+            allowed_tools=allowed_tools,
             permission_mode=os.environ.get(
-                "CLAW_PERMISSION_MODE", "workspace-write"
+                "CLAW_PERMISSION_MODE", "danger-full-access"
             ),
-            turn_timeout=max(10, int(os.environ.get("CLAW_TURN_TIMEOUT", "900"))),
+            turn_timeout=(
+                None if configured_turn_timeout <= 0 else max(10, configured_turn_timeout)
+            ),
             max_concurrent=max(1, int(os.environ.get("CLAW_MAX_CONCURRENT", "2"))),
             max_body_bytes=max(
-                1024, int(os.environ.get("CLAW_BRIDGE_MAX_BODY_BYTES", str(24 << 20)))
+                1024, int(os.environ.get("CLAW_BRIDGE_MAX_BODY_BYTES", str(64 << 20)))
             ),
             max_attachment_bytes=max(
                 1024, int(os.environ.get("CLAW_MAX_ATTACHMENT_BYTES", str(20 << 20)))
             ),
             auto_compact_input_tokens=max(
-                1, int(os.environ.get("CLAW_AUTO_COMPACT_INPUT_TOKENS", "22000"))
+                1, int(os.environ.get("CLAW_AUTO_COMPACT_INPUT_TOKENS", "110000"))
             ),
             gemma_base_url=os.environ.get(
                 "GOOGLE_BASE_URL", "http://127.0.0.1:18080/v1"
             ),
             gemma_api_key=os.environ.get("GOOGLE_API_KEY", "local-gemma"),
             gemma_max_output_tokens=max(
-                1, int(os.environ.get("CLAW_GEMMA_MAX_OUTPUT_TOKENS", "4096"))
+                1, int(os.environ.get("CLAW_GEMMA_MAX_OUTPUT_TOKENS", "32000"))
             ),
-            ocr_timeout=max(10, int(os.environ.get("CLAW_OCR_TIMEOUT", "180"))),
+            ocr_timeout=(
+                None if configured_ocr_timeout <= 0 else max(10, configured_ocr_timeout)
+            ),
             ocr_languages=os.environ.get("CLAW_OCR_LANGUAGES", "rus+eng"),
         )
 
@@ -310,9 +316,9 @@ class ClawRunner:
             "json",
             "--permission-mode",
             self.config.permission_mode,
-            "--allowedTools",
-            self.config.allowed_tools,
         ]
+        if self.config.allowed_tools:
+            command.extend(["--allowedTools", self.config.allowed_tools])
         if project.get("session_id"):
             # Prefer the exact persisted file. This remains unambiguous even
             # for sessions created by older Claw builds whose process-local ID
@@ -324,39 +330,9 @@ class ClawRunner:
         return command
 
     def _agent_environment(self) -> dict[str, str]:
-        """Build a minimal child environment without bridge credentials."""
+        """Pass the complete service environment to Claw and its tools."""
 
-        environment = {
-            key: value
-            for key in (
-                "HOME",
-                "USER",
-                "LOGNAME",
-                "SHELL",
-                "PATH",
-                "LANG",
-                "LC_ALL",
-                "LC_CTYPE",
-                "TZ",
-                "TMPDIR",
-                "XDG_CONFIG_HOME",
-                "XDG_CACHE_HOME",
-                "SSL_CERT_FILE",
-                "SSL_CERT_DIR",
-                "HTTP_PROXY",
-                "HTTPS_PROXY",
-                "NO_PROXY",
-                "http_proxy",
-                "https_proxy",
-                "no_proxy",
-                # Deployment persona is intentionally inherited by the Claw
-                # process and every built-in Agent child. The file contains no
-                # credentials and is read by the provider on every model call.
-                "CLAW_SYSTEM_PROMPT_FILE",
-                "CLAW_SYSTEM_PROMPT",
-            )
-            if (value := os.environ.get(key))
-        }
+        environment = dict(os.environ)
         environment.update(
             {
                 "GOOGLE_BASE_URL": self.config.gemma_base_url,
@@ -365,10 +341,10 @@ class ClawRunner:
                     self.config.gemma_max_output_tokens
                 ),
                 "CLAW_SUBAGENT_MODEL": self.config.model,
-                # The Agent tool is deliberately one level deep: sub-agents do
-                # not receive Agent themselves. One child is the safe operating
-                # target for the two-slot Gemma deployment.
+                # This is the only deployment-level capability limit: parent
+                # plus one child exactly fills the two Gemma inference slots.
                 "CLAW_SUBAGENT_MAX_CONCURRENT": "1",
+                "CLAW_UNRESTRICTED": "1",
                 "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS": str(
                     self.config.auto_compact_input_tokens
                 ),
@@ -622,12 +598,12 @@ class BridgeApplication:
         if vision_context:
             sections.append(
                 "Предварительный анализ Gemma Vision (проверь по исходному файлу, "
-                "если нужна точность):\n" + vision_context[:VISION_CONTEXT_LIMIT]
+                "если нужна точность):\n" + vision_context
             )
         if ocr_context:
             sections.append(
                 "Автоматически извлечённый локальный OCR/текстовый слой "
-                "(сверяй с исходным файлом):\n" + ocr_context[:OCR_CONTEXT_LIMIT]
+                "(сверяй с исходным файлом):\n" + ocr_context
             )
         return "\n\n".join(sections)
 
@@ -718,8 +694,6 @@ class BridgeApplication:
     def message(self, payload: dict[str, Any]) -> dict[str, Any]:
         chat_id = validated_chat_id(payload.get("chat_id"))
         text = str(payload.get("text") or "")
-        if len(text.encode("utf-8")) > PROMPT_LIMIT:
-            raise BridgeError("prompt is too large")
         vision_context = str(payload.get("vision_context") or "")
         with self.chat_lock(chat_id):
             project = self.store.active_project(chat_id, create=True)
@@ -775,6 +749,19 @@ def public_project(project: dict[str, Any]) -> dict[str, Any]:
             "created_at",
             "updated_at",
         )
+    }
+
+
+def configured_tool_enabled(allowed_tools: str | None, tool_name: str) -> bool:
+    """Report whether a tool survives an optional deployment allowlist."""
+
+    if allowed_tools is None:
+        return True
+    normalized = tool_name.casefold()
+    return normalized in {
+        token.casefold()
+        for token in allowed_tools.replace(",", " ").split()
+        if token
     }
 
 
@@ -884,8 +871,10 @@ def make_handler(application: BridgeApplication):
                         "auto_compact_input_tokens": application.config.auto_compact_input_tokens,
                         "max_concurrent": application.config.max_concurrent,
                         "permission_mode": application.config.permission_mode,
-                        "agents_enabled": "agent"
-                        in application.config.allowed_tools.casefold(),
+                        "agents_enabled": configured_tool_enabled(
+                            application.config.allowed_tools, "Agent"
+                        ),
+                        "tools_unrestricted": application.config.allowed_tools is None,
                         "gemma_max_output_tokens": application.config.gemma_max_output_tokens,
                     }
                 else:

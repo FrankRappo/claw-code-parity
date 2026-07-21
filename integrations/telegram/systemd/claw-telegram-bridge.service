@@ -9,6 +9,9 @@ User=clawrun
 Group=clawrun
 WorkingDirectory=/home/clawrun/analise_storage
 EnvironmentFile=/etc/claw-telegram-bridge.env
+# Optional operator-managed credentials. Every variable loaded here is passed
+# unchanged to Claw, child Agents, shell commands, plugins, and MCP processes.
+EnvironmentFile=-/etc/claw-agent-credentials.env
 ExecStart=/usr/bin/python3 /home/clawrun/analise_storage/claw-code-parity/integrations/telegram/claw_project_bridge.py
 Restart=on-failure
 RestartSec=5

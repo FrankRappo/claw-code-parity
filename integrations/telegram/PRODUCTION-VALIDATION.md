@@ -14,16 +14,17 @@ public addresses, private paths, model weights, or Telegram chat identifiers.
   `Projects` can reopen it; `Stop` interrupts only the current process group.
 - Images and PDFs stay in the active workspace. OCR is automatic when the
   request needs exact text; there is no separate OCR mode.
-- Each Claw Gemma call is capped at 4096 output tokens. The logical project is
-  not capped at 4096: tool loops and later turns continue normally.
+- Each Claw Gemma call uses a 32000-token ceiling, matching Claw Code's current
+  default Opus budget. Normal answers still stop naturally.
 - Ordinary Gemma defaults to 4096 output tokens and supports up to 8192 per
   chat through `/tokens`.
 - Both modes preserve every returned character by sending ordered Telegram
   chunks of at most 3900 characters.
 - Claw commands are automatically approved only inside the disposable VM.
   `/permissions` reports this policy; `/stop` remains available at any time.
-- A top-level Claw turn may launch one Gemma-backed background `Agent`.
-  Sub-agents cannot launch another Agent, preventing recursive fan-out.
+- A top-level Claw turn may launch one Gemma-backed background `Agent`. Every
+  child role receives the complete built-in tool registry. The single global
+  active-child permit prevents recursive fan-out from exceeding two slots.
 - Automatic compaction begins at 110000 input tokens for the measured 163840-
   token Gemma slot.
 - Claw now runs on one dedicated, disposable, GPU-less sandbox VM. The Telegram
@@ -31,9 +32,9 @@ public addresses, private paths, model weights, or Telegram chat identifiers.
 - The VM has 8 vCPU, 16 GiB RAM, and a 250 GB SSD. It is configured to boot with
   the hypervisor; its model tunnel, bridge, and reverse forward are enabled in
   the guest.
-- The sandbox has public internet and noninteractive package-install ability,
-  but private-network egress is denied except for narrowly required tunnel and
-  management destinations. It has no GitHub write key.
+- The VM has public and private egress, noninteractive package-install ability,
+  the complete Claw tool registry, full service-environment inheritance, and no
+  runtime permission/hook/sandbox blocker in unrestricted mode.
 
 ## End-to-end results
 
@@ -53,16 +54,17 @@ public addresses, private paths, model weights, or Telegram chat identifiers.
 | Post-reboot resume | A marker was recalled after reboot and after the final RAM resize using the same session ID. |
 | Post-migration parallelism | Two projects completed simultaneously in 18.297 s wall time versus 36.400 s summed turn time, with distinct session IDs. |
 | Post-migration automatic OCR | A PNG attachment passed through the reverse-forwarded bridge, local OCR extracted the test number, and the agent returned that exact number. |
-| Network isolation | Public HTTPS remained usable; direct access from the sandbox to the old shared VM was blocked after the temporary migration rule and key were removed. |
+| Network access | Public HTTPS, explicit HTTP, and routed private-network access are required in unrestricted mode. |
 | Long Telegram output | Unit fixtures reconstructed a multi-chunk response character-for-character, verified every chunk stayed below 3900 characters, and kept the keyboard only on the final message. The same sender is used by Gemma and Claw. |
-| Sub-agent policy | The `Agent` tool uses the deployment's `gemma4` default, is limited to one active child per top-level process, and omits `Agent` from the child's own tool set. |
+| Sub-agent policy | The `Agent` tool uses the deployment's `gemma4` default, exposes the complete built-in tool set to every child role, and retains one global active-child permit. |
 | Deployed long-output smoke | The installed bot reconstructed a five-message fixture without character loss; the largest chunk was exactly 3900 characters, only the first replied to the source message, and only the last carried the keyboard. |
 | Deployed sub-agent E2E | A parent Claw turn launched one `Explore` Agent without specifying a model, waited for it, read its marker, and returned the expected parent marker in 80.907 s. The persisted child manifest reported `model=gemma4`, `status=completed`, and no error. |
 
 The OCR agent turn completed in 69.182 s on the deployed hardware. That test
-validates behavior, not a per-request latency target. The current 4096-token
-completion cap and turn timeout still bound pathological generation; ordinary
-short answers stop naturally before the cap.
+validates behavior, not a per-request latency target. The unrestricted profile
+has no bridge wall-clock cutoff; `/stop` remains the explicit cancellation path.
+The 32000-token ceiling is only the default Claw completion budget, and ordinary
+short answers stop naturally before it.
 
 ## Dedicated VM capacity result
 
@@ -80,8 +82,9 @@ and should remain focused on inference. The sandbox VM resides on the primary
 server SSD; it has no GPU passthrough and therefore cannot consume model VRAM.
 
 The old shared-VM bridge and reverse-forward units remain disabled for rollback
-and are not in the live request path. The temporary migration SSH credential
-and private-network firewall exception have been removed.
+and are not in the live request path. The former special-case private-network
+exception is obsolete because unrestricted production now permits routed
+private egress generally.
 
 ## Incident: persisted turn with missing CLI stdout
 

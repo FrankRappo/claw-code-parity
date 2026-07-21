@@ -1657,7 +1657,7 @@ fn run_mcp_auth(input: McpAuthInput) -> Result<String, String> {
 #[allow(clippy::needless_pass_by_value)]
 fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, String> {
     let method = input.method.unwrap_or_else(|| "GET".to_string());
-    let client = Client::new();
+    let client = build_http_client()?;
 
     let mut request = match method.to_uppercase().as_str() {
         "GET" => client.get(&input.url),
@@ -1685,27 +1685,15 @@ fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, String> {
         request = request.body(body.clone());
     }
 
-    // Execute with a 30-second timeout
-    let request = request.timeout(Duration::from_secs(30));
-
     match request.send() {
         Ok(response) => {
             let status = response.status().as_u16();
             let body = response.text().unwrap_or_default();
-            let truncated_body = if body.len() > 8192 {
-                format!(
-                    "{}\n\n[response truncated — {} bytes total]",
-                    &body[..8192],
-                    body.len()
-                )
-            } else {
-                body
-            };
             to_pretty_json(json!({
                 "url": input.url,
                 "method": method,
                 "status_code": status,
-                "body": truncated_body,
+                "body": body,
                 "success": status >= 200 && status < 300
             }))
         }
@@ -2567,7 +2555,6 @@ fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String>
     }
 
     dedupe_hits(&mut hits);
-    hits.truncate(8);
 
     let summary = if hits.is_empty() {
         format!("No web search results matched the query {:?}.", input.query)
@@ -2598,8 +2585,9 @@ fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String>
 
 fn build_http_client() -> Result<Client, String> {
     Client::builder()
-        .timeout(Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::limited(10))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            attempt.follow()
+        }))
         .user_agent("clawd-rust-tools/0.1")
         .build()
         .map_err(|error| error.to_string())
@@ -2607,15 +2595,8 @@ fn build_http_client() -> Result<Client, String> {
 
 fn normalize_fetch_url(url: &str) -> Result<String, String> {
     let parsed = reqwest::Url::parse(url).map_err(|error| error.to_string())?;
-    if parsed.scheme() == "http" {
-        let host = parsed.host_str().unwrap_or_default();
-        if host != "localhost" && host != "127.0.0.1" && host != "::1" {
-            let mut upgraded = parsed;
-            upgraded
-                .set_scheme("https")
-                .map_err(|()| String::from("failed to upgrade URL to https"))?;
-            return Ok(upgraded.to_string());
-        }
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(String::from("WebFetch URL must use http or https"));
     }
     Ok(parsed.to_string())
 }
@@ -2652,15 +2633,12 @@ fn summarize_web_fetch(
     let compact = collapse_whitespace(content);
 
     let detail = if lower_prompt.contains("title") {
-        extract_title(content, raw_body, content_type).map_or_else(
-            || preview_text(&compact, 600),
-            |title| format!("Title: {title}"),
-        )
+        extract_title(content, raw_body, content_type)
+            .map_or_else(|| compact.clone(), |title| format!("Title: {title}"))
     } else if lower_prompt.contains("summary") || lower_prompt.contains("summarize") {
-        preview_text(&compact, 900)
+        format!("Content for summarization:\n{compact}")
     } else {
-        let preview = preview_text(&compact, 900);
-        format!("Prompt: {prompt}\nContent preview:\n{preview}")
+        format!("Prompt: {prompt}\nContent:\n{compact}")
     };
 
     format!("Fetched {url}\n{detail}")
@@ -2732,14 +2710,6 @@ fn decode_html_entities(input: &str) -> String {
 
 fn collapse_whitespace(input: &str) -> String {
     input.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn preview_text(input: &str, max_chars: usize) -> String {
-    if input.chars().count() <= max_chars {
-        return input.to_string();
-    }
-    let shortened = input.chars().take(max_chars).collect::<String>();
-    format!("{}…", shortened.trim_end())
 }
 
 fn extract_search_hits(html: &str) -> Vec<SearchHit> {
@@ -3019,7 +2989,6 @@ fn resolve_skill_path(skill: &str) -> Result<std::path::PathBuf, String> {
 
 const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
 const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
-const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
 static ACTIVE_SUBAGENTS: AtomicUsize = AtomicUsize::new(0);
 
 struct ActiveSubagentPermit;
@@ -3170,7 +3139,7 @@ fn spawn_agent_job(job: AgentJob, permit: ActiveSubagentPermit) -> Result<(), St
 }
 
 fn run_agent_job(job: &AgentJob) -> Result<(), String> {
-    let mut runtime = build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
+    let mut runtime = build_agent_runtime(job)?;
     let summary = runtime
         .run_turn(job.prompt.clone(), None)
         .map_err(|error| error.to_string())?;
@@ -3229,85 +3198,11 @@ fn resolve_agent_model(model: Option<&str>) -> String {
         .unwrap_or_else(|| DEFAULT_AGENT_MODEL.to_string())
 }
 
-fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
-    let tools = match subagent_type {
-        "Explore" => vec![
-            "read_file",
-            "glob_search",
-            "grep_search",
-            "WebFetch",
-            "WebSearch",
-            "ToolSearch",
-            "Skill",
-            "StructuredOutput",
-        ],
-        "Plan" => vec![
-            "read_file",
-            "glob_search",
-            "grep_search",
-            "WebFetch",
-            "WebSearch",
-            "ToolSearch",
-            "Skill",
-            "TodoWrite",
-            "StructuredOutput",
-            "SendUserMessage",
-        ],
-        "Verification" => vec![
-            "bash",
-            "read_file",
-            "glob_search",
-            "grep_search",
-            "WebFetch",
-            "WebSearch",
-            "ToolSearch",
-            "TodoWrite",
-            "StructuredOutput",
-            "SendUserMessage",
-            "PowerShell",
-        ],
-        "claw-guide" => vec![
-            "read_file",
-            "glob_search",
-            "grep_search",
-            "WebFetch",
-            "WebSearch",
-            "ToolSearch",
-            "Skill",
-            "StructuredOutput",
-            "SendUserMessage",
-        ],
-        "statusline-setup" => vec![
-            "bash",
-            "read_file",
-            "write_file",
-            "edit_file",
-            "glob_search",
-            "grep_search",
-            "ToolSearch",
-        ],
-        _ => vec![
-            "bash",
-            "read_file",
-            "write_file",
-            "edit_file",
-            "glob_search",
-            "grep_search",
-            "WebFetch",
-            "WebSearch",
-            "TodoWrite",
-            "Skill",
-            "ToolSearch",
-            "NotebookEdit",
-            "Sleep",
-            "SendUserMessage",
-            "Config",
-            "StructuredOutput",
-            "REPL",
-            "PowerShell",
-        ],
-    };
-    tools.into_iter().map(str::to_string).collect()
+fn allowed_tools_for_subagent(_subagent_type: &str) -> BTreeSet<String> {
+    mvp_tool_specs()
+        .into_iter()
+        .map(|spec| spec.name.to_string())
+        .collect()
 }
 
 fn agent_permission_policy() -> PermissionPolicy {
@@ -4098,7 +3993,7 @@ const MAX_SLEEP_DURATION_MS: u64 = 300_000;
 
 #[allow(clippy::needless_pass_by_value)]
 fn execute_sleep(input: SleepInput) -> Result<SleepOutput, String> {
-    if input.duration_ms > MAX_SLEEP_DURATION_MS {
+    if !unrestricted_deployment_enabled() && input.duration_ms > MAX_SLEEP_DURATION_MS {
         return Err(format!(
             "duration_ms {} exceeds maximum allowed sleep of {MAX_SLEEP_DURATION_MS}ms",
             input.duration_ms,
@@ -4108,6 +4003,15 @@ fn execute_sleep(input: SleepInput) -> Result<SleepOutput, String> {
     Ok(SleepOutput {
         duration_ms: input.duration_ms,
         message: format!("Slept for {}ms", input.duration_ms),
+    })
+}
+
+fn unrestricted_deployment_enabled() -> bool {
+    std::env::var("CLAW_UNRESTRICTED").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
     })
 }
 
@@ -5441,6 +5345,58 @@ mod tests {
     }
 
     #[test]
+    fn native_web_tools_preserve_results_beyond_the_old_caps() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = TestServer::spawn(Arc::new(|request_line: &str| {
+            if request_line.starts_with("GET /large ") {
+                return HttpResponse::text(200, "OK", &format!("START-{}-END", "x".repeat(70_000)));
+            }
+            assert!(request_line.contains("GET /many?q=all+results "));
+            let body = (0..60)
+                .map(|index| {
+                    format!(
+                        r#"<a class="result__a" href="https://example.com/{index}">Result {index}</a>"#
+                    )
+                })
+                .collect::<String>();
+            HttpResponse::html(200, "OK", &body)
+        }));
+
+        let fetched = execute_tool(
+            "WebFetch",
+            &json!({
+                "url": format!("http://{}/large", server.addr()),
+                "prompt": "Return the content"
+            }),
+        )
+        .expect("large WebFetch response should succeed");
+        let fetched: serde_json::Value = serde_json::from_str(&fetched).expect("valid json");
+        assert!(fetched["result"]
+            .as_str()
+            .expect("result")
+            .ends_with("-END"));
+
+        std::env::set_var(
+            "CLAWD_WEB_SEARCH_BASE_URL",
+            format!("http://{}/many", server.addr()),
+        );
+        let searched = execute_tool("WebSearch", &json!({ "query": "all results" }))
+            .expect("large WebSearch result set should succeed");
+        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
+        let searched: serde_json::Value = serde_json::from_str(&searched).expect("valid json");
+        let content = searched["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .find_map(|item| item.get("content"))
+            .and_then(serde_json::Value::as_array)
+            .expect("search content");
+        assert_eq!(content.len(), 60);
+    }
+
+    #[test]
     fn web_search_extracts_and_filters_results() {
         let _guard = env_lock()
             .lock()
@@ -5838,7 +5794,7 @@ mod tests {
             .expect("spawn job should be captured");
         assert_eq!(captured_job.prompt, "Check tests and outstanding work.");
         assert!(captured_job.allowed_tools.contains("read_file"));
-        assert!(!captured_job.allowed_tools.contains("Agent"));
+        assert!(captured_job.allowed_tools.contains("Agent"));
 
         let normalized = execute_tool(
             "Agent",
@@ -6071,26 +6027,25 @@ mod tests {
     }
 
     #[test]
-    fn agent_tool_subset_mapping_is_expected() {
-        let general = allowed_tools_for_subagent("general-purpose");
-        assert!(general.contains("bash"));
-        assert!(general.contains("write_file"));
-        assert!(!general.contains("Agent"));
+    fn every_subagent_type_receives_the_complete_builtin_tool_registry() {
+        let expected = mvp_tool_specs()
+            .into_iter()
+            .map(|spec| spec.name.to_string())
+            .collect::<BTreeSet<_>>();
 
-        let explore = allowed_tools_for_subagent("Explore");
-        assert!(explore.contains("read_file"));
-        assert!(explore.contains("grep_search"));
-        assert!(!explore.contains("bash"));
-
-        let plan = allowed_tools_for_subagent("Plan");
-        assert!(plan.contains("TodoWrite"));
-        assert!(plan.contains("StructuredOutput"));
-        assert!(!plan.contains("Agent"));
-
-        let verification = allowed_tools_for_subagent("Verification");
-        assert!(verification.contains("bash"));
-        assert!(verification.contains("PowerShell"));
-        assert!(!verification.contains("write_file"));
+        for subagent_type in [
+            "general-purpose",
+            "Explore",
+            "Plan",
+            "Verification",
+            "claw-guide",
+            "statusline-setup",
+        ] {
+            assert_eq!(allowed_tools_for_subagent(subagent_type), expected);
+        }
+        assert!(expected.contains("Agent"));
+        assert!(expected.contains("bash"));
+        assert!(expected.contains("RemoteTrigger"));
     }
 
     #[derive(Debug)]

@@ -59,8 +59,8 @@ CLAW_BRIDGE_URL = os.environ.get(
     "CLAW_BRIDGE_URL", "http://127.0.0.1:19090"
 ).rstrip("/")
 CLAW_BRIDGE_TOKEN = os.environ.get("CLAW_BRIDGE_TOKEN", "").strip()
-CLAW_REQUEST_TIMEOUT = int(os.environ.get("CLAW_REQUEST_TIMEOUT", "1000"))
-CLAW_VISION_MAX_TOKENS = int(os.environ.get("CLAW_VISION_MAX_TOKENS", "1024"))
+CLAW_REQUEST_TIMEOUT = int(os.environ.get("CLAW_REQUEST_TIMEOUT", "0"))
+CLAW_VISION_MAX_TOKENS = int(os.environ.get("CLAW_VISION_MAX_TOKENS", "32000"))
 CHAT_MODE_STATE_FILE = Path(
     os.environ.get("CHAT_MODE_STATE_FILE", "/var/lib/tg-gemma-bot/chat-modes.json")
 )
@@ -166,7 +166,8 @@ def http_json(url, payload=None, timeout=REQUEST_TIMEOUT, extra_headers=None):
     if payload is not None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(url, data=data, headers=headers)
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    effective_timeout = None if timeout is not None and timeout <= 0 else timeout
+    with urllib.request.urlopen(request, timeout=effective_timeout) as response:
         return json.loads(response.read().decode("utf-8", "replace"))
 
 
