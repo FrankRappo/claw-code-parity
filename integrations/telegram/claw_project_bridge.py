@@ -49,6 +49,9 @@ SUPPORTED_ATTACHMENTS = {
     "image/png": (".png", b"\x89PNG\r\n\x1a\n"),
     "application/pdf": (".pdf", b"%PDF-"),
 }
+PROGRESS_SLOW_SECONDS = 90
+PROGRESS_STALLED_SECONDS = 300
+PROGRESS_DETAIL_LIMIT = 240
 
 
 class BridgeError(RuntimeError):
@@ -158,6 +161,14 @@ class BridgeConfig:
             ),
             ocr_languages=os.environ.get("CLAW_OCR_LANGUAGES", "rus+eng"),
         )
+
+
+@dataclass
+class ActiveTurn:
+    process: subprocess.Popen[str]
+    started_at: float
+    progress_file: Path
+    operation_id: str
 
 
 def utc_timestamp() -> str:
@@ -340,8 +351,7 @@ class ClawRunner:
         self.config = config
         self._capacity = threading.BoundedSemaphore(config.max_concurrent)
         self._active_lock = threading.Lock()
-        self._active: dict[str, subprocess.Popen[str]] = {}
-        self._active_operation_ids: dict[str, str] = {}
+        self._active: dict[str, ActiveTurn] = {}
         self._cancelled_operation_ids: dict[str, set[str]] = {}
 
     def _command(self, project: dict[str, Any], prompt: str) -> list[str]:
@@ -366,7 +376,11 @@ class ClawRunner:
             command.extend(["prompt", prompt])
         return command
 
-    def _agent_environment(self) -> dict[str, str]:
+    def _agent_environment(
+        self,
+        progress_file: Path | None = None,
+        operation_id: str | None = None,
+    ) -> dict[str, str]:
         """Pass the complete service environment to Claw and its tools."""
 
         environment = dict(os.environ)
@@ -386,6 +400,14 @@ class ClawRunner:
                 ),
             }
         )
+        if progress_file is not None:
+            environment["CLAW_PROGRESS_FILE"] = str(progress_file)
+        else:
+            environment.pop("CLAW_PROGRESS_FILE", None)
+        if operation_id:
+            environment["CLAW_PROGRESS_OPERATION_ID"] = operation_id
+        else:
+            environment.pop("CLAW_PROGRESS_OPERATION_ID", None)
         if self.config.unrestricted:
             environment["CLAW_UNRESTRICTED"] = "1"
             environment["CLAW_SUBAGENT_LOCK_FILE"] = str(
@@ -395,6 +417,108 @@ class ClawRunner:
             environment.pop("CLAW_UNRESTRICTED", None)
             environment.pop("CLAW_SUBAGENT_LOCK_FILE", None)
         return environment
+
+    @staticmethod
+    def _write_progress_file(path: Path, payload: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(
+            f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            encoding="utf-8",
+        )
+        temporary.chmod(0o600)
+        os.replace(temporary, path)
+
+    @staticmethod
+    def _read_progress_file(turn: ActiveTurn) -> dict[str, Any]:
+        try:
+            payload = json.loads(turn.progress_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        reported_operation = str(payload.get("operation_id") or "")
+        if reported_operation and reported_operation != turn.operation_id:
+            return {}
+        return payload
+
+    def _agent_progress(self, operation_id: str) -> list[dict[str, Any]]:
+        store = self.config.projects_root / ".clawd-agents"
+        try:
+            candidates = sorted(
+                store.glob("*.json"),
+                key=lambda path: path.stat().st_mtime_ns,
+                reverse=True,
+            )[:200]
+        except OSError:
+            return []
+        agents = []
+        for path in candidates:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict) or payload.get("operationId") != operation_id:
+                continue
+            agents.append(
+                {
+                    "agent_id": str(payload.get("agentId") or "")[:128],
+                    "name": str(payload.get("name") or "")[:128],
+                    "description": str(payload.get("description") or "")[
+                        :PROGRESS_DETAIL_LIMIT
+                    ],
+                    "status": str(payload.get("status") or "unknown")[:32],
+                    "started_at": payload.get("startedAt"),
+                    "completed_at": payload.get("completedAt"),
+                }
+            )
+        return agents
+
+    def progress(self, chat_id: str, now: float | None = None) -> dict[str, Any]:
+        with self._active_lock:
+            turn = self._active.get(chat_id)
+        if turn is None or turn.process.poll() is not None:
+            return {
+                "running": False,
+                "health": "idle",
+                "phase": "idle",
+                "agents": [],
+            }
+
+        observed_at = time.time() if now is None else now
+        payload = self._read_progress_file(turn)
+        updated_at_ms = payload.get("updated_at_unix_ms")
+        try:
+            updated_at = float(updated_at_ms) / 1000
+        except (TypeError, ValueError):
+            updated_at = turn.started_at
+        elapsed = max(0, int(observed_at - turn.started_at))
+        inactive = max(0, int(observed_at - updated_at))
+        if inactive >= PROGRESS_STALLED_SECONDS:
+            health = "possibly_stalled"
+        elif inactive >= PROGRESS_SLOW_SECONDS:
+            health = "slow"
+        else:
+            health = "working"
+        phase = str(payload.get("phase") or "starting")[:32]
+        detail = str(payload.get("detail") or "")[:PROGRESS_DETAIL_LIMIT] or None
+        tool_name = str(payload.get("tool_name") or "")[:64] or None
+        return {
+            "running": True,
+            "health": health,
+            "phase": phase,
+            "detail": detail,
+            "tool_name": tool_name,
+            "elapsed_seconds": elapsed,
+            "last_activity_seconds": inactive,
+            "started_at_unix_ms": int(turn.started_at * 1000),
+            "updated_at_unix_ms": int(updated_at * 1000),
+            "operation_id": turn.operation_id,
+            "process_id": turn.process.pid,
+            "agents": self._agent_progress(turn.operation_id),
+        }
 
     @staticmethod
     def _session_signature(
@@ -491,7 +615,23 @@ class ClawRunner:
         if not self.config.claw_binary.is_file():
             raise BridgeError("Claw binary is unavailable", HTTPStatus.SERVICE_UNAVAILABLE)
         session_before = self._session_signature(project)
-        environment = self._agent_environment()
+        active_operation_id = operation_id or f"bridge-{uuid.uuid4().hex}"
+        progress_file = (
+            self.config.state_file.parent / "progress" / f"chat-{chat_id}.json"
+        )
+        started_at = time.time()
+        try:
+            self._write_progress_file(
+                progress_file,
+                {
+                    "operation_id": active_operation_id,
+                    "phase": "starting",
+                    "updated_at_unix_ms": int(started_at * 1000),
+                },
+            )
+        except OSError as error:
+            print(f"Claw progress initialization warning: {error}", flush=True)
+        environment = self._agent_environment(progress_file, active_operation_id)
         with self._capacity:
             with self._active_lock:
                 cancelled = self._cancelled_operation_ids.get(chat_id, set())
@@ -516,9 +656,12 @@ class ClawRunner:
                     stderr=subprocess.PIPE,
                     start_new_session=True,
                 )
-                self._active[chat_id] = process
-                if operation_id:
-                    self._active_operation_ids[chat_id] = operation_id
+                self._active[chat_id] = ActiveTurn(
+                    process=process,
+                    started_at=started_at,
+                    progress_file=progress_file,
+                    operation_id=active_operation_id,
+                )
             try:
                 stdout, stderr = process.communicate(timeout=self.config.turn_timeout)
             except subprocess.TimeoutExpired as error:
@@ -529,12 +672,11 @@ class ClawRunner:
                 ) from error
             finally:
                 with self._active_lock:
-                    self._active.pop(chat_id, None)
-                    active_operation_id = self._active_operation_ids.pop(chat_id, None)
-                    if active_operation_id:
+                    completed_turn = self._active.pop(chat_id, None)
+                    if completed_turn:
                         cancelled = self._cancelled_operation_ids.get(chat_id)
                         if cancelled is not None:
-                            cancelled.discard(active_operation_id)
+                            cancelled.discard(completed_turn.operation_id)
                             if not cancelled:
                                 self._cancelled_operation_ids.pop(chat_id, None)
 
@@ -588,16 +730,16 @@ class ClawRunner:
                 self._cancelled_operation_ids.setdefault(chat_id, set()).update(
                     operation_ids
                 )
-            process = self._active.get(chat_id)
-        if process is None or process.poll() is not None:
+            turn = self._active.get(chat_id)
+        if turn is None or turn.process.poll() is not None:
             return False
-        self._terminate(process, signal.SIGINT)
+        self._terminate(turn.process, signal.SIGINT)
         return True
 
     def is_running(self, chat_id: str) -> bool:
         with self._active_lock:
-            process = self._active.get(chat_id)
-            return bool(process and process.poll() is None)
+            turn = self._active.get(chat_id)
+            return bool(turn and turn.process.poll() is None)
 
 
 class BridgeApplication:
@@ -940,11 +1082,15 @@ def make_handler(application: BridgeApplication):
                             validated_operation_ids(payload.get("operation_ids")),
                         ),
                     }
+                elif self.path == "/v1/progress":
+                    result = {"ok": True, **application.runner.progress(chat_id)}
                 elif self.path == "/v1/status":
                     project = application.store.active_project(chat_id)
+                    progress = application.runner.progress(chat_id)
                     result = {
                         "ok": True,
-                        "running": application.runner.is_running(chat_id),
+                        "running": progress["running"],
+                        "progress": progress,
                         "project": public_project(project) if project else None,
                         "auto_compact_input_tokens": application.config.auto_compact_input_tokens,
                         "max_concurrent": application.config.max_concurrent,

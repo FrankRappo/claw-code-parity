@@ -8,6 +8,9 @@ deployment without adding a separate OCR menu.
 - **New project** creates a new workspace and a fresh Claw session.
 - Messages continue the active project's saved session.
 - **Stop** interrupts only the running operation; completed context remains.
+- **Progress** (`/progress` or **📊 Ход работы**) reports the current model/tool
+  phase, elapsed time, last phase change, matching child Agents, and whether the
+  turn may be stalled.
 - **Close** stops the active project without deleting it.
 - **Projects** lists saved projects; `/project ID` opens one again.
 - A VM or bridge restart does not lose completed turns. The bridge restores the
@@ -40,6 +43,12 @@ the sandbox; `/permissions` explains the active policy and `/stop` interrupts a
 running process group. A future approval-button mode would require a separate
 asynchronous stdin/permission protocol and is not mixed with the current
 `danger-full-access` deployment.
+
+Control commands use a separate Telegram worker pool, so `/progress`, `/status`,
+and `/stop` remain responsive while a long turn occupies the normal request
+pool. A second ordinary message is not injected into an in-flight model turn;
+the bot immediately reports that it was not delivered and points to
+`/progress` and `/stop`.
 
 The parent and child expose the complete built-in tool registry, including
 `WebFetch`, `WebSearch`, `RemoteTrigger`, `MCP`, `ToolSearch`, shell, filesystem,

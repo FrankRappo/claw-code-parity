@@ -1,6 +1,8 @@
 import base64
 import json
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -193,6 +195,169 @@ class RunnerTests(unittest.TestCase):
 
             index = command.index("--allowedTools")
             self.assertEqual(command[index + 1], "read,bash")
+
+    def test_progress_reports_current_phase_and_staleness(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner = bridge.ClawRunner(test_config(root))
+            progress_file = root / "progress.json"
+            now = time.time()
+            progress_file.write_text(
+                json.dumps(
+                    {
+                        "operation_id": "operation-1",
+                        "phase": "tool",
+                        "tool_name": "Bash",
+                        "detail": "shell: apt-get install",
+                        "updated_at_unix_ms": int((now - 12) * 1000),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            process = mock.Mock()
+            process.pid = 1234
+            process.poll.return_value = None
+            runner._active["7"] = bridge.ActiveTurn(
+                process=process,
+                started_at=now - 45,
+                progress_file=progress_file,
+                operation_id="operation-1",
+            )
+
+            progress = runner.progress("7", now=now)
+
+            self.assertTrue(progress["running"])
+            self.assertEqual(progress["phase"], "tool")
+            self.assertEqual(progress["tool_name"], "Bash")
+            self.assertEqual(progress["health"], "working")
+            self.assertEqual(progress["elapsed_seconds"], 45)
+            self.assertEqual(progress["last_activity_seconds"], 12)
+
+            progress_file.write_text(
+                json.dumps(
+                    {
+                        "operation_id": "operation-1",
+                        "phase": "model",
+                        "updated_at_unix_ms": int((now - 301) * 1000),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stalled = runner.progress("7", now=now)
+            self.assertEqual(stalled["health"], "possibly_stalled")
+
+    def test_progress_includes_only_agents_from_the_active_operation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner = bridge.ClawRunner(test_config(root))
+            now = time.time()
+            progress_file = root / "progress.json"
+            progress_file.write_text("{}", encoding="utf-8")
+            process = mock.Mock()
+            process.pid = 1234
+            process.poll.return_value = None
+            runner._active["7"] = bridge.ActiveTurn(
+                process=process,
+                started_at=now - 20,
+                progress_file=progress_file,
+                operation_id="operation-1",
+            )
+            store = root / "projects" / ".clawd-agents"
+            store.mkdir(parents=True)
+            (store / "matching.json").write_text(
+                json.dumps(
+                    {
+                        "agentId": "agent-1",
+                        "operationId": "operation-1",
+                        "description": "Проверить сайт",
+                        "status": "running",
+                        "startedAt": "2026-07-21T10:00:00Z",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (store / "other.json").write_text(
+                json.dumps(
+                    {
+                        "agentId": "agent-2",
+                        "operationId": "operation-2",
+                        "description": "Чужая задача",
+                        "status": "running",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            progress = runner.progress("7", now=now)
+
+            self.assertEqual(len(progress["agents"]), 1)
+            self.assertEqual(progress["agents"][0]["agent_id"], "agent-1")
+            self.assertEqual(progress["agents"][0]["description"], "Проверить сайт")
+
+    def test_agent_environment_receives_progress_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner = bridge.ClawRunner(test_config(root))
+            progress_file = root / "progress.json"
+
+            environment = runner._agent_environment(
+                progress_file=progress_file,
+                operation_id="operation-1",
+            )
+
+            self.assertEqual(environment["CLAW_PROGRESS_FILE"], str(progress_file))
+            self.assertEqual(environment["CLAW_PROGRESS_OPERATION_ID"], "operation-1")
+
+    def test_live_progress_is_visible_while_claw_process_runs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_claw = root / "claw"
+            fake_claw.write_text(
+                """#!/usr/bin/env python3
+import json
+import os
+import time
+from pathlib import Path
+
+Path(os.environ["CLAW_PROGRESS_FILE"]).write_text(json.dumps({
+    "operation_id": os.environ["CLAW_PROGRESS_OPERATION_ID"],
+    "phase": "tool",
+    "tool_name": "Bash",
+    "detail": "shell: cargo test",
+    "updated_at_unix_ms": int(time.time() * 1000),
+}), encoding="utf-8")
+time.sleep(0.2)
+print(json.dumps({"message": "done", "session_id": "session-1"}))
+""",
+                encoding="utf-8",
+            )
+            fake_claw.chmod(0o755)
+            runner = bridge.ClawRunner(test_config(root))
+            project = {"workspace": str(root), "session_id": None}
+            outcome = {}
+
+            def run():
+                outcome["result"] = runner.run_turn(
+                    "7", project, "test progress", "operation-live"
+                )
+
+            thread = threading.Thread(target=run)
+            thread.start()
+            deadline = time.monotonic() + 2
+            progress = {"running": False}
+            while time.monotonic() < deadline:
+                progress = runner.progress("7")
+                if progress.get("phase") == "tool":
+                    break
+                time.sleep(0.01)
+
+            self.assertTrue(progress["running"])
+            self.assertEqual(progress["tool_name"], "Bash")
+            self.assertEqual(progress["detail"], "shell: cargo test")
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(outcome["result"]["message"], "done")
+            self.assertFalse(runner.progress("7")["running"])
 
     def test_stop_tombstone_prevents_a_not_yet_registered_turn(self):
         with tempfile.TemporaryDirectory() as directory:

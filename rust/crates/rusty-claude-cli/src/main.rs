@@ -4827,6 +4827,167 @@ fn runtime_hook_config_from_plugin_hooks(hooks: PluginHooks) -> runtime::Runtime
     )
 }
 
+#[derive(Debug)]
+struct OperationProgressState {
+    sequence: u64,
+    phase: String,
+}
+
+#[derive(Debug)]
+struct OperationProgressShared {
+    path: PathBuf,
+    operation_id: String,
+    state: Mutex<OperationProgressState>,
+}
+
+#[derive(Debug, Clone)]
+struct OperationProgressReporter {
+    shared: Arc<OperationProgressShared>,
+}
+
+impl OperationProgressReporter {
+    fn from_env() -> Option<Self> {
+        let path = env::var_os("CLAW_PROGRESS_FILE").map(PathBuf::from)?;
+        let operation_id = env::var("CLAW_PROGRESS_OPERATION_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| format!("process-{}", std::process::id()));
+        Some(Self::new(path, operation_id))
+    }
+
+    fn new(path: PathBuf, operation_id: impl Into<String>) -> Self {
+        Self {
+            shared: Arc::new(OperationProgressShared {
+                path,
+                operation_id: operation_id.into(),
+                state: Mutex::new(OperationProgressState {
+                    sequence: 0,
+                    phase: String::new(),
+                }),
+            }),
+        }
+    }
+
+    fn mark_model_phase(&self) {
+        self.write_update("model", None, None, false);
+    }
+
+    fn mark_text_phase(&self) {
+        self.write_update("answer", None, None, true);
+    }
+
+    fn mark_tool_phase(&self, name: &str, input: &str) {
+        let phase = if name.eq_ignore_ascii_case("Agent") {
+            "agent"
+        } else {
+            "tool"
+        };
+        let detail = operation_progress_tool_detail(name, input);
+        self.write_update(phase, Some(name), Some(&detail), false);
+    }
+
+    fn write_update(
+        &self,
+        phase: &str,
+        tool_name: Option<&str>,
+        detail: Option<&str>,
+        only_on_phase_change: bool,
+    ) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .expect("operation progress state poisoned");
+        if only_on_phase_change && state.phase == phase {
+            return;
+        }
+        state.sequence += 1;
+        state.phase = phase.to_string();
+        let updated_at_unix_ms = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let payload = json!({
+            "version": 1,
+            "operation_id": self.shared.operation_id,
+            "phase": phase,
+            "tool_name": tool_name,
+            "detail": detail,
+            "sequence": state.sequence,
+            "updated_at_unix_ms": updated_at_unix_ms,
+        });
+        let Some(parent) = self.shared.path.parent() else {
+            return;
+        };
+        if fs::create_dir_all(parent).is_err() {
+            return;
+        }
+        let file_name = self
+            .shared
+            .path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("claw-progress.json");
+        let temporary = parent.join(format!(
+            ".{file_name}.{}.{}.tmp",
+            std::process::id(),
+            state.sequence
+        ));
+        let Ok(serialized) = serde_json::to_vec(&payload) else {
+            return;
+        };
+        if fs::write(&temporary, serialized).is_ok() {
+            let _ = fs::rename(&temporary, &self.shared.path);
+        }
+        let _ = fs::remove_file(temporary);
+    }
+}
+
+fn operation_progress_tool_detail(name: &str, input: &str) -> String {
+    let parsed: serde_json::Value = serde_json::from_str(input).unwrap_or(serde_json::Value::Null);
+    if name.eq_ignore_ascii_case("Agent") {
+        return parsed
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .map(|value| truncate_for_summary(value.trim(), 160))
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "delegated background task".to_string());
+    }
+    if name.eq_ignore_ascii_case("Bash") {
+        let command = parsed
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let mut tokens = command
+            .split_whitespace()
+            .skip_while(|token| token.contains('='));
+        let executable = tokens.next().unwrap_or("shell");
+        let action = tokens.next().filter(|_| {
+            matches!(
+                executable.rsplit('/').next().unwrap_or(executable),
+                "apt" | "apt-get" | "cargo" | "git" | "npm" | "pnpm" | "pip" | "pip3" | "systemctl"
+            )
+        });
+        return action.map_or_else(
+            || format!("shell: {}", truncate_for_summary(executable, 80)),
+            |action| {
+                format!(
+                    "shell: {} {}",
+                    truncate_for_summary(executable, 80),
+                    truncate_for_summary(action, 40)
+                )
+            },
+        );
+    }
+    match name {
+        "read_file" | "Read" => format!("reading {}", extract_tool_path(&parsed)),
+        "write_file" | "Write" => format!("writing {}", extract_tool_path(&parsed)),
+        "edit_file" | "Edit" => format!("editing {}", extract_tool_path(&parsed)),
+        "web_search" | "WebSearch" | "WebFetch" => "network lookup".to_string(),
+        _ => format!("running {name}"),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InternalPromptProgressState {
     command_label: &'static str,
@@ -5324,6 +5485,7 @@ struct AnthropicRuntimeClient {
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
     progress_reporter: Option<InternalPromptProgressReporter>,
+    operation_progress_reporter: Option<OperationProgressReporter>,
 }
 
 impl AnthropicRuntimeClient {
@@ -5362,6 +5524,7 @@ impl AnthropicRuntimeClient {
             allowed_tools,
             tool_registry,
             progress_reporter,
+            operation_progress_reporter: OperationProgressReporter::from_env(),
         })
     }
 }
@@ -5380,6 +5543,9 @@ impl ApiClient for AnthropicRuntimeClient {
     #[allow(clippy::too_many_lines)]
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
         if let Some(progress_reporter) = &self.progress_reporter {
+            progress_reporter.mark_model_phase();
+        }
+        if let Some(progress_reporter) = &self.operation_progress_reporter {
             progress_reporter.mark_model_phase();
         }
         let tools = self
@@ -5441,6 +5607,9 @@ impl ApiClient for AnthropicRuntimeClient {
                                 if let Some(progress_reporter) = &self.progress_reporter {
                                     progress_reporter.mark_text_phase(&text);
                                 }
+                                if let Some(progress_reporter) = &self.operation_progress_reporter {
+                                    progress_reporter.mark_text_phase();
+                                }
                                 if let Some(rendered) = markdown_stream.push(&renderer, &text) {
                                     write!(out, "{rendered}")
                                         .and_then(|()| out.flush())
@@ -5465,6 +5634,9 @@ impl ApiClient for AnthropicRuntimeClient {
                         }
                         if let Some((id, name, input)) = pending_tool.take() {
                             if let Some(progress_reporter) = &self.progress_reporter {
+                                progress_reporter.mark_tool_phase(&name, &input);
+                            }
+                            if let Some(progress_reporter) = &self.operation_progress_reporter {
                                 progress_reporter.mark_tool_phase(&name, &input);
                             }
                             // Display tool call now that input is fully accumulated
@@ -6570,8 +6742,8 @@ mod tests {
         slash_command_completion_candidates_with_sessions, status_context, tool_choice_for_request,
         validate_no_args, write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor,
         GitBranchFreshness, GitCommitEntry, GitWorkspaceSummary, GitWorktreeEntry,
-        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, SlashCommand,
-        StatusUsage, DEFAULT_MODEL,
+        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli,
+        OperationProgressReporter, SlashCommand, StatusUsage, DEFAULT_MODEL,
     };
     use api::{MessageResponse, OutputContentBlock, ToolChoice, ToolDefinition, Usage};
     use plugins::{
@@ -6681,6 +6853,47 @@ mod tests {
             Some(ToolChoice::Auto)
         );
         assert_eq!(tool_choice_for_request(None, Some("Agent")), None);
+    }
+
+    #[test]
+    fn operation_progress_reporter_persists_safe_live_phase() {
+        let root = temp_dir().join("operation-progress");
+        std::fs::create_dir_all(&root).expect("progress root");
+        let path = root.join("progress.json");
+        let reporter = OperationProgressReporter::new(path.clone(), "operation-1");
+
+        reporter.mark_model_phase();
+        let model: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("model progress"))
+                .expect("valid model progress");
+        assert_eq!(model["operation_id"], "operation-1");
+        assert_eq!(model["phase"], "model");
+
+        reporter.mark_tool_phase(
+            "Bash",
+            r#"{"command":"API_TOKEN=top-secret apt-get install python3-opencv"}"#,
+        );
+        let raw = std::fs::read_to_string(&path).expect("tool progress");
+        let tool: serde_json::Value = serde_json::from_str(&raw).expect("valid tool progress");
+        assert_eq!(tool["phase"], "tool");
+        assert_eq!(tool["tool_name"], "Bash");
+        assert!(tool["detail"]
+            .as_str()
+            .is_some_and(|value| value.contains("apt-get")));
+        assert!(!raw.contains("top-secret"));
+
+        reporter.mark_tool_phase(
+            "Agent",
+            r#"{"description":"Проверить сайт","prompt":"private details"}"#,
+        );
+        let agent: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("agent progress"))
+                .expect("valid agent progress");
+        assert_eq!(agent["phase"], "agent");
+        assert_eq!(agent["detail"], "Проверить сайт");
+        assert!(!agent.to_string().contains("private details"));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn git(args: &[&str], cwd: &Path) {

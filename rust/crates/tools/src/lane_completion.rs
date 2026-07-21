@@ -99,6 +99,7 @@ mod tests {
     fn test_output() -> AgentOutput {
         AgentOutput {
             agent_id: "test-lane-1".to_string(),
+            operation_id: None,
             name: "Test Agent".to_string(),
             description: "Test".to_string(),
             subagent_type: None,

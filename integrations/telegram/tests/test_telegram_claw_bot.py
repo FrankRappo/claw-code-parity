@@ -414,6 +414,7 @@ class ClawModeTests(unittest.TestCase):
         ]
         self.assertIn("🆕 Новый проект", labels)
         self.assertIn("⛔ Остановить Claw", labels)
+        self.assertIn("📊 Ход работы", labels)
         self.assertFalse(any("OCR" in label.upper() for label in labels))
 
     def test_claw_accepts_pdf_while_gemma_selector_rejects_it(self):
@@ -496,7 +497,66 @@ class ClawModeTests(unittest.TestCase):
     def test_stop_uses_control_executor(self):
         self.assertTrue(bot.is_control_message({"text": "/stop"}))
         self.assertTrue(bot.is_control_message({"text": "/newclaw Новый"}))
+        self.assertTrue(bot.is_control_message({"text": "/progress"}))
+        self.assertTrue(bot.is_control_message({"text": "/status"}))
+        self.assertTrue(bot.is_control_message({"text": "📊 Ход работы"}))
         self.assertFalse(bot.is_control_message({"text": "обычная задача"}))
+
+    def test_progress_text_reports_tool_agent_and_stall_health(self):
+        response = {
+            "ok": True,
+            "running": True,
+            "health": "possibly_stalled",
+            "elapsed_seconds": 367,
+            "last_activity_seconds": 301,
+            "phase": "tool",
+            "tool_name": "Bash",
+            "detail": "shell: apt-get install",
+            "agents": [
+                {
+                    "agent_id": "agent-1",
+                    "status": "running",
+                    "description": "Проверить сайт",
+                }
+            ],
+        }
+        with mock.patch.object(bot, "claw_request", return_value=response) as request:
+            text = bot.claw_progress_text(10)
+
+        request.assert_called_once_with("/v1/progress", {"chat_id": 10}, timeout=15)
+        self.assertIn("возможно завис", text)
+        self.assertIn("Bash", text)
+        self.assertIn("apt-get install", text)
+        self.assertIn("Проверить сайт", text)
+        self.assertIn("6м 7с", text)
+
+    def test_regular_claw_message_gets_immediate_busy_reply(self):
+        bot.CHAT_MODES[10] = bot.MODE_CLAW
+        bot.ACTIVE_CLAW_OPERATIONS[10] = {"operation-1"}
+        message = {
+            "chat": {"id": 10},
+            "from": {"id": 20},
+            "message_id": 30,
+            "text": "Ещё один вопрос",
+        }
+        with mock.patch.object(bot, "ALLOWED", set()), mock.patch.object(
+            bot, "ALLOWED_USERNAMES", set()
+        ), mock.patch.object(bot, "claw_answer") as answer, mock.patch.object(
+            bot, "send_message"
+        ) as send:
+            bot.handle_message(message)
+
+        answer.assert_not_called()
+        self.assertIn("уже выполняет", send.call_args.args[1])
+        self.assertIn("/progress", send.call_args.args[1])
+
+    def test_begin_claw_operation_is_atomic_per_chat(self):
+        first = bot.begin_claw_operation(10)
+        second = bot.begin_claw_operation(10)
+
+        self.assertIsNotNone(first)
+        self.assertIsNone(second)
+        self.assertEqual(len(bot.ACTIVE_CLAW_OPERATIONS[10]), 1)
 
     def test_stop_reports_local_vision_cancellation_even_if_bridge_is_idle(self):
         bot.ACTIVE_CLAW_OPERATIONS[10] = {"operation-1"}

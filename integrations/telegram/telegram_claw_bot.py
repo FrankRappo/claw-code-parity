@@ -119,8 +119,11 @@ MODE_GEMMA = "gemma"
 MODE_CLAW = "claw"
 CONTROL_TEXTS = {
     "/stop",
+    "/status",
+    "/progress",
     "/closeclaw",
     "/newclaw",
+    "📊 Ход работы",
     "⛔ Остановить Claw",
     "❌ Закрыть проект",
     "🆕 Новый проект",
@@ -130,6 +133,7 @@ COMMANDS = [
     {"command": "help", "description": "Показать справку и список команд"},
     {"command": "reset", "description": "Очистить историю текущего чата"},
     {"command": "status", "description": "Проверить LLM и настройки"},
+    {"command": "progress", "description": "Показать ход текущей задачи Claw"},
     {"command": "bench", "description": "Бенчмарк генерации, например /bench 128"},
     {"command": "tokens", "description": "Лимит ответа, например /tokens 4096"},
     {"command": "permissions", "description": "Права команд Claw в sandbox VM"},
@@ -160,9 +164,11 @@ def begin_claw_operation(chat_id):
     """Register local preprocessing and return its cancellation identity."""
 
     with CLAW_OPERATION_LOCK:
+        if ACTIVE_CLAW_OPERATIONS.get(chat_id):
+            return None
         epoch = CLAW_OPERATION_EPOCHS.get(chat_id, 0)
         operation_id = f"{os.getpid()}-{time.monotonic_ns()}-{threading.get_ident()}"
-        ACTIVE_CLAW_OPERATIONS.setdefault(chat_id, set()).add(operation_id)
+        ACTIVE_CLAW_OPERATIONS[chat_id] = {operation_id}
         return epoch, operation_id
 
 
@@ -174,6 +180,11 @@ def finish_claw_operation(chat_id, operation_id):
         active.discard(operation_id)
         if not active:
             ACTIVE_CLAW_OPERATIONS.pop(chat_id, None)
+
+
+def has_active_claw_operation(chat_id):
+    with CLAW_OPERATION_LOCK:
+        return bool(ACTIVE_CLAW_OPERATIONS.get(chat_id))
 
 
 def ensure_claw_operation_active(chat_id, epoch):
@@ -219,7 +230,8 @@ def main_keyboard():
         "keyboard": [
             [{"text": "💬 Gemma"}, {"text": "🛠 Claw Cod"}],
             [{"text": "🆕 Новый проект"}, {"text": "📁 Проекты"}],
-            [{"text": "⛔ Остановить Claw"}, {"text": "❌ Закрыть проект"}],
+            [{"text": "📊 Ход работы"}, {"text": "⛔ Остановить Claw"}],
+            [{"text": "❌ Закрыть проект"}],
             [{"text": "🧹 Сбросить чат Gemma"}],
         ],
         "resize_keyboard": True,
@@ -849,8 +861,11 @@ def claw_status_text(chat_id):
             f"{project.get('name')} [{project.get('id')}], "
             f"session={project.get('session_id') or 'ещё не создана'}"
         )
+    progress = response.get("progress") or {}
+    health = progress.get("health") or ("working" if response.get("running") else "idle")
     return (
         f"Claw: {'выполняет задачу' if response.get('running') else 'готов'}\n"
+        f"Состояние: {progress_health_text(health)}\n"
         f"Проект: {project_text}\n"
         f"Auto-compact: {response.get('auto_compact_input_tokens')} input tokens\n"
         f"Parallel turns: {response.get('max_concurrent')}\n"
@@ -858,6 +873,71 @@ def claw_status_text(chat_id):
         f"Permissions: {response.get('permission_mode') or '?'}\n"
         f"Max output/call: {response.get('gemma_max_output_tokens') or '?'} tokens"
     )
+
+
+def progress_duration(seconds):
+    try:
+        total = max(0, int(seconds))
+    except (TypeError, ValueError):
+        total = 0
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}ч {minutes}м {secs}с"
+    if minutes:
+        return f"{minutes}м {secs}с"
+    return f"{secs}с"
+
+
+def progress_health_text(health):
+    return {
+        "working": "🟢 работает",
+        "slow": "🟡 долго нет нового этапа",
+        "possibly_stalled": "🔴 возможно завис",
+        "idle": "⚪ не запущен",
+    }.get(str(health or ""), "⚪ состояние неизвестно")
+
+
+def progress_phase_text(phase):
+    return {
+        "starting": "запускается",
+        "model": "модель анализирует задачу",
+        "answer": "формирует ответ",
+        "tool": "выполняет инструмент",
+        "agent": "работает дочерний Agent",
+        "idle": "ожидает задачу",
+    }.get(str(phase or ""), str(phase or "неизвестно"))
+
+
+def claw_progress_text(chat_id):
+    response = claw_request("/v1/progress", {"chat_id": chat_id}, timeout=15)
+    if not response.get("running"):
+        return "🟢 Claw готов: выполняющейся задачи нет."
+
+    lines = [
+        f"{progress_health_text(response.get('health'))}",
+        f"Этап: {progress_phase_text(response.get('phase'))}",
+        f"В работе: {progress_duration(response.get('elapsed_seconds'))}",
+        "Последнее изменение этапа: "
+        f"{progress_duration(response.get('last_activity_seconds'))} назад",
+    ]
+    tool_name = str(response.get("tool_name") or "").strip()
+    detail = str(response.get("detail") or "").strip()
+    if tool_name:
+        lines.append(f"Инструмент: {tool_name}")
+    if detail:
+        lines.append(f"Действие: {detail}")
+
+    agents = response.get("agents") or []
+    if agents:
+        lines.append("Дочерние Agents:")
+        for agent in agents[:5]:
+            status = str(agent.get("status") or "unknown")
+            description = str(agent.get("description") or agent.get("name") or "задача")
+            lines.append(f"• {status}: {description}")
+    if response.get("health") == "possibly_stalled":
+        lines.append("Можно обновить /progress или остановить задачу командой /stop.")
+    return "\n".join(lines)
 
 
 def shell_output(command, default="?"):
@@ -1117,6 +1197,16 @@ def handle_message(message):
             reply_to=message_id,
         )
         return
+    if text == "📊 Ход работы" or text.startswith("/progress"):
+        try:
+            send_message(chat_id, claw_progress_text(chat_id), reply_to=message_id)
+        except ClawBridgeError as error:
+            send_message(
+                chat_id,
+                f"Не удалось получить ход работы Claw: {error}",
+                reply_to=message_id,
+            )
+        return
     if text.startswith("/status"):
         send_message(chat_id, status_text(chat_id), reply_to=message_id)
         return
@@ -1146,10 +1236,27 @@ def handle_message(message):
     if not text and attachment is None:
         return
 
+    if current_mode == MODE_CLAW and has_active_claw_operation(chat_id):
+        send_message(
+            chat_id,
+            "Claw уже выполняет предыдущую задачу. Новое сообщение сейчас не "
+            "передано в активный turn. Посмотреть работу: /progress; остановить: /stop.",
+            reply_to=message_id,
+        )
+        return
+
     send_typing(chat_id)
     operation_identity = (
         begin_claw_operation(chat_id) if current_mode == MODE_CLAW else None
     )
+    if current_mode == MODE_CLAW and operation_identity is None:
+        send_message(
+            chat_id,
+            "Claw уже выполняет предыдущую задачу. Посмотреть работу: /progress; "
+            "остановить: /stop.",
+            reply_to=message_id,
+        )
+        return
     try:
         attachment_data = None
         attachment_mime_type = None
@@ -1201,7 +1308,13 @@ def is_control_message(message):
     text = (message.get("text") or message.get("caption") or "").strip()
     return text in CONTROL_TEXTS or any(
         text.startswith(prefix)
-        for prefix in ("/stop ", "/closeclaw ", "/newclaw ")
+        for prefix in (
+            "/stop ",
+            "/status ",
+            "/progress ",
+            "/closeclaw ",
+            "/newclaw ",
+        )
     )
 
 

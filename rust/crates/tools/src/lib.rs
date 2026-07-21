@@ -2347,6 +2347,8 @@ struct SkillOutput {
 struct AgentOutput {
     #[serde(rename = "agentId")]
     agent_id: String,
+    #[serde(rename = "operationId", skip_serializing_if = "Option::is_none")]
+    operation_id: Option<String>,
     name: String,
     description: String,
     #[serde(rename = "subagentType")]
@@ -3206,6 +3208,10 @@ where
 
     let manifest = AgentOutput {
         agent_id,
+        operation_id: std::env::var("CLAW_PROGRESS_OPERATION_ID")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
         name: agent_name,
         description: input.description,
         subagent_type: Some(normalized_subagent_type),
@@ -5889,6 +5895,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = temp_path("agent-store");
         std::env::set_var("CLAWD_AGENT_STORE", &dir);
+        std::env::set_var("CLAW_PROGRESS_OPERATION_ID", "operation-1");
         let captured = Arc::new(Mutex::new(None::<AgentJob>));
         let captured_for_spawn = Arc::clone(&captured);
 
@@ -5909,10 +5916,12 @@ mod tests {
         )
         .expect("Agent should succeed");
         std::env::remove_var("CLAWD_AGENT_STORE");
+        std::env::remove_var("CLAW_PROGRESS_OPERATION_ID");
 
         assert_eq!(manifest.name, "ship-audit");
         assert_eq!(manifest.subagent_type.as_deref(), Some("Explore"));
         assert_eq!(manifest.status, "running");
+        assert_eq!(manifest.operation_id.as_deref(), Some("operation-1"));
         assert!(!manifest.created_at.is_empty());
         assert!(manifest.started_at.is_some());
         assert!(manifest.completed_at.is_none());
@@ -5925,6 +5934,7 @@ mod tests {
         assert!(contents.contains("Check tests and outstanding work."));
         assert!(manifest_contents.contains("\"subagentType\": \"Explore\""));
         assert!(manifest_contents.contains("\"status\": \"running\""));
+        assert_eq!(manifest_json["operationId"], "operation-1");
         assert_eq!(manifest_json["laneEvents"][0]["event"], "lane.started");
         assert_eq!(manifest_json["laneEvents"][0]["status"], "running");
         assert!(manifest_json["currentBlocker"].is_null());
