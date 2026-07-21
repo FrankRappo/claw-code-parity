@@ -700,7 +700,16 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
             Value::Array(tools.iter().map(openai_tool_definition).collect::<Vec<_>>());
     }
     if let Some(tool_choice) = &request.tool_choice {
-        payload["tool_choice"] = openai_tool_choice(tool_choice);
+        payload["tool_choice"] = if request.model.to_ascii_lowercase().starts_with("gemma")
+            && matches!(tool_choice, ToolChoice::Tool { .. })
+        {
+            // The deployed llama-server accepts only the string contract for
+            // tool_choice. The accompanying runtime instruction names the
+            // required tool, while `required` prevents an empty EOS response.
+            Value::String("required".to_string())
+        } else {
+            openai_tool_choice(tool_choice)
+        };
     }
 
     payload
@@ -1187,6 +1196,30 @@ mod tests {
             }),
             json!({"type": "function", "function": {"name": "weather"}})
         );
+    }
+
+    #[test]
+    fn gemma_named_tool_choice_uses_llama_server_string_contract() {
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "gemma4".to_string(),
+                max_tokens: 64,
+                messages: vec![InputMessage::user_text("update the plan")],
+                system: None,
+                tools: Some(vec![ToolDefinition {
+                    name: "TodoWrite".to_string(),
+                    description: None,
+                    input_schema: json!({"type": "object"}),
+                }]),
+                tool_choice: Some(ToolChoice::Tool {
+                    name: "TodoWrite".to_string(),
+                }),
+                stream: true,
+            },
+            OpenAiCompatConfig::google(),
+        );
+
+        assert_eq!(payload["tool_choice"], json!("required"));
     }
 
     #[test]

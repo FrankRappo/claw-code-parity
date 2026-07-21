@@ -664,12 +664,13 @@ where
                 .get("evidence")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
-                .trim();
+                .trim()
+                .to_lowercase();
             todo.get("status").and_then(Value::as_str) == Some("completed")
                 && !evidence.is_empty()
                 && ["verif", "test", "проверк", "qa", "e2e"]
                     .iter()
-                    .any(|marker| content.contains(marker))
+                    .any(|marker| content.contains(marker) || evidence.contains(marker))
         });
         if incomplete.is_empty() && verified {
             self.plan_gate_signature = None;
@@ -2004,6 +2005,50 @@ mod tests {
             &summary.assistant_messages.last().expect("final message").blocks[0],
             ContentBlock::Text { text } if text == "verified final"
         ));
+    }
+
+    #[test]
+    fn autonomous_completion_gate_accepts_verification_marker_in_evidence() {
+        struct SingleCallApi {
+            calls: usize,
+        }
+
+        impl ApiClient for SingleCallApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                assert_eq!(
+                    self.calls, 1,
+                    "verified plan must not trigger another model call"
+                );
+                assert_eq!(request.forced_tool, None);
+                Ok(vec![
+                    AssistantEvent::TextDelta("verified final".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let plan_path = temp_session_path("verification-in-evidence");
+        fs::write(
+            &plan_path,
+            r#"[{"content":"Restore VPN services","activeForm":"Restoring","status":"completed","evidence":"Verified ports and service health in production"}]"#,
+        )
+        .expect("completed plan should write");
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            SingleCallApi { calls: 0 },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_autonomous_plan_store(plan_path.clone());
+
+        let summary = runtime
+            .run_turn("describe the completed task", None)
+            .expect("verification evidence should satisfy the gate");
+
+        let _ = fs::remove_file(plan_path);
+        assert_eq!(summary.iterations, 1);
     }
 
     #[test]

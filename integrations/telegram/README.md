@@ -65,11 +65,16 @@ than merely a long but healthy Gemma request.
 
 Every operator turn owns a durable, versioned plan in `.claw/plan.json` and may
 finish only when all items are complete and a verification item contains
-concrete evidence. The completion gate retries premature final answers and the
-bridge retries failed processes with durable idempotency keys before declaring
-a concrete blocker (four unchanged plan continuations or three failed process
-attempts). These are explicit no-progress escalation rules, not task-duration
-timeouts. `.claw/project-memory.json` stores corrections with
+concrete evidence. Verification markers are accepted in either the plan item or
+its evidence. The completion gate retries premature final answers; forced Gemma
+tool calls use llama-server's string `tool_choice` contract instead of an
+unsupported named-tool object. If a completed verified turn persists its final
+answer but ends with an empty terminal stream, the bridge returns that newly
+persisted answer instead of replaying the entire task. Other failed processes
+are retried with durable idempotency keys before declaring a concrete blocker
+(four unchanged plan continuations or three failed process attempts). These are
+explicit no-progress escalation rules, not task-duration timeouts.
+`.claw/project-memory.json` stores corrections with
 provenance/TTL, `.claw/events.jsonl` is an append-only audit journal, and
 `.claw/checkpoints/` holds non-destructive Git/untracked recovery points.
 

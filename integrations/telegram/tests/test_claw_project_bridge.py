@@ -195,6 +195,70 @@ class ProjectStoreTests(unittest.TestCase):
 
 
 class RunnerTests(unittest.TestCase):
+    def test_empty_final_stream_recovers_completed_verified_session_without_replay(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            claw = workspace / ".claw"
+            sessions = claw / "sessions"
+            sessions.mkdir(parents=True)
+            session = sessions / "session-completed.jsonl"
+            session.write_text(
+                json.dumps(
+                    {
+                        "type": "session_meta",
+                        "version": 1,
+                        "session_id": "session-completed",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (claw / "plan.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "todos": [
+                            {
+                                "content": "Restore VPN services",
+                                "status": "completed",
+                                "evidence": "Verified ports and service health in production",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            fake_claw = root / "claw"
+            fake_claw.write_text(
+                """#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[sys.argv.index('--resume') + 1])
+with path.open('a', encoding='utf-8') as stream:
+    stream.write(json.dumps({'type': 'message', 'message': {'role': 'assistant', 'blocks': [{'type': 'text', 'text': 'Recovered final answer'}]}}) + '\\n')
+print('error: assistant stream produced no content', file=sys.stderr)
+raise SystemExit(1)
+""",
+                encoding="utf-8",
+            )
+            fake_claw.chmod(0o755)
+            runner = bridge.ClawRunner(test_config(root))
+            project = {
+                "workspace": str(workspace),
+                "session_id": "session-completed",
+                "session_path": str(session),
+            }
+
+            result = runner.run_turn("7", project, "finish", "operation-completed")
+
+            self.assertEqual(result["message"], "Recovered final answer")
+            self.assertTrue(result["recovered_from_session"])
+            events = (claw / "events.jsonl").read_text(encoding="utf-8")
+            self.assertNotIn("turn_recovery_scheduled", events)
+
     def test_agent_environment_inherits_all_credentials_and_enables_unrestricted_mode(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

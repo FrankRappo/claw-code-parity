@@ -326,6 +326,38 @@ def project_observer_context(project: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def project_plan_is_complete_and_verified(project: dict[str, Any]) -> bool:
+    """Match the runtime completion contract for safe result recovery."""
+
+    path = Path(project["workspace"]) / ".claw" / "plan.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    todos = (
+        value.get("todos", [])
+        if isinstance(value, dict)
+        else value
+        if isinstance(value, list)
+        else []
+    )
+    todos = [item for item in todos if isinstance(item, dict)]
+    if not todos or any(item.get("status") != "completed" for item in todos):
+        return False
+    markers = ("verif", "test", "проверк", "qa", "e2e")
+    for item in todos:
+        content = item.get("content")
+        evidence = item.get("evidence")
+        if not isinstance(content, str):
+            content = ""
+        if not isinstance(evidence, str) or not evidence.strip():
+            continue
+        verification_text = f"{content}\n{evidence}".casefold()
+        if any(marker in verification_text for marker in markers):
+            return True
+    return False
+
+
 def append_project_correction(
     project: dict[str, Any], text: str, source_message_id: Any = None
 ) -> None:
@@ -1343,37 +1375,58 @@ class ClawRunner:
                     or stdout.strip()
                     or f"exit code {process.returncode}"
                 )
-                failure_attempts += 1
-                if failure_attempts < TURN_RECOVERY_ATTEMPTS:
+                recovered_result = None
+                if (
+                    "assistant stream produced no content" in message
+                    and project_plan_is_complete_and_verified(project)
+                ):
+                    recovered_result = self._recover_persisted_result(
+                        project, session_before
+                    )
+                if recovered_result is not None:
                     append_project_event(
                         project,
-                        "turn_recovery_scheduled",
+                        "turn_result_recovered_after_empty_stream",
                         operation_id=active_operation_id,
-                        attempt=failure_attempts,
-                        error=message[-1000:],
                     )
-                    current_prompt = (
-                        "RECOVERY ATTEMPT after an interrupted or failed Claw process. "
-                        f"Attempt {failure_attempts + 1}/{TURN_RECOVERY_ATTEMPTS}. "
-                        "Resume from the durable plan, project memory, event journal, and "
-                        "current files. Inspect existing effects before repeating them; use "
-                        "their idempotency keys. Diagnose the previous failure, choose a "
-                        "materially different recovery when appropriate, and continue until "
-                        "the plan is complete and verified. Previous process tail:\n"
-                        f"{message[-1000:]}"
+                    stdout = (
+                        stdout.rstrip()
+                        + "\n"
+                        + json.dumps(recovered_result, ensure_ascii=False)
                     )
-                    self._update_active_task(
-                        project,
-                        active_operation_id,
-                        prompt=current_prompt,
-                        state="recovering",
+                    failure_attempts = 0
+                if recovered_result is None:
+                    failure_attempts += 1
+                    if failure_attempts < TURN_RECOVERY_ATTEMPTS:
+                        append_project_event(
+                            project,
+                            "turn_recovery_scheduled",
+                            operation_id=active_operation_id,
+                            attempt=failure_attempts,
+                            error=message[-1000:],
+                        )
+                        current_prompt = (
+                            "RECOVERY ATTEMPT after an interrupted or failed Claw process. "
+                            f"Attempt {failure_attempts + 1}/{TURN_RECOVERY_ATTEMPTS}. "
+                            "Resume from the durable plan, project memory, event journal, and "
+                            "current files. Inspect existing effects before repeating them; use "
+                            "their idempotency keys. Diagnose the previous failure, choose a "
+                            "materially different recovery when appropriate, and continue until "
+                            "the plan is complete and verified. Previous process tail:\n"
+                            f"{message[-1000:]}"
+                        )
+                        self._update_active_task(
+                            project,
+                            active_operation_id,
+                            prompt=current_prompt,
+                            state="recovering",
+                        )
+                        time.sleep(min(failure_attempts, 2))
+                        continue
+                    self._finish_active_task(project, active_operation_id, "blocked")
+                    raise BridgeError(
+                        f"Claw turn failed: {message[-2000:]}", HTTPStatus.BAD_GATEWAY
                     )
-                    time.sleep(min(failure_attempts, 2))
-                    continue
-                self._finish_active_task(project, active_operation_id, "blocked")
-                raise BridgeError(
-                    f"Claw turn failed: {message[-2000:]}", HTTPStatus.BAD_GATEWAY
-                )
 
             result = None
             for line in reversed(stdout.splitlines()):

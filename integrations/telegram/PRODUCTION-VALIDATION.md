@@ -55,6 +55,7 @@ public addresses, private paths, model weights, or Telegram chat identifiers.
 | Parallel resume | Both projects recalled their own distinct markers concurrently in 16.658 s; session IDs and files remained unchanged. |
 | Service health | Bridge active, model tunnel active, bridge restart count 0 after final code deployment. |
 | Lost CLI stdout recovery | If a resumed turn is persisted but its final JSON stdout is lost, the bridge returns the newly persisted assistant text instead of reporting a false failure. It never replays an unchanged older answer. |
+| Completed-plan empty-stream recovery | Verification markers in TodoWrite evidence satisfy the runtime completion gate. Gemma forced-tool requests use llama-server's string `tool_choice=required` contract, and an empty final stream recovers only a newly persisted answer instead of scheduling the completed task again. Covered by Rust and bridge regression tests. |
 | Dedicated VM tool/install test | Claw fetched a public HTTPS endpoint, installed a harmless package through noninteractive `sudo`, executed it, and returned the expected marker. |
 | Migration integrity | Both real Telegram project session files matched the source SHA-256 hashes byte for byte; the original active project/session metadata was unchanged. |
 | VM reboot recovery | The model tunnel, bridge, and reverse forward automatically returned active with zero restarts; the Telegram host health check and bot recovered. |
