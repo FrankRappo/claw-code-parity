@@ -1,11 +1,14 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
+use std::fs;
+use std::path::PathBuf;
 
 use serde_json::{Map, Value};
 use telemetry::SessionTracer;
 
 use crate::compact::{
-    compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
+    compact_session, compact_session_durable, estimate_session_tokens, CompactionConfig,
+    CompactionResult,
 };
 use crate::config::RuntimeFeatureConfig;
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
@@ -17,6 +20,8 @@ use crate::usage::{TokenUsage, UsageTracker};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
+const AUTONOMOUS_PLAN_ENV_VAR: &str = "CLAW_AUTONOMOUS_PLAN";
+const AUTONOMOUS_PLAN_MAX_STALLS: usize = 4;
 
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,6 +143,10 @@ pub struct ConversationRuntime<C, T> {
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     session_tracer: Option<SessionTracer>,
     next_forced_tool: Option<String>,
+    plan_gate_signature: Option<String>,
+    plan_gate_stalls: usize,
+    autonomous_plan_enabled: bool,
+    plan_store_path: Option<PathBuf>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -188,6 +197,10 @@ where
             hook_progress_reporter: None,
             session_tracer: None,
             next_forced_tool: None,
+            plan_gate_signature: None,
+            plan_gate_stalls: 0,
+            autonomous_plan_enabled: env_flag(AUTONOMOUS_PLAN_ENV_VAR),
+            plan_store_path: std::env::var_os("CLAWD_TODO_STORE").map(PathBuf::from),
         }
     }
 
@@ -200,6 +213,13 @@ where
     #[must_use]
     pub fn with_auto_compaction_input_tokens_threshold(mut self, threshold: u32) -> Self {
         self.auto_compaction_input_tokens_threshold = threshold;
+        self
+    }
+
+    #[must_use]
+    pub fn with_autonomous_plan_store(mut self, path: impl Into<PathBuf>) -> Self {
+        self.autonomous_plan_enabled = true;
+        self.plan_store_path = Some(path.into());
         self
     }
 
@@ -311,7 +331,7 @@ where
         // Compact before the request as well as after it. The previous
         // post-turn-only behavior could submit an oversized request when the
         // provider context was smaller than the default compaction threshold.
-        let pre_turn_auto_compaction = self.maybe_auto_compact_before_turn(&user_input);
+        let pre_turn_auto_compaction = self.maybe_auto_compact_before_turn(&user_input)?;
         self.session
             .push_user_text(user_input)
             .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -377,6 +397,12 @@ where
             assistant_messages.push(assistant_message);
 
             if pending_tool_uses.is_empty() {
+                if let Some(instruction) = self.completion_gate_instruction()? {
+                    self.session
+                        .push_user_text(instruction)
+                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                    continue;
+                }
                 break;
             }
 
@@ -482,7 +508,11 @@ where
             }
         }
 
-        let auto_compaction = pre_turn_auto_compaction.or_else(|| self.maybe_auto_compact());
+        let auto_compaction = if pre_turn_auto_compaction.is_some() {
+            pre_turn_auto_compaction
+        } else {
+            self.maybe_auto_compact()?
+        };
 
         let summary = TurnSummary {
             assistant_messages,
@@ -500,6 +530,14 @@ where
     #[must_use]
     pub fn compact(&self, config: CompactionConfig) -> CompactionResult {
         compact_session(&self.session, config)
+    }
+
+    pub fn compact_durable(
+        &self,
+        config: CompactionConfig,
+    ) -> Result<CompactionResult, RuntimeError> {
+        compact_session_durable(&self.session, config)
+            .map_err(|error| RuntimeError::new(error.to_string()))
     }
 
     #[must_use]
@@ -527,32 +565,36 @@ where
         self.session
     }
 
-    fn maybe_auto_compact(&mut self) -> Option<AutoCompactionEvent> {
+    fn maybe_auto_compact(&mut self) -> Result<Option<AutoCompactionEvent>, RuntimeError> {
         if self.usage_tracker.cumulative_usage().input_tokens
             < self.auto_compaction_input_tokens_threshold
         {
-            return None;
+            return Ok(None);
         }
 
-        let result = compact_session(
+        let result = compact_session_durable(
             &self.session,
             CompactionConfig {
                 max_estimated_tokens: 0,
                 ..CompactionConfig::default()
             },
-        );
+        )
+        .map_err(|error| RuntimeError::new(format!("durable compaction failed: {error}")))?;
 
         if result.removed_message_count == 0 {
-            return None;
+            return Ok(None);
         }
 
         self.session = result.compacted_session;
-        Some(AutoCompactionEvent {
+        Ok(Some(AutoCompactionEvent {
             removed_message_count: result.removed_message_count,
-        })
+        }))
     }
 
-    fn maybe_auto_compact_before_turn(&mut self, user_input: &str) -> Option<AutoCompactionEvent> {
+    fn maybe_auto_compact_before_turn(
+        &mut self,
+        user_input: &str,
+    ) -> Result<Option<AutoCompactionEvent>, RuntimeError> {
         let mut pending_session = self.session.clone();
         // Directly extend the in-memory clone so its configured persistence
         // path is never touched during estimation.
@@ -562,23 +604,109 @@ where
         if estimate_session_tokens(&pending_session)
             < self.auto_compaction_input_tokens_threshold as usize
         {
-            return None;
+            return Ok(None);
         }
 
-        let result = compact_session(
+        let result = compact_session_durable(
             &self.session,
             CompactionConfig {
                 max_estimated_tokens: 0,
                 ..CompactionConfig::default()
             },
-        );
+        )
+        .map_err(|error| RuntimeError::new(format!("durable compaction failed: {error}")))?;
         if result.removed_message_count == 0 {
-            return None;
+            return Ok(None);
         }
         self.session = result.compacted_session;
-        Some(AutoCompactionEvent {
+        Ok(Some(AutoCompactionEvent {
             removed_message_count: result.removed_message_count,
-        })
+        }))
+    }
+
+    fn completion_gate_instruction(&mut self) -> Result<Option<String>, RuntimeError> {
+        if !self.autonomous_plan_enabled {
+            return Ok(None);
+        }
+        let Some(path) = self.plan_store_path.as_ref() else {
+            return Ok(None);
+        };
+        let contents = match fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(RuntimeError::new(format!(
+                    "cannot read plan state: {error}"
+                )))
+            }
+        };
+        let value: Value = serde_json::from_str(&contents)
+            .map_err(|error| RuntimeError::new(format!("invalid plan state: {error}")))?;
+        let todos = value
+            .as_array()
+            .or_else(|| value.get("todos").and_then(Value::as_array))
+            .ok_or_else(|| RuntimeError::new("plan state must contain a todos array"))?;
+        if todos.is_empty() {
+            return Ok(None);
+        }
+
+        let incomplete = todos
+            .iter()
+            .filter(|todo| todo.get("status").and_then(Value::as_str) != Some("completed"))
+            .collect::<Vec<_>>();
+        let verified = todos.iter().any(|todo| {
+            let content = todo
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_lowercase();
+            let evidence = todo
+                .get("evidence")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim();
+            todo.get("status").and_then(Value::as_str) == Some("completed")
+                && !evidence.is_empty()
+                && ["verif", "test", "проверк", "qa", "e2e"]
+                    .iter()
+                    .any(|marker| content.contains(marker))
+        });
+        if incomplete.is_empty() && verified {
+            self.plan_gate_signature = None;
+            self.plan_gate_stalls = 0;
+            return Ok(None);
+        }
+
+        let semantic_signature = serde_json::to_string(todos).map_err(|error| {
+            RuntimeError::new(format!("cannot fingerprint plan state: {error}"))
+        })?;
+        if self.plan_gate_signature.as_deref() == Some(semantic_signature.as_str()) {
+            self.plan_gate_stalls += 1;
+        } else {
+            self.plan_gate_signature = Some(semantic_signature);
+            self.plan_gate_stalls = 0;
+        }
+        if self.plan_gate_stalls >= AUTONOMOUS_PLAN_MAX_STALLS {
+            return Err(RuntimeError::new(
+                "autonomous plan is blocked: no durable plan progress after repeated continuation attempts",
+            ));
+        }
+
+        let instruction = if incomplete.is_empty() {
+            "COMPLETION GATE: the plan cannot finish yet. Add and execute a dedicated verification step, then mark it completed with concrete evidence in TodoWrite.evidence. Do not answer the user until verification succeeds."
+                .to_string()
+        } else {
+            let next = incomplete
+                .first()
+                .and_then(|todo| todo.get("content"))
+                .and_then(Value::as_str)
+                .unwrap_or("the next pending plan step");
+            format!(
+                "COMPLETION GATE: the durable plan still has pending work. Continue autonomously now with: {next}. Update TodoWrite after the step, recover from errors with an alternative approach, and do not give a final answer while any item is pending or in progress."
+            )
+        };
+        self.next_forced_tool = Some("TodoWrite".to_string());
+        Ok(Some(instruction))
     }
 
     fn record_turn_started(&self, user_input: &str) {
@@ -697,6 +825,15 @@ pub fn auto_compaction_threshold_from_env() -> u32 {
             .ok()
             .as_deref(),
     )
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 #[must_use]
@@ -1803,6 +1940,70 @@ mod tests {
         assert!(error
             .to_string()
             .contains("conversation loop exceeded the maximum number of iterations"));
+    }
+
+    #[test]
+    fn autonomous_completion_gate_continues_until_plan_has_verification_evidence() {
+        struct GateApi {
+            calls: usize,
+            plan_path: PathBuf,
+        }
+
+        impl ApiClient for GateApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                if self.calls == 2 {
+                    let has_gate = request.messages.iter().any(|message| {
+                        message.blocks.iter().any(|block| {
+                            matches!(block, ContentBlock::Text { text } if text.contains("COMPLETION GATE"))
+                        })
+                    });
+                    assert!(has_gate, "second request must contain the completion gate");
+                    fs::write(
+                        &self.plan_path,
+                        r#"[{"content":"Implement","activeForm":"Implementing","status":"completed"},{"content":"Verify tests","activeForm":"Verifying","status":"completed","evidence":"cargo test: ok"}]"#,
+                    )
+                    .expect("completed plan should write");
+                }
+                Ok(vec![
+                    AssistantEvent::TextDelta(if self.calls == 1 {
+                        "premature final".to_string()
+                    } else {
+                        "verified final".to_string()
+                    }),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let plan_path = temp_session_path("autonomous-plan");
+        fs::write(
+            &plan_path,
+            r#"[{"content":"Implement","activeForm":"Implementing","status":"in_progress"},{"content":"Verify tests","activeForm":"Verifying","status":"pending"}]"#,
+        )
+        .expect("pending plan should write");
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            GateApi {
+                calls: 0,
+                plan_path: plan_path.clone(),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_autonomous_plan_store(plan_path.clone());
+
+        let summary = runtime
+            .run_turn("complete everything", None)
+            .expect("gate should continue to verified completion");
+
+        let _ = fs::remove_file(plan_path);
+        assert_eq!(summary.iterations, 2);
+        assert!(matches!(
+            &summary.assistant_messages.last().expect("final message").blocks[0],
+            ContentBlock::Text { text } if text == "verified final"
+        ));
     }
 
     #[test]

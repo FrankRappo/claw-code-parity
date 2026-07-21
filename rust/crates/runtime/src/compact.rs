@@ -1,4 +1,4 @@
-use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
+use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session, SessionError};
 
 const COMPACT_CONTINUATION_PREAMBLE: &str =
     "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n";
@@ -136,6 +136,48 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
         compacted_session,
         removed_message_count: removed.len(),
     }
+}
+
+/// Compacts a persisted session only after an immutable transcript archive and
+/// atomic recovery checkpoint have been written successfully.
+pub fn compact_session_durable(
+    session: &Session,
+    config: CompactionConfig,
+) -> Result<CompactionResult, SessionError> {
+    let mut result = compact_session(session, config);
+    if result.removed_message_count == 0 {
+        return Ok(result);
+    }
+    let Some(checkpoint) =
+        session.persist_compaction_checkpoint(&result.summary, result.removed_message_count)?
+    else {
+        return Ok(result);
+    };
+
+    let augmented_summary = format!(
+        "{}\n\n# Durable recovery checkpoint\n{}\nTreat this checkpoint as protected continuation context. The immutable archive is authoritative when exact older details are needed.",
+        result.summary, checkpoint.recovery_context
+    );
+    let recent_messages_preserved = result.compacted_session.messages.len() > 1;
+    if let Some(ConversationMessage {
+        blocks: first_blocks,
+        ..
+    }) = result.compacted_session.messages.first_mut()
+    {
+        *first_blocks = vec![ContentBlock::Text {
+            text: get_compact_continuation_message(
+                &augmented_summary,
+                true,
+                recent_messages_preserved,
+            ),
+        }];
+    }
+    if let Some(compaction) = result.compacted_session.compaction.as_mut() {
+        compaction.summary.clone_from(&augmented_summary);
+    }
+    result.summary = augmented_summary;
+    result.formatted_summary = format_compact_summary(&result.summary);
+    Ok(result)
 }
 
 fn compacted_summary_prefix_len(session: &Session) -> usize {

@@ -12,6 +12,7 @@ use crate::usage::TokenUsage;
 const SESSION_VERSION: u32 = 1;
 const ROTATE_AFTER_BYTES: u64 = 256 * 1024;
 const MAX_ROTATED_FILES: usize = 3;
+const DURABLE_MEMORY_SCHEMA_VERSION: u32 = 1;
 static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Speaker role associated with a persisted conversation message.
@@ -81,6 +82,14 @@ pub struct Session {
     pub compaction: Option<SessionCompaction>,
     pub fork: Option<SessionFork>,
     persistence: Option<SessionPersistence>,
+}
+
+/// Immutable archive and mutable recovery checkpoint written before compaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableCompactionCheckpoint {
+    pub archive_path: PathBuf,
+    pub checkpoint_path: PathBuf,
+    pub recovery_context: String,
 }
 
 impl PartialEq for Session {
@@ -163,6 +172,97 @@ impl Session {
         write_atomic(path, &snapshot)?;
         cleanup_rotated_logs(path)?;
         Ok(())
+    }
+
+    /// Persists the complete pre-compaction transcript before any messages are
+    /// discarded. Archives are immutable, while `checkpoint.json` is replaced
+    /// atomically and contains the small state needed to resume work.
+    pub fn persist_compaction_checkpoint(
+        &self,
+        summary: &str,
+        removed_message_count: usize,
+    ) -> Result<Option<DurableCompactionCheckpoint>, SessionError> {
+        let Some(session_path) = self.persistence_path() else {
+            return Ok(None);
+        };
+        let next_count = self.compaction.as_ref().map_or(1, |value| value.count + 1);
+        let memory_dir = durable_memory_dir(session_path, &self.session_id);
+        let archive_dir = memory_dir.join("archive");
+        fs::create_dir_all(&archive_dir)?;
+
+        let archive_path = archive_dir.join(format!("compaction-{next_count:06}.jsonl"));
+        let archive_snapshot = self.render_jsonl_snapshot()?;
+        write_immutable(&archive_path, &archive_snapshot)?;
+        let mut archive_chain = fs::read_dir(&archive_dir)?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "jsonl")
+            })
+            .collect::<Vec<_>>();
+        archive_chain.sort();
+
+        let plan_state = read_optional_json_env("CLAWD_TODO_STORE");
+        let project_memory = read_optional_json_env("CLAW_PROJECT_MEMORY_FILE");
+        let checkpoint_path = memory_dir.join("checkpoint.json");
+        let checkpoint = serde_json::json!({
+            "schema_version": DURABLE_MEMORY_SCHEMA_VERSION,
+            "session_id": self.session_id,
+            "created_at_unix_ms": current_time_millis(),
+            "compaction_count": next_count,
+            "removed_message_count": removed_message_count,
+            "source": {
+                "kind": "claw_session_compaction",
+                "archive": archive_path,
+                "archive_chain": archive_chain,
+                "session_path": session_path,
+            },
+            "provenance": {
+                "producer": "runtime::Session::persist_compaction_checkpoint",
+                "immutable_source": true,
+            },
+            "expires_at_unix_ms": serde_json::Value::Null,
+            "summary": summary,
+            "plan": plan_state,
+            "project_memory": project_memory,
+        });
+        let checkpoint_text = serde_json::to_string_pretty(&checkpoint)
+            .map_err(|error| SessionError::Format(error.to_string()))?;
+        write_atomic(&checkpoint_path, &format!("{checkpoint_text}\n"))?;
+        secure_file(&archive_path)?;
+        secure_file(&checkpoint_path)?;
+
+        let event_path = std::env::var_os("CLAW_EVENT_JOURNAL")
+            .map_or_else(|| memory_dir.join("events.jsonl"), PathBuf::from);
+        append_jsonl_event(
+            &event_path,
+            &serde_json::json!({
+                "schema_version": DURABLE_MEMORY_SCHEMA_VERSION,
+                "event_id": format!("compaction:{}:{next_count}", self.session_id),
+                "event": "compaction_checkpoint_created",
+                "timestamp_unix_ms": current_time_millis(),
+                "session_id": self.session_id,
+                "compaction_count": next_count,
+                "archive": archive_path,
+                "checkpoint": checkpoint_path,
+            }),
+        )?;
+
+        let recovery_context = serde_json::to_string(&serde_json::json!({
+            "schema_version": DURABLE_MEMORY_SCHEMA_VERSION,
+            "checkpoint": checkpoint_path,
+            "archive": archive_path,
+            "archive_chain": archive_chain,
+            "plan": plan_state,
+            "project_memory": project_memory,
+        }))
+        .map_err(|error| SessionError::Format(error.to_string()))?;
+        Ok(Some(DurableCompactionCheckpoint {
+            archive_path,
+            checkpoint_path,
+            recovery_context,
+        }))
     }
 
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self, SessionError> {
@@ -862,6 +962,69 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), SessionError> {
     Ok(())
 }
 
+fn write_immutable(path: &Path, contents: &str) -> Result<(), SessionError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = fs::read_to_string(path)?;
+            if existing == contents {
+                return Ok(());
+            }
+            return Err(SessionError::Format(format!(
+                "immutable archive already exists with different content: {}",
+                path.display()
+            )));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn append_jsonl_event(path: &Path, value: &serde_json::Value) -> Result<(), SessionError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(file, "{value}")?;
+    file.sync_data()?;
+    secure_file(path)
+}
+
+fn read_optional_json_env(name: &str) -> Option<serde_json::Value> {
+    let path = PathBuf::from(std::env::var_os(name)?);
+    let contents = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&contents).ok()
+}
+
+fn durable_memory_dir(session_path: &Path, session_id: &str) -> PathBuf {
+    let parent = session_path.parent().unwrap_or_else(|| Path::new("."));
+    if parent.file_name().is_some_and(|value| value == "sessions") {
+        return parent
+            .parent()
+            .unwrap_or(parent)
+            .join("memory")
+            .join(session_id);
+    }
+    parent.join(format!("{session_id}.memory"))
+}
+
+#[cfg(unix)]
+fn secure_file(path: &Path) -> Result<(), SessionError> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn secure_file(_path: &Path) -> Result<(), SessionError> {
+    Ok(())
+}
+
 fn temporary_path_for(path: &Path) -> PathBuf {
     let file_name = path
         .file_name()
@@ -1064,6 +1227,48 @@ mod tests {
         assert_eq!(compaction.count, 1);
         assert_eq!(compaction.removed_message_count, 4);
         assert!(compaction.summary.contains("summarized"));
+    }
+
+    #[test]
+    fn persists_immutable_archive_and_versioned_checkpoint_before_compaction() {
+        let path = temp_session_path("durable-compaction");
+        let mut session = Session::new().with_persistence_path(path.clone());
+        session
+            .push_user_text("critical original instruction")
+            .expect("message should persist");
+        let checkpoint = session
+            .persist_compaction_checkpoint("continue implementation", 1)
+            .expect("checkpoint should persist")
+            .expect("persisted session should have durable paths");
+
+        let archive = fs::read_to_string(&checkpoint.archive_path).expect("archive should read");
+        assert!(archive.contains("critical original instruction"));
+        let value: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&checkpoint.checkpoint_path).expect("checkpoint should read"),
+        )
+        .expect("checkpoint should be JSON");
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["session_id"], session.session_id);
+        assert_eq!(value["provenance"]["immutable_source"], true);
+        assert!(checkpoint.recovery_context.contains("checkpoint"));
+
+        let duplicate = session
+            .persist_compaction_checkpoint("again", 1)
+            .expect("same compaction transaction should be idempotent")
+            .expect("duplicate checkpoint paths");
+        assert_eq!(duplicate.archive_path, checkpoint.archive_path);
+        assert_eq!(
+            fs::read_to_string(&duplicate.archive_path).expect("archive should remain readable"),
+            archive,
+            "immutable archive must never be overwritten"
+        );
+        let memory_dir = checkpoint
+            .archive_path
+            .parent()
+            .and_then(Path::parent)
+            .expect("memory directory");
+        fs::remove_dir_all(memory_dir).expect("memory directory should be removable");
+        let _ = fs::remove_file(path);
     }
 
     #[test]

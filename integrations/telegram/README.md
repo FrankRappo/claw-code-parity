@@ -11,6 +11,10 @@ deployment without adding a separate OCR menu.
 - **Progress** (`/progress` or **📊 Ход работы**) reports the current model/tool
   phase, elapsed time, last phase change, matching child Agents, and whether the
   turn may be stalled.
+- An ordinary text message during a running turn is a live steering update: the
+  current process is interrupted, its durable state is checkpointed, and the
+  same project resumes with the correction. `/next TEXT` queues work without
+  interrupting; `/queue`, `/pause`, and `/continue` expose durable control.
 - **Close** stops the active project without deleting it.
 - **Projects** lists saved projects; `/project ID` opens one again.
 - A VM or bridge restart does not lose completed turns. The bridge restores the
@@ -45,10 +49,20 @@ asynchronous stdin/permission protocol and is not mixed with the current
 `danger-full-access` deployment.
 
 Control commands use a separate Telegram worker pool, so `/progress`, `/status`,
-and `/stop` remain responsive while a long turn occupies the normal request
-pool. A second ordinary message is not injected into an in-flight model turn;
-the bot immediately reports that it was not delivered and points to
-`/progress` and `/stop`.
+`/queue`, `/pause`, `/continue`, and `/stop` remain responsive while a long turn
+occupies the normal request pool. Live steering is process-boundary safe rather
+than stdin injection: the correction is written atomically, the old process
+group is interrupted, and a resumed process applies the correction.
+
+Every operator turn owns a durable, versioned plan in `.claw/plan.json` and may
+finish only when all items are complete and a verification item contains
+concrete evidence. The completion gate retries premature final answers and the
+bridge retries failed processes with durable idempotency keys before declaring
+a concrete blocker (four unchanged plan continuations or three failed process
+attempts). These are explicit no-progress escalation rules, not task-duration
+timeouts. `.claw/project-memory.json` stores corrections with
+provenance/TTL, `.claw/events.jsonl` is an append-only audit journal, and
+`.claw/checkpoints/` holds non-destructive Git/untracked recovery points.
 
 The parent and child expose the complete built-in tool registry, including
 `WebFetch`, `WebSearch`, `RemoteTrigger`, `MCP`, `ToolSearch`, shell, filesystem,
@@ -88,10 +102,13 @@ per slot.
 
 The measured Gemma deployment exposes two 163840-token slots and uses a 110000-
 token threshold. A project can continue through repeated compactions, but one
-model call can never exceed its physical slot. Compaction summarizes older
-completed turns, so exact verbatim details far back in the project should be
-written to project files when they must be preserved losslessly. An interrupted
-in-flight turn is not promised to persist; all previously completed turns do.
+model call can never exceed its physical slot. Before removing any message,
+compaction writes an immutable full JSONL archive and an atomic versioned
+checkpoint containing the plan, project memory, provenance, archive chain, and
+resume summary. The latest checkpoint is automatically injected on every new
+Claw process. Active-task and control state are also persisted; `/continue` can
+recover an in-flight task after a bridge/process restart without guessing its
+prompt.
 
 The bridge uses a 32000-token completion ceiling, matching the current Claw Code
 default Opus budget. It is not a target length: normal responses stop naturally.

@@ -121,10 +121,16 @@ CONTROL_TEXTS = {
     "/stop",
     "/status",
     "/progress",
+    "/pause",
+    "/continue",
+    "/queue",
+    "/next",
     "/closeclaw",
     "/newclaw",
     "📊 Ход работы",
     "⛔ Остановить Claw",
+    "⏸ Пауза Claw",
+    "▶️ Продолжить Claw",
     "❌ Закрыть проект",
     "🆕 Новый проект",
 }
@@ -134,6 +140,10 @@ COMMANDS = [
     {"command": "reset", "description": "Очистить историю текущего чата"},
     {"command": "status", "description": "Проверить LLM и настройки"},
     {"command": "progress", "description": "Показать ход текущей задачи Claw"},
+    {"command": "pause", "description": "Приостановить Claw с сохранением состояния"},
+    {"command": "continue", "description": "Продолжить приостановленную задачу"},
+    {"command": "next", "description": "Поставить следующую задачу: /next текст"},
+    {"command": "queue", "description": "Показать очередь и паузу Claw"},
     {"command": "bench", "description": "Бенчмарк генерации, например /bench 128"},
     {"command": "tokens", "description": "Лимит ответа, например /tokens 4096"},
     {"command": "permissions", "description": "Права команд Claw в sandbox VM"},
@@ -231,6 +241,7 @@ def main_keyboard():
             [{"text": "💬 Gemma"}, {"text": "🛠 Claw Cod"}],
             [{"text": "🆕 Новый проект"}, {"text": "📁 Проекты"}],
             [{"text": "📊 Ход работы"}, {"text": "⛔ Остановить Claw"}],
+            [{"text": "⏸ Пауза Claw"}, {"text": "▶️ Продолжить Claw"}],
             [{"text": "❌ Закрыть проект"}],
             [{"text": "🧹 Сбросить чат Gemma"}],
         ],
@@ -870,6 +881,9 @@ def claw_status_text(chat_id):
         f"Auto-compact: {response.get('auto_compact_input_tokens')} input tokens\n"
         f"Parallel turns: {response.get('max_concurrent')}\n"
         f"Agents: {'включены (один уровень)' if response.get('agents_enabled') else 'выключены'}\n"
+        f"Autonomous plan: {'включён' if response.get('autonomous_plan') else 'выключен'}\n"
+        f"Durable memory: {'включена' if response.get('durable_memory') else 'выключена'}\n"
+        f"Live steering: {'включён' if response.get('live_steering') else 'выключен'}\n"
         f"Permissions: {response.get('permission_mode') or '?'}\n"
         f"Max output/call: {response.get('gemma_max_output_tokens') or '?'} tokens"
     )
@@ -911,7 +925,7 @@ def progress_phase_text(phase):
 
 def claw_progress_text(chat_id):
     response = claw_request("/v1/progress", {"chat_id": chat_id}, timeout=15)
-    if not response.get("running"):
+    if not response.get("running") and not response.get("paused"):
         return "🟢 Claw готов: выполняющейся задачи нет."
 
     lines = [
@@ -921,6 +935,8 @@ def claw_progress_text(chat_id):
         "Последнее изменение этапа: "
         f"{progress_duration(response.get('last_activity_seconds'))} назад",
     ]
+    if response.get("paused"):
+        lines.insert(0, "⏸ Задача приостановлена; /continue — продолжить.")
     tool_name = str(response.get("tool_name") or "").strip()
     detail = str(response.get("detail") or "").strip()
     if tool_name:
@@ -937,6 +953,28 @@ def claw_progress_text(chat_id):
             lines.append(f"• {status}: {description}")
     if response.get("health") == "possibly_stalled":
         lines.append("Можно обновить /progress или остановить задачу командой /stop.")
+    queue = response.get("queue") or []
+    if queue:
+        lines.append(f"В очереди: {len(queue)}")
+    if response.get("latest_checkpoint"):
+        lines.append(f"Последний checkpoint: {response.get('latest_checkpoint')}")
+    return "\n".join(lines)
+
+
+def claw_queue_text(chat_id):
+    response = claw_request("/v1/queue", {"chat_id": chat_id}, timeout=15)
+    queue = response.get("queue") or []
+    lines = [f"Пауза: {'да' if response.get('paused') else 'нет'}"]
+    lines.append(f"Recovery checkpoints: {response.get('checkpoint_count') or 0}")
+    if not queue:
+        lines.append("Очередь пуста.")
+    else:
+        lines.append("Очередь:")
+        for index, item in enumerate(queue[:20], 1):
+            lines.append(
+                f"{index}. {item.get('kind')} / {item.get('state')}: "
+                f"{item.get('text')}"
+            )
     return "\n".join(lines)
 
 
@@ -1151,6 +1189,82 @@ def handle_message(message):
             else:
                 send_message(chat_id, f"Не удалось остановить Claw: {error}", reply_to=message_id)
         return
+    if text in {"⏸ Пауза Claw", "/pause"} or text.startswith("/pause "):
+        try:
+            response = claw_request("/v1/pause", {"chat_id": chat_id}, timeout=15)
+            send_message(
+                chat_id,
+                "Claw приостановлен с сохранением проекта и очереди. "
+                "Продолжить: /continue."
+                if response.get("paused")
+                else "У Claw сейчас нет выполняющейся операции.",
+                reply_to=message_id,
+            )
+        except ClawBridgeError as error:
+            send_message(chat_id, f"Не удалось поставить Claw на паузу: {error}", reply_to=message_id)
+        return
+    if text in {"▶️ Продолжить Claw", "/continue"} or text.startswith("/continue "):
+        try:
+            response = claw_request("/v1/continue", {"chat_id": chat_id}, timeout=15)
+            restart_prompt = str(response.get("restart_prompt") or "").strip()
+            if restart_prompt:
+                operation_identity = begin_claw_operation(chat_id)
+                if operation_identity is None:
+                    send_message(
+                        chat_id,
+                        "Предыдущий Telegram-запрос ещё завершается; повтори /continue через несколько секунд.",
+                        reply_to=message_id,
+                    )
+                    return
+                try:
+                    answer = claw_answer(
+                        chat_id,
+                        user_id,
+                        restart_prompt,
+                        operation_epoch=operation_identity[0],
+                        operation_id=operation_identity[1],
+                    )
+                    send_message(chat_id, answer, reply_to=message_id)
+                finally:
+                    finish_claw_operation(chat_id, operation_identity[1])
+                return
+            send_message(
+                chat_id,
+                "Claw продолжает сохранённую задачу."
+                if response.get("resumed")
+                else "Claw не был на паузе.",
+                reply_to=message_id,
+            )
+        except ClawOperationStopped:
+            return
+        except ClawBridgeError as error:
+            send_message(chat_id, f"Не удалось продолжить Claw: {error}", reply_to=message_id)
+        return
+    if text.startswith("/next"):
+        next_text = text.partition(" ")[2].strip()
+        if not next_text:
+            send_message(chat_id, "Использование: /next следующая задача", reply_to=message_id)
+            return
+        try:
+            claw_request(
+                "/v1/next",
+                {"chat_id": chat_id, "text": next_text, "message_id": message_id},
+                timeout=15,
+            )
+            send_message(
+                chat_id,
+                "Следующая задача добавлена в долговечную очередь Claw.",
+                reply_to=message_id,
+            )
+        except ClawBridgeError as error:
+            send_message(chat_id, f"Не удалось добавить задачу: {error}", reply_to=message_id)
+        return
+    if text.startswith("/queue"):
+        try:
+            send_message(chat_id, claw_queue_text(chat_id), reply_to=message_id)
+        except ClawBridgeError as error:
+            send_message(chat_id, f"Не удалось получить очередь: {error}", reply_to=message_id)
+        return
     if text in {"❌ Закрыть проект", "/closeclaw"} or text.startswith("/closeclaw "):
         try:
             response = claw_request(
@@ -1236,13 +1350,43 @@ def handle_message(message):
     if not text and attachment is None:
         return
 
-    if current_mode == MODE_CLAW and has_active_claw_operation(chat_id):
-        send_message(
-            chat_id,
-            "Claw уже выполняет предыдущую задачу. Новое сообщение сейчас не "
-            "передано в активный turn. Посмотреть работу: /progress; остановить: /stop.",
-            reply_to=message_id,
-        )
+    claw_operation_active = has_active_claw_operation(chat_id)
+    if current_mode == MODE_CLAW and not claw_operation_active:
+        try:
+            bridge_progress = claw_request(
+                "/v1/progress", {"chat_id": chat_id}, timeout=5
+            )
+            claw_operation_active = bool(
+                bridge_progress.get("running") or bridge_progress.get("paused")
+            )
+        except ClawBridgeError:
+            pass
+
+    if current_mode == MODE_CLAW and claw_operation_active:
+        if attachment is not None:
+            send_message(
+                chat_id,
+                "Вложение нельзя безопасно внедрить в уже выполняющийся шаг. "
+                "Поставь текстовую задачу через /next или останови /stop и отправь файл снова.",
+                reply_to=message_id,
+            )
+            return
+        try:
+            response = claw_request(
+                "/v1/steer",
+                {"chat_id": chat_id, "text": text, "message_id": message_id},
+                timeout=15,
+            )
+            send_message(
+                chat_id,
+                "Уточнение принято: текущий шаг прерван, контекст и файлы сохранены, "
+                "Claw продолжает ту же задачу с новой инструкцией."
+                if response.get("interrupted")
+                else "Уточнение сохранено в очереди и будет применено перед завершением.",
+                reply_to=message_id,
+            )
+        except ClawBridgeError as error:
+            send_message(chat_id, f"Не удалось передать уточнение Claw: {error}", reply_to=message_id)
         return
 
     send_typing(chat_id)
@@ -1291,6 +1435,14 @@ def handle_message(message):
         send_message(chat_id, str(error), reply_to=message_id)
     except ClawOperationStopped:
         return
+    except ClawBridgeError as error:
+        send_message(
+            chat_id,
+            f"Claw остановился на конкретном блокере: {error}. "
+            "План, checkpoint и журнал сохранены; /continue повторит восстановление, "
+            "/progress покажет состояние.",
+            reply_to=message_id,
+        )
     except Exception as error:
         print("ERROR handling message:", repr(error), flush=True)
         traceback.print_exc()
@@ -1312,6 +1464,10 @@ def is_control_message(message):
             "/stop ",
             "/status ",
             "/progress ",
+            "/pause ",
+            "/continue ",
+            "/queue ",
+            "/next ",
             "/closeclaw ",
             "/newclaw ",
         )

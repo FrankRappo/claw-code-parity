@@ -3349,7 +3349,7 @@ impl LiveCli {
     }
 
     fn compact(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let result = self.runtime.compact(CompactionConfig::default());
+        let result = self.runtime.compact_durable(CompactionConfig::default())?;
         let removed = result.removed_message_count;
         let kept = result.compacted_session.messages.len();
         let skipped = removed == 0;
@@ -4742,12 +4742,63 @@ fn resolve_export_path(
 }
 
 fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    Ok(load_system_prompt(
-        env::current_dir()?,
-        DEFAULT_DATE,
-        env::consts::OS,
-        "unknown",
-    )?)
+    let cwd = env::current_dir()?;
+    let mut sections = load_system_prompt(&cwd, DEFAULT_DATE, env::consts::OS, "unknown")?;
+    if environment_flag("CLAW_DURABLE_MEMORY") {
+        sections.extend(durable_runtime_context_sections(&cwd));
+    }
+    Ok(sections)
+}
+
+fn durable_runtime_context_sections(cwd: &Path) -> Vec<String> {
+    let mut sources = Vec::new();
+    for (label, environment_name) in [
+        ("Durable plan ledger", "CLAWD_TODO_STORE"),
+        ("Project memory", "CLAW_PROJECT_MEMORY_FILE"),
+    ] {
+        let Some(path) = env::var_os(environment_name).map(PathBuf::from) else {
+            continue;
+        };
+        if let Ok(contents) = fs::read_to_string(&path) {
+            if !contents.trim().is_empty() {
+                sources.push(format!(
+                    "## {label}\nSource: {}\n{}",
+                    path.display(),
+                    contents.trim()
+                ));
+            }
+        }
+    }
+
+    let memory_root = cwd.join(".claw").join("memory");
+    let latest_checkpoint = fs::read_dir(&memory_root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("checkpoint.json"))
+        .filter_map(|path| {
+            let modified = fs::metadata(&path).ok()?.modified().ok()?;
+            Some((modified, path))
+        })
+        .max_by_key(|(modified, _)| *modified)
+        .and_then(|(_, path)| fs::read_to_string(&path).ok().map(|value| (path, value)));
+    if let Some((path, contents)) = latest_checkpoint {
+        sources.push(format!(
+            "## Latest compaction checkpoint\nSource: {}\n{}",
+            path.display(),
+            contents.trim()
+        ));
+    }
+
+    if sources.is_empty() {
+        Vec::new()
+    } else {
+        vec![format!(
+            "# Durable recovery context\nThe following versioned project state is authoritative after resume, interruption, or compaction. Preserve provenance, consult the referenced immutable archive for exact older details, and do not repeat completed external side effects.\n\n{}",
+            sources.join("\n\n")
+        )]
+    }
 }
 
 fn build_runtime_plugin_state() -> Result<RuntimePluginState, Box<dyn std::error::Error>> {
@@ -6522,7 +6573,11 @@ fn permission_policy_for_deployment(
 }
 
 fn unrestricted_deployment_enabled() -> bool {
-    env::var("CLAW_UNRESTRICTED").is_ok_and(|value| {
+    environment_flag("CLAW_UNRESTRICTED")
+}
+
+fn environment_flag(name: &str) -> bool {
+    env::var(name).is_ok_and(|value| {
         matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "1" | "true" | "yes" | "on"
@@ -6724,7 +6779,8 @@ mod tests {
     use super::{
         build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
         create_managed_session_handle, delete_merged_local_branches_in, describe_tool_progress,
-        explicit_agent_delegation_intent, filter_tool_specs, format_bughunter_report,
+        durable_runtime_context_sections, explicit_agent_delegation_intent, filter_tool_specs,
+        format_bughunter_report,
         format_commit_preflight_report, format_commit_skipped_report, format_compact_report,
         format_cost_report, format_internal_prompt_progress_line, format_issue_report,
         format_model_report, format_model_switch_report, format_permissions_report,
@@ -8401,6 +8457,46 @@ UU conflicted.rs",
         assert!(help.contains("Use `latest` with --resume, /resume, or /session switch"));
         assert!(help.contains("claw --resume latest"));
         assert!(help.contains("claw --resume latest /status /diff /export notes.txt"));
+    }
+
+    #[test]
+    fn durable_context_rehydrates_plan_memory_and_latest_checkpoint() {
+        let _guard = env_lock();
+        let root = temp_dir();
+        let state = root.join(".claw");
+        let plan = state.join("plan.json");
+        let memory = state.join("project-memory.json");
+        let checkpoint = state
+            .join("memory")
+            .join("session-test")
+            .join("checkpoint.json");
+        fs::create_dir_all(checkpoint.parent().expect("checkpoint parent"))
+            .expect("state directories should create");
+        fs::write(&plan, r#"{"schema_version":1,"todos":[{"content":"ship"}]}"#)
+            .expect("plan should write");
+        fs::write(&memory, r#"{"schema_version":1,"corrections":["keep API"]}"#)
+            .expect("memory should write");
+        fs::write(&checkpoint, r#"{"schema_version":1,"summary":"resume here"}"#)
+            .expect("checkpoint should write");
+        let previous_plan = std::env::var_os("CLAWD_TODO_STORE");
+        let previous_memory = std::env::var_os("CLAW_PROJECT_MEMORY_FILE");
+        std::env::set_var("CLAWD_TODO_STORE", &plan);
+        std::env::set_var("CLAW_PROJECT_MEMORY_FILE", &memory);
+
+        let rendered = durable_runtime_context_sections(&root).join("\n");
+
+        match previous_plan {
+            Some(value) => std::env::set_var("CLAWD_TODO_STORE", value),
+            None => std::env::remove_var("CLAWD_TODO_STORE"),
+        }
+        match previous_memory {
+            Some(value) => std::env::set_var("CLAW_PROJECT_MEMORY_FILE", value),
+            None => std::env::remove_var("CLAW_PROJECT_MEMORY_FILE"),
+        }
+        fs::remove_dir_all(root).expect("temp state should remove");
+        assert!(rendered.contains("Durable plan ledger"));
+        assert!(rendered.contains("keep API"));
+        assert!(rendered.contains("resume here"));
     }
 
     #[test]

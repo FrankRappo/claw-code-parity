@@ -44,3 +44,16 @@ tool, environment, or output-truncation blockers.
 `/stop` remains the explicit cancellation mechanism. Automatic compaction is
 not disabled or moved: `110000` is the verified operating point requested by
 the deployment owner.
+
+## Autonomous continuity retained
+
+- Multi-step turns use a durable TodoWrite ledger and a runtime completion gate;
+  final output is withheld while work is pending or verification evidence is
+  absent.
+- Compaction is transactional: immutable full archives are created before
+  message removal, checkpoints are atomically replaced, and archive retries are
+  idempotent.
+- Project memory, active-task state, live steering, `/next` queue entries, and
+  pause state are schema-versioned and rehydrated into a resumed process.
+- Audit events are append-only and filesystem checkpoints preserve Git tracked
+  state plus untracked files before operator turns and steering transitions.

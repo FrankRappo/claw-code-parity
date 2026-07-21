@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -541,6 +542,14 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                                 "status": {
                                     "type": "string",
                                     "enum": ["pending", "in_progress", "completed"]
+                                },
+                                "evidence": {
+                                    "type": "string",
+                                    "description": "Concrete command/result or artifact proving a completed step"
+                                },
+                                "idempotencyKey": {
+                                    "type": "string",
+                                    "description": "Stable key used to avoid repeating an external side effect after restart"
                                 }
                             },
                             "required": ["content", "activeForm", "status"],
@@ -2059,6 +2068,14 @@ struct TodoItem {
     #[serde(rename = "activeForm")]
     active_form: String,
     status: TodoStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    evidence: Option<String>,
+    #[serde(
+        rename = "idempotencyKey",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
@@ -2877,8 +2894,12 @@ fn execute_todo_write(input: TodoWriteInput) -> Result<TodoWriteOutput, String> 
     validate_todos(&input.todos)?;
     let store_path = todo_store_path()?;
     let old_todos = if store_path.exists() {
-        serde_json::from_str::<Vec<TodoItem>>(
+        let old_value: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(&store_path).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        serde_json::from_value::<Vec<TodoItem>>(
+            old_value.get("todos").cloned().unwrap_or(old_value),
         )
         .map_err(|error| error.to_string())?
     } else {
@@ -2889,20 +2910,51 @@ fn execute_todo_write(input: TodoWriteInput) -> Result<TodoWriteOutput, String> 
         .todos
         .iter()
         .all(|todo| matches!(todo.status, TodoStatus::Completed));
-    let persisted = if all_done {
-        Vec::new()
-    } else {
-        input.todos.clone()
-    };
 
     if let Some(parent) = store_path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    std::fs::write(
-        &store_path,
-        serde_json::to_string_pretty(&persisted).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
+    let persisted = serde_json::json!({
+        "schema_version": 1,
+        "updated_at_unix_ms": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default(),
+        "provenance": {
+            "source": "TodoWrite",
+            "expires_at_unix_ms": serde_json::Value::Null,
+        },
+        "todos": &input.todos,
+    });
+    let payload = serde_json::to_string_pretty(&persisted).map_err(|error| error.to_string())?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let temporary = store_path.with_extension(format!("tmp-{}-{nonce}", std::process::id(),));
+    std::fs::write(&temporary, format!("{payload}\n")).map_err(|error| error.to_string())?;
+    std::fs::rename(&temporary, &store_path).map_err(|error| error.to_string())?;
+
+    if let Ok(event_path) = std::env::var("CLAW_EVENT_JOURNAL") {
+        if let Some(parent) = std::path::Path::new(&event_path).parent() {
+            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        let event = serde_json::json!({
+            "schema_version": 1,
+            "event": "plan_updated",
+            "timestamp_unix_ms": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_millis())
+                .unwrap_or_default(),
+            "todos": &input.todos,
+        });
+        let mut stream = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(event_path)
+            .map_err(|error| error.to_string())?;
+        writeln!(stream, "{event}").map_err(|error| error.to_string())?;
+    }
 
     let verification_nudge_needed = (all_done
         && input.todos.len() >= 3

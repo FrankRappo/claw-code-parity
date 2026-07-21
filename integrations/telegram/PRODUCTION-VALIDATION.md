@@ -28,6 +28,12 @@ public addresses, private paths, model weights, or Telegram chat identifiers.
   automatically after a crashed owner, and prevents recursive fan-out.
 - Automatic compaction begins at 110000 input tokens for the measured 163840-
   token Gemma slot.
+- Compaction archives the complete pre-compaction JSONL immutably, atomically
+  updates a versioned recovery checkpoint, and rehydrates plan/project memory.
+- Autonomous plans cannot finalize with pending items or without concrete
+  verification evidence. Live steering, durable `/next`, `/queue`, `/pause`,
+  `/continue`, active-task recovery, retry events, and project checkpoints are
+  part of the deployed contract and require post-deployment E2E below.
 - Claw now runs on one dedicated, disposable, GPU-less sandbox VM. The Telegram
   bot and Gemma inference remain on their existing hosts.
 - The VM has 8 vCPU, 16 GiB RAM, and a 250 GB SSD. It is configured to boot with

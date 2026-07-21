@@ -308,6 +308,132 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(environment["CLAW_PROGRESS_FILE"], str(progress_file))
             self.assertEqual(environment["CLAW_PROGRESS_OPERATION_ID"], "operation-1")
 
+    def test_agent_environment_binds_durable_project_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner = bridge.ClawRunner(test_config(root))
+            environment = runner._agent_environment(workspace=root)
+
+            self.assertEqual(environment["CLAWD_TODO_STORE"], str(root / ".claw" / "plan.json"))
+            self.assertEqual(
+                environment["CLAW_PROJECT_MEMORY_FILE"],
+                str(root / ".claw" / "project-memory.json"),
+            )
+            self.assertEqual(environment["CLAW_AUTONOMOUS_PLAN"], "1")
+            self.assertEqual(environment["CLAW_DURABLE_MEMORY"], "1")
+
+    def test_steering_interrupts_and_resumes_the_same_first_turn(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_claw = root / "claw"
+            fake_claw.write_text(
+                """#!/usr/bin/env python3
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+workspace = Path.cwd()
+session = workspace / '.claw' / 'sessions' / 'session-steer.jsonl'
+session.parent.mkdir(parents=True, exist_ok=True)
+prompt = sys.argv[-1]
+if '--resume' not in sys.argv and 'change direction' not in prompt:
+    session.write_text(json.dumps({'type': 'session_meta', 'version': 1, 'session_id': 'session-steer', 'created_at_ms': 1, 'updated_at_ms': 1}) + '\\n', encoding='utf-8')
+    time.sleep(30)
+else:
+    print(json.dumps({'message': 'steered:' + prompt, 'session_id': 'session-steer', 'session_path': str(session)}))
+""",
+                encoding="utf-8",
+            )
+            fake_claw.chmod(0o755)
+            config = bridge.BridgeConfig(
+                **{**test_config(root).__dict__, "claw_binary": fake_claw}
+            )
+            runner = bridge.ClawRunner(config)
+            project = bridge.ProjectStore(root / "state.json", root / "projects").new_project("7", "Steer")
+            outcome = {}
+
+            def run():
+                outcome["result"] = runner.run_turn(
+                    "7", project, "original", "operation-steer"
+                )
+
+            thread = threading.Thread(target=run)
+            thread.start()
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and not runner.is_running("7"):
+                time.sleep(0.01)
+            response = runner.steer("7", project, "change direction", 99)
+            thread.join(timeout=5)
+
+            self.assertTrue(response["interrupted"])
+            self.assertFalse(thread.is_alive())
+            self.assertIn("change direction", outcome["result"]["message"])
+            memory = json.loads(
+                (Path(project["workspace"]) / ".claw" / "project-memory.json").read_text()
+            )
+            self.assertEqual(memory["corrections"][-1]["text"], "change direction")
+            events = (Path(project["workspace"]) / ".claw" / "events.jsonl").read_text()
+            self.assertIn("turn_restarted_for_steering", events)
+
+    def test_next_queue_runs_after_the_current_turn_and_is_crash_safe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_claw = root / "claw"
+            fake_claw.write_text(
+                """#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+session = Path.cwd() / '.claw' / 'sessions' / 'session-next.jsonl'
+session.parent.mkdir(parents=True, exist_ok=True)
+if not session.exists():
+    session.write_text(json.dumps({'type': 'session_meta', 'version': 1, 'session_id': 'session-next', 'created_at_ms': 1, 'updated_at_ms': 1}) + '\\n')
+prompt = sys.argv[-1]
+with open(Path.cwd() / 'prompts.log', 'a') as stream:
+    stream.write(prompt + '\\n')
+print(json.dumps({'message': prompt, 'session_id': 'session-next', 'session_path': str(session)}))
+""",
+                encoding="utf-8",
+            )
+            fake_claw.chmod(0o755)
+            config = bridge.BridgeConfig(
+                **{**test_config(root).__dict__, "claw_binary": fake_claw}
+            )
+            runner = bridge.ClawRunner(config)
+            project = bridge.ProjectStore(root / "state.json", root / "projects").new_project("7", "Queue")
+            runner.enqueue_next("7", project, "second task", 101)
+
+            result = runner.run_turn("7", project, "first task", "operation-next")
+
+            prompts = (Path(project["workspace"]) / "prompts.log").read_text()
+            self.assertIn("first task", prompts)
+            self.assertIn("second task", prompts)
+            self.assertIn("second task", result["message"])
+            self.assertEqual(runner.control_status(project)["queue"], [])
+
+    def test_continue_recovers_a_persisted_inflight_task_after_runner_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner = bridge.ClawRunner(test_config(root))
+            project = bridge.ProjectStore(root / "state.json", root / "projects").new_project("7", "Recover")
+            state_path = Path(project["workspace"]) / ".claw" / "control-state.json"
+            state = json.loads(state_path.read_text())
+            state["paused"] = True
+            state["active_task"] = {
+                "operation_id": "operation-crashed",
+                "prompt": "finish the durable deployment",
+                "state": "paused",
+            }
+            bridge.atomic_write_json(state_path, state)
+
+            result = runner.resume("7", project)
+
+            self.assertTrue(result["resumed"])
+            self.assertFalse(result["live"])
+            self.assertIn("finish the durable deployment", result["restart_prompt"])
+
     def test_live_progress_is_visible_while_claw_process_runs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -469,6 +595,25 @@ print("diagnostic-without-json")
 
 
 class ApplicationTests(unittest.TestCase):
+    def test_autonomous_plan_is_versioned_and_requires_verification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            application = bridge.BridgeApplication(test_config(root))
+            project = application.store.new_project("1", "Plan")
+
+            application.ensure_autonomous_plan(project, "Implement feature", "operation-1")
+
+            plan = json.loads(
+                (Path(project["workspace"]) / ".claw" / "plan.json").read_text()
+            )
+            self.assertEqual(plan["schema_version"], 1)
+            self.assertEqual(plan["todos"][0]["status"], "in_progress")
+            self.assertIn("Implement feature", plan["todos"][0]["content"])
+            self.assertIn("Verify", plan["todos"][1]["content"])
+            self.assertEqual(
+                plan["todos"][0]["idempotencyKey"], "operation-1"
+            )
+
     def test_attachment_validation_and_effective_prompt(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

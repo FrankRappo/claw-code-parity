@@ -530,7 +530,7 @@ class ClawModeTests(unittest.TestCase):
         self.assertIn("Проверить сайт", text)
         self.assertIn("6м 7с", text)
 
-    def test_regular_claw_message_gets_immediate_busy_reply(self):
+    def test_regular_claw_message_steers_the_active_turn(self):
         bot.CHAT_MODES[10] = bot.MODE_CLAW
         bot.ACTIVE_CLAW_OPERATIONS[10] = {"operation-1"}
         message = {
@@ -542,13 +542,21 @@ class ClawModeTests(unittest.TestCase):
         with mock.patch.object(bot, "ALLOWED", set()), mock.patch.object(
             bot, "ALLOWED_USERNAMES", set()
         ), mock.patch.object(bot, "claw_answer") as answer, mock.patch.object(
+            bot,
+            "claw_request",
+            return_value={"ok": True, "accepted": True, "interrupted": True},
+        ) as request, mock.patch.object(
             bot, "send_message"
         ) as send:
             bot.handle_message(message)
 
         answer.assert_not_called()
-        self.assertIn("уже выполняет", send.call_args.args[1])
-        self.assertIn("/progress", send.call_args.args[1])
+        request.assert_called_once_with(
+            "/v1/steer",
+            {"chat_id": 10, "text": "Ещё один вопрос", "message_id": 30},
+            timeout=15,
+        )
+        self.assertIn("Уточнение принято", send.call_args.args[1])
 
     def test_begin_claw_operation_is_atomic_per_chat(self):
         first = bot.begin_claw_operation(10)
@@ -580,6 +588,37 @@ class ClawModeTests(unittest.TestCase):
             {"chat_id": 10, "operation_ids": ("operation-1",)},
             timeout=15,
         )
+
+    def test_continue_restarts_a_durable_inflight_task_after_service_restart(self):
+        message = {
+            "chat": {"id": 10},
+            "from": {"id": 20},
+            "message_id": 30,
+            "text": "/continue",
+        }
+        with mock.patch.object(bot, "ALLOWED", set()), mock.patch.object(
+            bot, "ALLOWED_USERNAMES", set()
+        ), mock.patch.object(
+            bot,
+            "claw_request",
+            return_value={
+                "ok": True,
+                "resumed": True,
+                "live": False,
+                "restart_prompt": "recover persisted task",
+            },
+        ) as request, mock.patch.object(
+            bot, "claw_answer", return_value="recovered answer"
+        ) as answer, mock.patch.object(bot, "send_message") as send:
+            bot.handle_message(message)
+
+        request.assert_called_once_with(
+            "/v1/continue", {"chat_id": 10}, timeout=15
+        )
+        answer.assert_called_once()
+        self.assertEqual(answer.call_args.args[:3], (10, 20, "recover persisted task"))
+        self.assertEqual(send.call_args.args[1], "recovered answer")
+        self.assertNotIn(10, bot.ACTIVE_CLAW_OPERATIONS)
 
 
 if __name__ == "__main__":

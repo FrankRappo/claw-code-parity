@@ -45,7 +45,7 @@ pub mod worker_boot;
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use compact::{
-    compact_session, estimate_session_tokens, format_compact_summary,
+    compact_session, compact_session_durable, estimate_session_tokens, format_compact_summary,
     get_compact_continuation_message, should_compact, CompactionConfig, CompactionResult,
 };
 pub use config::{
@@ -132,8 +132,8 @@ pub use sandbox::{
     SandboxRequest, SandboxStatus,
 };
 pub use session::{
-    ContentBlock, ConversationMessage, MessageRole, Session, SessionCompaction, SessionError,
-    SessionFork,
+    ContentBlock, ConversationMessage, DurableCompactionCheckpoint, MessageRole, Session,
+    SessionCompaction, SessionError, SessionFork,
 };
 pub use sse::{IncrementalSseParser, SseEvent};
 pub use stale_branch::{

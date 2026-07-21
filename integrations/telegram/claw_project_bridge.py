@@ -11,13 +11,16 @@ from __future__ import annotations
 
 import base64
 import binascii
+import fcntl
 import hashlib
 import hmac
 import json
 import os
 import re
 import signal
+import shutil
 import subprocess
+import tarfile
 import threading
 import time
 import uuid
@@ -52,6 +55,10 @@ SUPPORTED_ATTACHMENTS = {
 PROGRESS_SLOW_SECONDS = 90
 PROGRESS_STALLED_SECONDS = 300
 PROGRESS_DETAIL_LIMIT = 240
+CONTROL_SCHEMA_VERSION = 1
+PROJECT_MEMORY_SCHEMA_VERSION = 1
+CONTROL_TEXT_LIMIT = 32_000
+TURN_RECOVERY_ATTEMPTS = 3
 
 
 class BridgeError(RuntimeError):
@@ -175,6 +182,185 @@ def utc_timestamp() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def atomic_write_json(path: Path, value: dict[str, Any]) -> None:
+    """Write versioned state by replace so crashes cannot leave partial JSON."""
+
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    temporary.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary.chmod(0o600)
+    os.replace(temporary, path)
+
+
+def append_project_event(project: dict[str, Any], event: str, **fields: Any) -> None:
+    path = Path(project["workspace"]) / ".claw" / "events.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    record = {
+        "schema_version": CONTROL_SCHEMA_VERSION,
+        "event_id": uuid.uuid4().hex,
+        "event": event,
+        "timestamp": utc_timestamp(),
+        **fields,
+    }
+    with path.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        try:
+            stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+    path.chmod(0o600)
+
+
+def append_project_correction(
+    project: dict[str, Any], text: str, source_message_id: Any = None
+) -> None:
+    path = Path(project["workspace"]) / ".claw" / "project-memory.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        value = {
+            "schema_version": PROJECT_MEMORY_SCHEMA_VERSION,
+            "created_at": utc_timestamp(),
+            "directives": [],
+            "corrections": [],
+            "provenance": {"source": "telegram_claw_bridge", "expires_at": None},
+        }
+    corrections = value.setdefault("corrections", [])
+    corrections.append(
+        {
+            "id": uuid.uuid4().hex,
+            "text": text,
+            "created_at": utc_timestamp(),
+            "source": {
+                "kind": "telegram_steering",
+                "message_id": source_message_id,
+            },
+            "expires_at": None,
+        }
+    )
+    value["schema_version"] = PROJECT_MEMORY_SCHEMA_VERSION
+    value["updated_at"] = utc_timestamp()
+    atomic_write_json(path, value)
+
+
+def create_project_checkpoint(project: dict[str, Any], reason: str) -> str:
+    """Create a non-destructive recovery point before an autonomous mutation."""
+
+    workspace = Path(project["workspace"])
+    checkpoint_id = f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{uuid.uuid4().hex[:8]}"
+    directory = workspace / ".claw" / "checkpoints" / checkpoint_id
+    directory.mkdir(parents=True, mode=0o700)
+    git_ref = None
+    untracked: list[str] = []
+    is_git_worktree = False
+    try:
+        inside = subprocess.run(
+            ["git", "-C", str(workspace), "rev-parse", "--is-inside-work-tree"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if inside.returncode == 0 and inside.stdout.strip() == "true":
+            is_git_worktree = True
+            snapshot = subprocess.run(
+                ["git", "-C", str(workspace), "stash", "create", f"claw-{checkpoint_id}"],
+                text=True,
+                capture_output=True,
+                check=False,
+            ).stdout.strip()
+            if snapshot:
+                git_ref = f"refs/claw/checkpoints/{checkpoint_id}"
+                subprocess.run(
+                    ["git", "-C", str(workspace), "update-ref", git_ref, snapshot],
+                    text=True,
+                    capture_output=True,
+                    check=True,
+                )
+            listed = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(workspace),
+                    "ls-files",
+                    "--others",
+                    "--exclude-standard",
+                    "-z",
+                ],
+                capture_output=True,
+                check=False,
+            )
+            if listed.returncode == 0:
+                untracked = [
+                    value.decode("utf-8", "surrogateescape")
+                    for value in listed.stdout.split(b"\0")
+                    if value and not value.startswith(b".claw/")
+                ]
+                if untracked:
+                    with tarfile.open(directory / "untracked.tar.gz", "w:gz") as archive:
+                        for relative in untracked:
+                            candidate = workspace / relative
+                            if candidate.exists() or candidate.is_symlink():
+                                archive.add(candidate, arcname=relative, recursive=True)
+        if not is_git_worktree:
+            with tarfile.open(directory / "workspace.tar.gz", "w:gz") as archive:
+                for candidate in workspace.iterdir():
+                    if candidate.name == ".claw":
+                        continue
+
+                    def exclude_internal_state(
+                        member: tarfile.TarInfo,
+                    ) -> tarfile.TarInfo | None:
+                        parts = Path(member.name).parts
+                        return None if ".git" in parts or ".claw" in parts else member
+
+                    archive.add(
+                        candidate,
+                        arcname=candidate.name,
+                        recursive=True,
+                        filter=exclude_internal_state,
+                    )
+    except (OSError, subprocess.SubprocessError, tarfile.TarError) as error:
+        (directory / "checkpoint-warning.txt").write_text(
+            f"Git/untracked snapshot warning: {error}\n", encoding="utf-8"
+        )
+
+    for name in ("plan.json", "project-memory.json", "control-state.json"):
+        source = workspace / ".claw" / name
+        if source.is_file():
+            shutil.copy2(source, directory / name)
+    atomic_write_json(
+        directory / "metadata.json",
+        {
+            "schema_version": 1,
+            "checkpoint_id": checkpoint_id,
+            "created_at": utc_timestamp(),
+            "reason": reason,
+            "git_ref": git_ref,
+            "untracked_archive": "untracked.tar.gz" if untracked else None,
+            "workspace_archive": "workspace.tar.gz" if not is_git_worktree else None,
+            "session_id": project.get("session_id"),
+            "session_path": project.get("session_path"),
+            "provenance": {
+                "source": "telegram_claw_bridge",
+                "expires_at": None,
+            },
+        },
+    )
+    append_project_event(
+        project,
+        "project_checkpoint_created",
+        checkpoint_id=checkpoint_id,
+        reason=reason,
+        git_ref=git_ref,
+    )
+    return checkpoint_id
+
+
 def validated_chat_id(value: Any) -> str:
     try:
         return str(int(value))
@@ -255,7 +441,31 @@ class ProjectStore:
             project_id = uuid.uuid4().hex[:12]
             workspace = self.projects_root / f"chat-{chat_id}" / project_id
             workspace.mkdir(parents=True, exist_ok=False, mode=0o700)
+            claw_state = workspace / ".claw"
+            claw_state.mkdir(mode=0o700)
             now = utc_timestamp()
+            atomic_write_json(
+                claw_state / "project-memory.json",
+                {
+                    "schema_version": PROJECT_MEMORY_SCHEMA_VERSION,
+                    "created_at": now,
+                    "updated_at": now,
+                    "directives": [],
+                    "corrections": [],
+                    "provenance": {
+                        "source": "telegram_claw_bridge",
+                        "expires_at": None,
+                    },
+                },
+            )
+            atomic_write_json(
+                claw_state / "control-state.json",
+                {
+                    "schema_version": CONTROL_SCHEMA_VERSION,
+                    "paused": False,
+                    "queue": [],
+                },
+            )
             project = {
                 "id": project_id,
                 "name": clean_project_name(name),
@@ -350,7 +560,8 @@ class ClawRunner:
     def __init__(self, config: BridgeConfig):
         self.config = config
         self._capacity = threading.BoundedSemaphore(config.max_concurrent)
-        self._active_lock = threading.Lock()
+        self._active_lock = threading.RLock()
+        self._control_changed = threading.Condition(self._active_lock)
         self._active: dict[str, ActiveTurn] = {}
         self._cancelled_operation_ids: dict[str, set[str]] = {}
 
@@ -380,6 +591,7 @@ class ClawRunner:
         self,
         progress_file: Path | None = None,
         operation_id: str | None = None,
+        workspace: Path | None = None,
     ) -> dict[str, str]:
         """Pass the complete service environment to Claw and its tools."""
 
@@ -408,6 +620,29 @@ class ClawRunner:
             environment["CLAW_PROGRESS_OPERATION_ID"] = operation_id
         else:
             environment.pop("CLAW_PROGRESS_OPERATION_ID", None)
+        if workspace is not None:
+            state_dir = workspace / ".claw"
+            state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            environment.update(
+                {
+                    "CLAWD_TODO_STORE": str(state_dir / "plan.json"),
+                    "CLAW_PROJECT_MEMORY_FILE": str(
+                        state_dir / "project-memory.json"
+                    ),
+                    "CLAW_EVENT_JOURNAL": str(state_dir / "events.jsonl"),
+                    "CLAW_AUTONOMOUS_PLAN": "1",
+                    "CLAW_DURABLE_MEMORY": "1",
+                }
+            )
+        else:
+            for name in (
+                "CLAWD_TODO_STORE",
+                "CLAW_PROJECT_MEMORY_FILE",
+                "CLAW_EVENT_JOURNAL",
+                "CLAW_AUTONOMOUS_PLAN",
+                "CLAW_DURABLE_MEMORY",
+            ):
+                environment.pop(name, None)
         if self.config.unrestricted:
             environment["CLAW_UNRESTRICTED"] = "1"
             environment["CLAW_SUBAGENT_LOCK_FILE"] = str(
@@ -417,6 +652,205 @@ class ClawRunner:
             environment.pop("CLAW_UNRESTRICTED", None)
             environment.pop("CLAW_SUBAGENT_LOCK_FILE", None)
         return environment
+
+    @staticmethod
+    def _control_path(project: dict[str, Any]) -> Path:
+        return Path(project["workspace"]) / ".claw" / "control-state.json"
+
+    def _read_control(self, project: dict[str, Any]) -> dict[str, Any]:
+        path = self._control_path(project)
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            value = {
+                "schema_version": CONTROL_SCHEMA_VERSION,
+                "paused": False,
+                "queue": [],
+            }
+        if value.get("schema_version") != CONTROL_SCHEMA_VERSION:
+            raise BridgeError("unsupported project control-state version")
+        if not isinstance(value.get("queue"), list):
+            raise BridgeError("invalid project control queue")
+        return value
+
+    def _write_control(self, project: dict[str, Any], value: dict[str, Any]) -> None:
+        value["schema_version"] = CONTROL_SCHEMA_VERSION
+        atomic_write_json(self._control_path(project), value)
+
+    def _update_active_task(
+        self,
+        project: dict[str, Any],
+        operation_id: str,
+        prompt: str | None = None,
+        state: str | None = None,
+    ) -> None:
+        with self._active_lock:
+            value = self._read_control(project)
+            task = value.get("active_task")
+            if not isinstance(task, dict) or task.get("operation_id") != operation_id:
+                task = {
+                    "operation_id": operation_id,
+                    "created_at": utc_timestamp(),
+                    "attempts": 0,
+                    "provenance": {
+                        "source": "telegram_claw_bridge",
+                        "expires_at": None,
+                    },
+                }
+                value["active_task"] = task
+            if prompt is not None:
+                task["prompt"] = prompt
+            if state is not None:
+                task["state"] = state
+            task["updated_at"] = utc_timestamp()
+            self._write_control(project, value)
+
+    def _increment_active_task_attempt(
+        self, project: dict[str, Any], operation_id: str
+    ) -> None:
+        with self._active_lock:
+            value = self._read_control(project)
+            task = value.get("active_task")
+            if isinstance(task, dict) and task.get("operation_id") == operation_id:
+                task["attempts"] = int(task.get("attempts") or 0) + 1
+                task["state"] = "running"
+                task["updated_at"] = utc_timestamp()
+                self._write_control(project, value)
+
+    def _finish_active_task(
+        self, project: dict[str, Any], operation_id: str, state: str
+    ) -> None:
+        with self._active_lock:
+            value = self._read_control(project)
+            task = value.get("active_task")
+            if isinstance(task, dict) and task.get("operation_id") == operation_id:
+                task["state"] = state
+                task["finished_at"] = utc_timestamp()
+                value["last_task"] = task
+                value.pop("active_task", None)
+                self._write_control(project, value)
+
+    def _enqueue_control(
+        self,
+        project: dict[str, Any],
+        kind: str,
+        text: str,
+        source_message_id: Any = None,
+    ) -> dict[str, Any]:
+        normalized = text.strip()
+        if not normalized:
+            raise BridgeError("control message must not be empty")
+        if len(normalized) > CONTROL_TEXT_LIMIT:
+            raise BridgeError(f"control message exceeds {CONTROL_TEXT_LIMIT} characters")
+        with self._active_lock:
+            value = self._read_control(project)
+            item = {
+                "id": uuid.uuid4().hex,
+                "kind": kind,
+                "text": normalized,
+                "state": "pending",
+                "created_at": utc_timestamp(),
+                "attempts": 0,
+                "source": {
+                    "kind": "telegram",
+                    "message_id": source_message_id,
+                },
+                "expires_at": None,
+            }
+            value["queue"].append(item)
+            self._write_control(project, value)
+        append_project_event(
+            project,
+            "control_message_queued",
+            control_id=item["id"],
+            kind=kind,
+            source=item["source"],
+        )
+        return item
+
+    def _claim_control(
+        self, project: dict[str, Any], exclude_id: str | None = None
+    ) -> dict[str, Any] | None:
+        with self._active_lock:
+            value = self._read_control(project)
+            if value.get("paused"):
+                return None
+            queue = value["queue"]
+            candidates = [
+                item
+                for item in queue
+                if item.get("state") in {"pending", "running"}
+                and item.get("id") != exclude_id
+            ]
+            if not candidates:
+                return None
+            candidates.sort(key=lambda item: 0 if item.get("kind") == "steer" else 1)
+            item = candidates[0]
+            item["state"] = "running"
+            item["attempts"] = int(item.get("attempts") or 0) + 1
+            item["started_at"] = utc_timestamp()
+            self._write_control(project, value)
+        append_project_event(
+            project,
+            "control_message_claimed",
+            control_id=item.get("id"),
+            kind=item.get("kind"),
+            attempt=item["attempts"],
+        )
+        return dict(item)
+
+    def _complete_control(self, project: dict[str, Any], item_id: str) -> None:
+        with self._active_lock:
+            value = self._read_control(project)
+            for item in value["queue"]:
+                if item.get("id") == item_id:
+                    item["state"] = "completed"
+                    item["completed_at"] = utc_timestamp()
+                    break
+            self._write_control(project, value)
+        append_project_event(
+            project, "control_message_completed", control_id=item_id
+        )
+
+    @staticmethod
+    def _control_prompt(item: dict[str, Any]) -> str:
+        kind = item.get("kind")
+        heading = (
+            "OPERATOR STEERING UPDATE — supersedes conflicting earlier instructions"
+            if kind == "steer"
+            else "NEXT QUEUED OPERATOR TASK"
+        )
+        return (
+            f"{heading}\n"
+            f"Control id / idempotency key: {item.get('id')}\n"
+            f"Message: {item.get('text')}\n\n"
+            "Resume the same project autonomously. Inspect current files and durable plan "
+            "before repeating side effects. Apply this update, repair the plan, continue "
+            "until every plan item is completed and verified, then answer the operator."
+        )
+
+    @staticmethod
+    def _adopt_latest_session(project: dict[str, Any]) -> bool:
+        session_dir = Path(project["workspace"]) / ".claw" / "sessions"
+        try:
+            candidates = sorted(
+                session_dir.glob("*.jsonl"),
+                key=lambda path: path.stat().st_mtime_ns,
+                reverse=True,
+            )
+        except OSError:
+            return False
+        for path in candidates:
+            try:
+                for raw_line in path.read_text(encoding="utf-8").splitlines():
+                    record = json.loads(raw_line)
+                    if record.get("type") == "session_meta" and record.get("session_id"):
+                        project["session_id"] = str(record["session_id"])
+                        project["session_path"] = str(path)
+                        return True
+            except (OSError, json.JSONDecodeError):
+                continue
+        return False
 
     @staticmethod
     def _write_progress_file(path: Path, payload: dict[str, Any]) -> None:
@@ -614,95 +1048,293 @@ class ClawRunner:
     ) -> dict[str, Any]:
         if not self.config.claw_binary.is_file():
             raise BridgeError("Claw binary is unavailable", HTTPStatus.SERVICE_UNAVAILABLE)
-        session_before = self._session_signature(project)
         active_operation_id = operation_id or f"bridge-{uuid.uuid4().hex}"
         progress_file = (
             self.config.state_file.parent / "progress" / f"chat-{chat_id}.json"
         )
+        current_prompt = prompt
+        current_control: dict[str, Any] | None = None
+        failure_attempts = 0
         started_at = time.time()
-        try:
-            self._write_progress_file(
-                progress_file,
-                {
-                    "operation_id": active_operation_id,
-                    "phase": "starting",
-                    "updated_at_unix_ms": int(started_at * 1000),
-                },
-            )
-        except OSError as error:
-            print(f"Claw progress initialization warning: {error}", flush=True)
-        environment = self._agent_environment(progress_file, active_operation_id)
-        with self._capacity:
-            with self._active_lock:
-                cancelled = self._cancelled_operation_ids.get(chat_id, set())
-                if operation_id and operation_id in cancelled:
-                    cancelled.discard(operation_id)
-                    if not cancelled:
-                        self._cancelled_operation_ids.pop(chat_id, None)
-                    raise BridgeError("Claw operation was stopped", HTTPStatus.CONFLICT)
-                if chat_id in self._active:
-                    raise BridgeError(
-                        "this project already has a running turn", HTTPStatus.CONFLICT
-                    )
-                # Spawn and registration share the same lock as stop(). This
-                # closes the last check-to-registration race: stop either
-                # tombstones the operation first or observes its process.
-                process = subprocess.Popen(
-                    self._command(project, prompt),
-                    cwd=project["workspace"],
-                    env=environment,
-                    text=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    start_new_session=True,
-                )
-                self._active[chat_id] = ActiveTurn(
-                    process=process,
-                    started_at=started_at,
-                    progress_file=progress_file,
-                    operation_id=active_operation_id,
-                )
-            try:
-                stdout, stderr = process.communicate(timeout=self.config.turn_timeout)
-            except subprocess.TimeoutExpired as error:
-                self._terminate(process, signal.SIGINT)
-                raise BridgeError(
-                    f"Claw turn exceeded {self.config.turn_timeout} seconds",
-                    HTTPStatus.GATEWAY_TIMEOUT,
-                ) from error
-            finally:
-                with self._active_lock:
-                    completed_turn = self._active.pop(chat_id, None)
-                    if completed_turn:
-                        cancelled = self._cancelled_operation_ids.get(chat_id)
-                        if cancelled is not None:
-                            cancelled.discard(completed_turn.operation_id)
-                            if not cancelled:
-                                self._cancelled_operation_ids.pop(chat_id, None)
-
-        if process.returncode != 0:
-            message = stderr.strip() or stdout.strip() or f"exit code {process.returncode}"
-            raise BridgeError(f"Claw turn failed: {message[-2000:]}", HTTPStatus.BAD_GATEWAY)
-        for line in reversed(stdout.splitlines()):
-            try:
-                result = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(result, dict) and "message" in result:
-                return result
-        recovered = self._recover_persisted_result(project, session_before)
-        if recovered is not None:
-            print(
-                "Claw stdout contained no JSON; recovered completed turn from session",
-                flush=True,
-            )
-            return recovered
-        print(
-            "Claw output protocol error: "
-            f"stdout_chars={len(stdout)} stderr_chars={len(stderr)}",
-            flush=True,
+        append_project_event(
+            project,
+            "turn_started",
+            chat_id=chat_id,
+            operation_id=active_operation_id,
         )
-        raise BridgeError("Claw returned no JSON result", HTTPStatus.BAD_GATEWAY)
+        self._update_active_task(
+            project, active_operation_id, prompt=current_prompt, state="running"
+        )
+
+        while True:
+            with self._control_changed:
+                while self._read_control(project).get("paused"):
+                    cancelled = self._cancelled_operation_ids.get(chat_id, set())
+                    if active_operation_id in cancelled:
+                        cancelled.discard(active_operation_id)
+                        if not cancelled:
+                            self._cancelled_operation_ids.pop(chat_id, None)
+                        self._finish_active_task(
+                            project, active_operation_id, "cancelled"
+                        )
+                        raise BridgeError("Claw operation was stopped", HTTPStatus.CONFLICT)
+                    self._control_changed.wait(timeout=1)
+
+            session_before = self._session_signature(project)
+            attempt_started = time.time()
+            try:
+                self._write_progress_file(
+                    progress_file,
+                    {
+                        "operation_id": active_operation_id,
+                        "phase": "starting",
+                        "detail": (
+                            f"control:{current_control.get('id')}"
+                            if current_control
+                            else "initial turn"
+                        ),
+                        "updated_at_unix_ms": int(attempt_started * 1000),
+                    },
+                )
+            except OSError as error:
+                print(f"Claw progress initialization warning: {error}", flush=True)
+            environment = self._agent_environment(
+                progress_file,
+                active_operation_id,
+                Path(project["workspace"]),
+            )
+            self._increment_active_task_attempt(project, active_operation_id)
+
+            with self._capacity:
+                with self._active_lock:
+                    cancelled = self._cancelled_operation_ids.get(chat_id, set())
+                    if operation_id and operation_id in cancelled:
+                        cancelled.discard(operation_id)
+                        if not cancelled:
+                            self._cancelled_operation_ids.pop(chat_id, None)
+                        self._finish_active_task(
+                            project, active_operation_id, "cancelled"
+                        )
+                        raise BridgeError("Claw operation was stopped", HTTPStatus.CONFLICT)
+                    if chat_id in self._active:
+                        raise BridgeError(
+                            "this project already has a running turn", HTTPStatus.CONFLICT
+                        )
+                    process = subprocess.Popen(
+                        self._command(project, current_prompt),
+                        cwd=project["workspace"],
+                        env=environment,
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        start_new_session=True,
+                    )
+                    self._active[chat_id] = ActiveTurn(
+                        process=process,
+                        started_at=attempt_started,
+                        progress_file=progress_file,
+                        operation_id=active_operation_id,
+                    )
+                try:
+                    stdout, stderr = process.communicate(timeout=self.config.turn_timeout)
+                except subprocess.TimeoutExpired as error:
+                    self._terminate(process, signal.SIGINT)
+                    raise BridgeError(
+                        f"Claw turn exceeded {self.config.turn_timeout} seconds",
+                        HTTPStatus.GATEWAY_TIMEOUT,
+                    ) from error
+                finally:
+                    with self._active_lock:
+                        self._active.pop(chat_id, None)
+
+            if process.returncode != 0:
+                adopted_session = self._adopt_latest_session(project)
+                with self._active_lock:
+                    paused = bool(self._read_control(project).get("paused"))
+                    cancelled = self._cancelled_operation_ids.get(chat_id)
+                    stopped = bool(
+                        cancelled and active_operation_id in cancelled
+                    )
+                    if stopped:
+                        cancelled.discard(active_operation_id)
+                        if not cancelled:
+                            self._cancelled_operation_ids.pop(chat_id, None)
+                if stopped:
+                    self._finish_active_task(project, active_operation_id, "cancelled")
+                    raise BridgeError("Claw operation was stopped", HTTPStatus.CONFLICT)
+                if paused:
+                    self._update_active_task(
+                        project,
+                        active_operation_id,
+                        prompt=current_prompt,
+                        state="paused",
+                    )
+                    create_project_checkpoint(project, "pause after interrupted process")
+                    append_project_event(
+                        project,
+                        "turn_interrupted_for_pause",
+                        operation_id=active_operation_id,
+                    )
+                    current_prompt = (
+                        "Resume the interrupted autonomous plan from durable state. "
+                        "Inspect current files before repeating side effects and continue "
+                        "until the plan is complete and verified."
+                    )
+                    self._update_active_task(
+                        project,
+                        active_operation_id,
+                        prompt=current_prompt,
+                        state="paused",
+                    )
+                    continue
+
+                next_control = self._claim_control(
+                    project,
+                    exclude_id=(current_control or {}).get("id"),
+                )
+                if next_control is not None:
+                    create_project_checkpoint(
+                        project, f"before {next_control.get('kind')} control"
+                    )
+                    if current_control is not None:
+                        self._supersede_control(
+                            project,
+                            str(current_control["id"]),
+                            str(next_control["id"]),
+                        )
+                    current_control = next_control
+                    failure_attempts = 0
+                    control_prompt = self._control_prompt(next_control)
+                    current_prompt = (
+                        control_prompt
+                        if adopted_session
+                        else (
+                            "The first attempt was interrupted before its session metadata "
+                            "was durable. Preserve and continue this original request:\n"
+                            f"{current_prompt}\n\n{control_prompt}"
+                        )
+                    )
+                    self._update_active_task(
+                        project,
+                        active_operation_id,
+                        prompt=current_prompt,
+                        state="running",
+                    )
+                    append_project_event(
+                        project,
+                        "turn_restarted_for_steering",
+                        operation_id=active_operation_id,
+                        control_id=next_control["id"],
+                    )
+                    continue
+
+                message = (
+                    stderr.strip()
+                    or stdout.strip()
+                    or f"exit code {process.returncode}"
+                )
+                failure_attempts += 1
+                if failure_attempts < TURN_RECOVERY_ATTEMPTS:
+                    append_project_event(
+                        project,
+                        "turn_recovery_scheduled",
+                        operation_id=active_operation_id,
+                        attempt=failure_attempts,
+                        error=message[-1000:],
+                    )
+                    current_prompt = (
+                        "RECOVERY ATTEMPT after an interrupted or failed Claw process. "
+                        f"Attempt {failure_attempts + 1}/{TURN_RECOVERY_ATTEMPTS}. "
+                        "Resume from the durable plan, project memory, event journal, and "
+                        "current files. Inspect existing effects before repeating them; use "
+                        "their idempotency keys. Diagnose the previous failure, choose a "
+                        "materially different recovery when appropriate, and continue until "
+                        "the plan is complete and verified. Previous process tail:\n"
+                        f"{message[-1000:]}"
+                    )
+                    self._update_active_task(
+                        project,
+                        active_operation_id,
+                        prompt=current_prompt,
+                        state="recovering",
+                    )
+                    time.sleep(min(failure_attempts, 2))
+                    continue
+                self._finish_active_task(project, active_operation_id, "blocked")
+                raise BridgeError(
+                    f"Claw turn failed: {message[-2000:]}", HTTPStatus.BAD_GATEWAY
+                )
+
+            result = None
+            for line in reversed(stdout.splitlines()):
+                try:
+                    candidate = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(candidate, dict) and "message" in candidate:
+                    result = candidate
+                    break
+            if result is None:
+                result = self._recover_persisted_result(project, session_before)
+            if result is None:
+                print(
+                    "Claw output protocol error: "
+                    f"stdout_chars={len(stdout)} stderr_chars={len(stderr)}",
+                    flush=True,
+                )
+                raise BridgeError("Claw returned no JSON result", HTTPStatus.BAD_GATEWAY)
+
+            session_id = str(result.get("session_id") or "")
+            session_path = str(result.get("session_path") or "")
+            if session_id and session_path:
+                project["session_id"] = session_id
+                project["session_path"] = session_path
+            if current_control is not None:
+                self._complete_control(project, str(current_control["id"]))
+                current_control = None
+            failure_attempts = 0
+
+            next_control = self._claim_control(project)
+            if next_control is not None:
+                create_project_checkpoint(
+                    project, f"before {next_control.get('kind')} control"
+                )
+                current_control = next_control
+                current_prompt = self._control_prompt(next_control)
+                self._update_active_task(
+                    project,
+                    active_operation_id,
+                    prompt=current_prompt,
+                    state="running",
+                )
+                continue
+
+            append_project_event(
+                project,
+                "turn_completed",
+                operation_id=active_operation_id,
+                elapsed_seconds=round(time.time() - started_at, 3),
+            )
+            self._finish_active_task(project, active_operation_id, "completed")
+            return result
+
+    def _supersede_control(
+        self, project: dict[str, Any], item_id: str, replacement_id: str
+    ) -> None:
+        with self._active_lock:
+            value = self._read_control(project)
+            for item in value["queue"]:
+                if item.get("id") == item_id:
+                    item["state"] = "superseded"
+                    item["superseded_by"] = replacement_id
+                    break
+            self._write_control(project, value)
+        append_project_event(
+            project,
+            "control_message_superseded",
+            control_id=item_id,
+            replacement_id=replacement_id,
+        )
 
     def _terminate(self, process: subprocess.Popen[str], first_signal: signal.Signals) -> None:
         if process.poll() is not None:
@@ -735,6 +1367,129 @@ class ClawRunner:
             return False
         self._terminate(turn.process, signal.SIGINT)
         return True
+
+    def steer(
+        self,
+        chat_id: str,
+        project: dict[str, Any],
+        text: str,
+        source_message_id: Any = None,
+    ) -> dict[str, Any]:
+        with self._active_lock:
+            item = self._enqueue_control(
+                project, "steer", text, source_message_id=source_message_id
+            )
+            append_project_correction(project, text, source_message_id)
+            turn = self._active.get(chat_id)
+        interrupted = bool(turn and turn.process.poll() is None)
+        if interrupted:
+            self._terminate(turn.process, signal.SIGINT)
+        return {
+            "accepted": True,
+            "interrupted": interrupted,
+            "control_id": item["id"],
+        }
+
+    def enqueue_next(
+        self,
+        chat_id: str,
+        project: dict[str, Any],
+        text: str,
+        source_message_id: Any = None,
+    ) -> dict[str, Any]:
+        with self._active_lock:
+            item = self._enqueue_control(
+                project, "next", text, source_message_id=source_message_id
+            )
+            running = self.is_running(chat_id)
+            self._control_changed.notify_all()
+        return {"accepted": True, "running": running, "control_id": item["id"]}
+
+    def pause(self, chat_id: str, project: dict[str, Any]) -> bool:
+        with self._active_lock:
+            value = self._read_control(project)
+            value["paused"] = True
+            self._write_control(project, value)
+            turn = self._active.get(chat_id)
+        append_project_event(project, "operation_paused", chat_id=chat_id)
+        if turn and turn.process.poll() is None:
+            self._terminate(turn.process, signal.SIGINT)
+            return True
+        return False
+
+    def resume(self, chat_id: str, project: dict[str, Any]) -> dict[str, Any]:
+        with self._control_changed:
+            value = self._read_control(project)
+            was_paused = bool(value.get("paused"))
+            active_task = value.get("active_task")
+            live = self.is_running(chat_id)
+            value["paused"] = False
+            self._write_control(project, value)
+            self._control_changed.notify_all()
+        append_project_event(project, "operation_resumed", chat_id=chat_id)
+        restart_prompt = None
+        if not live and isinstance(active_task, dict):
+            persisted_prompt = str(active_task.get("prompt") or "").strip()
+            if persisted_prompt:
+                restart_prompt = (
+                    "RECOVER A DURABLE IN-FLIGHT TASK AFTER PROCESS OR SERVICE RESTART. "
+                    "Inspect the durable plan, project memory, checkpoints, event journal, "
+                    "session archive, and current files before repeating any side effect. "
+                    "Continue autonomously to verified completion. Persisted task:\n"
+                    + persisted_prompt
+                )
+        return {
+            "resumed": was_paused or live or restart_prompt is not None,
+            "live": live,
+            "restart_prompt": restart_prompt,
+        }
+
+    def cancel_control(self, project: dict[str, Any]) -> None:
+        with self._control_changed:
+            value = self._read_control(project)
+            value["paused"] = False
+            for item in value["queue"]:
+                if item.get("state") in {"pending", "running"}:
+                    item["state"] = "cancelled"
+                    item["cancelled_at"] = utc_timestamp()
+            active_task = value.get("active_task")
+            if isinstance(active_task, dict):
+                active_task["state"] = "cancelled"
+                active_task["finished_at"] = utc_timestamp()
+                value["last_task"] = active_task
+                value.pop("active_task", None)
+            self._write_control(project, value)
+            self._control_changed.notify_all()
+        append_project_event(project, "control_queue_cancelled")
+
+    def control_status(self, project: dict[str, Any]) -> dict[str, Any]:
+        with self._active_lock:
+            value = self._read_control(project)
+        queued = [
+            {
+                "id": item.get("id"),
+                "kind": item.get("kind"),
+                "state": item.get("state"),
+                "text": str(item.get("text") or "")[:PROGRESS_DETAIL_LIMIT],
+                "attempts": item.get("attempts", 0),
+            }
+            for item in value["queue"]
+            if item.get("state") in {"pending", "running"}
+        ]
+        checkpoint_root = Path(project["workspace"]) / ".claw" / "checkpoints"
+        try:
+            checkpoints = sorted(
+                (path.name for path in checkpoint_root.iterdir() if path.is_dir()),
+                reverse=True,
+            )
+        except OSError:
+            checkpoints = []
+        return {
+            "paused": bool(value.get("paused")),
+            "queue": queued,
+            "checkpoint_count": len(checkpoints),
+            "latest_checkpoint": checkpoints[0] if checkpoints else None,
+        }
 
     def is_running(self, chat_id: str) -> bool:
         with self._active_lock:
@@ -904,6 +1659,119 @@ class BridgeApplication:
             stream.write(json.dumps(record, ensure_ascii=False) + "\n")
         os.chmod(path, 0o600)
 
+    @staticmethod
+    def ensure_autonomous_plan(
+        project: dict[str, Any], text: str, operation_id: str | None
+    ) -> None:
+        path = Path(project["workspace"]) / ".claw" / "plan.json"
+        try:
+            current = json.loads(path.read_text(encoding="utf-8"))
+            todos = (
+                current
+                if isinstance(current, list)
+                else current.get("todos", [])
+                if isinstance(current, dict)
+                else []
+            )
+        except (OSError, json.JSONDecodeError):
+            todos = []
+        if not isinstance(todos, list):
+            todos = []
+        todos = [item for item in todos if isinstance(item, dict)]
+        incomplete = [item for item in todos if item.get("status") != "completed"]
+        request = (text.strip() or "Complete the operator request")[:4000]
+        idempotency_key = operation_id or f"turn-{uuid.uuid4().hex}"
+        if incomplete:
+            for item in incomplete:
+                if item.get("status") == "in_progress":
+                    item["status"] = "pending"
+            todos.insert(
+                0,
+                {
+                    "content": f"Apply latest operator request: {request}",
+                    "activeForm": "Applying latest operator request",
+                    "status": "in_progress",
+                    "idempotencyKey": idempotency_key,
+                },
+            )
+        else:
+            todos = [
+                {
+                    "content": f"Complete operator request: {request}",
+                    "activeForm": "Completing operator request",
+                    "status": "in_progress",
+                    "idempotencyKey": idempotency_key,
+                },
+                {
+                    "content": "Verify completion with tests or direct production evidence",
+                    "activeForm": "Verifying completion",
+                    "status": "pending",
+                    "idempotencyKey": f"{idempotency_key}:verify",
+                },
+            ]
+        atomic_write_json(
+            path,
+            {
+                "schema_version": 1,
+                "updated_at": utc_timestamp(),
+                "provenance": {
+                    "source": "telegram_claw_bridge",
+                    "operation_id": operation_id,
+                    "expires_at": None,
+                },
+                "todos": todos,
+            },
+        )
+        append_project_event(
+            project,
+            "autonomous_plan_initialized",
+            operation_id=operation_id,
+            todo_count=len(todos),
+        )
+
+    def active_project_required(self, chat_id: str) -> dict[str, Any]:
+        project = self.store.active_project(chat_id)
+        if project is None:
+            raise BridgeError("there is no active Claw project", HTTPStatus.CONFLICT)
+        return project
+
+    def steer(self, payload: dict[str, Any]) -> dict[str, Any]:
+        chat_id = validated_chat_id(payload.get("chat_id"))
+        project = self.active_project_required(chat_id)
+        result = self.runner.steer(
+            chat_id,
+            project,
+            str(payload.get("text") or ""),
+            payload.get("message_id"),
+        )
+        return {"ok": True, **result}
+
+    def enqueue_next(self, payload: dict[str, Any]) -> dict[str, Any]:
+        chat_id = validated_chat_id(payload.get("chat_id"))
+        project = self.active_project_required(chat_id)
+        result = self.runner.enqueue_next(
+            chat_id,
+            project,
+            str(payload.get("text") or ""),
+            payload.get("message_id"),
+        )
+        return {"ok": True, **result}
+
+    def pause(self, payload: dict[str, Any]) -> dict[str, Any]:
+        chat_id = validated_chat_id(payload.get("chat_id"))
+        project = self.active_project_required(chat_id)
+        return {"ok": True, "paused": True, "interrupted": self.runner.pause(chat_id, project)}
+
+    def resume(self, payload: dict[str, Any]) -> dict[str, Any]:
+        chat_id = validated_chat_id(payload.get("chat_id"))
+        project = self.active_project_required(chat_id)
+        return {"ok": True, **self.runner.resume(chat_id, project)}
+
+    def queue_status(self, payload: dict[str, Any]) -> dict[str, Any]:
+        chat_id = validated_chat_id(payload.get("chat_id"))
+        project = self.active_project_required(chat_id)
+        return {"ok": True, **self.runner.control_status(project)}
+
     def message(self, payload: dict[str, Any]) -> dict[str, Any]:
         chat_id = validated_chat_id(payload.get("chat_id"))
         text = str(payload.get("text") or "")
@@ -921,6 +1789,8 @@ class BridgeApplication:
             prompt = self.effective_prompt(
                 text, attachment_path, mime_type, vision_context, ocr_context
             )
+            create_project_checkpoint(project, "before operator turn")
+            self.ensure_autonomous_plan(project, text, operation_id)
             started = time.monotonic()
             result = self.runner.run_turn(chat_id, project, prompt, operation_id)
             session_id = str(result.get("session_id") or "")
@@ -1040,6 +1910,16 @@ def make_handler(application: BridgeApplication):
                 chat_id = validated_chat_id(payload.get("chat_id"))
                 if self.path == "/v1/message":
                     result = application.message(payload)
+                elif self.path == "/v1/steer":
+                    result = application.steer(payload)
+                elif self.path == "/v1/next":
+                    result = application.enqueue_next(payload)
+                elif self.path == "/v1/pause":
+                    result = application.pause(payload)
+                elif self.path == "/v1/continue":
+                    result = application.resume(payload)
+                elif self.path == "/v1/queue":
+                    result = application.queue_status(payload)
                 elif self.path == "/v1/projects/new":
                     application.runner.stop(chat_id)
                     result = {
@@ -1075,15 +1955,27 @@ def make_handler(application: BridgeApplication):
                         "project": public_project(project) if project else None,
                     }
                 elif self.path == "/v1/stop":
+                    operation_ids = validated_operation_ids(payload.get("operation_ids"))
+                    stopped = application.runner.stop(chat_id, operation_ids)
+                    project = application.store.active_project(chat_id)
+                    if project is not None:
+                        application.runner.cancel_control(project)
                     result = {
                         "ok": True,
-                        "stopped": application.runner.stop(
-                            chat_id,
-                            validated_operation_ids(payload.get("operation_ids")),
-                        ),
+                        "stopped": stopped,
                     }
                 elif self.path == "/v1/progress":
-                    result = {"ok": True, **application.runner.progress(chat_id)}
+                    project = application.store.active_project(chat_id)
+                    control = (
+                        application.runner.control_status(project)
+                        if project is not None
+                        else {"paused": False, "queue": []}
+                    )
+                    result = {
+                        "ok": True,
+                        **application.runner.progress(chat_id),
+                        **control,
+                    }
                 elif self.path == "/v1/status":
                     project = application.store.active_project(chat_id)
                     progress = application.runner.progress(chat_id)
@@ -1101,6 +1993,9 @@ def make_handler(application: BridgeApplication):
                         ),
                         "tools_unrestricted": application.config.allowed_tools is None,
                         "gemma_max_output_tokens": application.config.gemma_max_output_tokens,
+                        "autonomous_plan": True,
+                        "durable_memory": True,
+                        "live_steering": True,
                     }
                 else:
                     raise BridgeError("not found", HTTPStatus.NOT_FOUND)
