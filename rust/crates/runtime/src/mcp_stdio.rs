@@ -381,8 +381,10 @@ impl McpServerManagerError {
     }
 
     fn recoverable(&self) -> bool {
-        !matches!(self.lifecycle_phase(), McpLifecyclePhase::InitializeHandshake)
-            && matches!(self, Self::Transport { .. } | Self::Timeout { .. })
+        !matches!(
+            self.lifecycle_phase(),
+            McpLifecyclePhase::InitializeHandshake
+        ) && matches!(self, Self::Transport { .. } | Self::Timeout { .. })
     }
 
     fn discovery_failure(&self, server_name: &str) -> McpDiscoveryFailure {
@@ -438,10 +440,9 @@ impl McpServerManagerError {
                 ("method".to_string(), (*method).to_string()),
                 ("timeout_ms".to_string(), timeout_ms.to_string()),
             ]),
-            Self::UnknownTool { qualified_name } => BTreeMap::from([(
-                "qualified_tool".to_string(),
-                qualified_name.clone(),
-            )]),
+            Self::UnknownTool { qualified_name } => {
+                BTreeMap::from([("qualified_tool".to_string(), qualified_name.clone())])
+            }
             Self::UnknownServer { server_name } => {
                 BTreeMap::from([("server".to_string(), server_name.clone())])
             }
@@ -2738,7 +2739,10 @@ mod tests {
             );
             assert!(!report.failed_servers[0].recoverable);
             assert_eq!(
-                report.failed_servers[0].context.get("method").map(String::as_str),
+                report.failed_servers[0]
+                    .context
+                    .get("method")
+                    .map(String::as_str),
                 Some("initialize")
             );
             assert!(report.failed_servers[0].error.contains("initialize"));
