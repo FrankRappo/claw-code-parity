@@ -18,6 +18,7 @@ use crate::ConfigLoader;
 
 const MAX_CAPTURED_STREAM_BYTES: usize = 256 * 1024;
 const OUTPUT_READ_BUFFER_BYTES: usize = 16 * 1024;
+const DEFAULT_TIMEOUT_ENV: &str = "CLAW_BASH_DEFAULT_TIMEOUT_MS";
 
 /// Input schema for the built-in bash execution tool.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -113,8 +114,10 @@ async fn execute_bash_async(
     cwd: std::path::PathBuf,
 ) -> io::Result<BashCommandOutput> {
     let mut command = prepare_tokio_command(&input.command, &cwd, &sandbox_status, true);
+    let timeout_ms =
+        effective_timeout_ms(input.timeout, env::var(DEFAULT_TIMEOUT_ENV).ok().as_deref());
 
-    let output_result = if let Some(timeout_ms) = input.timeout {
+    let output_result = if let Some(timeout_ms) = timeout_ms {
         match Box::pin(timeout(
             Duration::from_millis(timeout_ms),
             collect_bounded_output(&mut command),
@@ -177,6 +180,14 @@ async fn execute_bash_async(
     })
 }
 
+fn effective_timeout_ms(explicit: Option<u64>, configured_default: Option<&str>) -> Option<u64> {
+    explicit.or_else(|| {
+        configured_default
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|value| *value > 0)
+    })
+}
+
 struct BoundedCommandOutput {
     status: ExitStatus,
     stdout: CapturedStream,
@@ -193,7 +204,10 @@ async fn collect_bounded_output(command: &mut TokioCommand) -> io::Result<Bounde
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
     let mut child = command.spawn()?;
+    let mut process_group = ProcessGroupGuard::new(child.id());
     let stdout = child
         .stdout
         .take()
@@ -205,11 +219,40 @@ async fn collect_bounded_output(command: &mut TokioCommand) -> io::Result<Bounde
 
     let (status, stdout, stderr) =
         tokio::join!(child.wait(), drain_bounded(stdout), drain_bounded(stderr));
+    process_group.disarm();
     Ok(BoundedCommandOutput {
         status: status?,
         stdout: stdout?,
         stderr: stderr?,
     })
+}
+
+struct ProcessGroupGuard {
+    pid: Option<u32>,
+}
+
+impl ProcessGroupGuard {
+    const fn new(pid: Option<u32>) -> Self {
+        Self { pid }
+    }
+
+    fn disarm(&mut self) {
+        self.pid = None;
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        let Some(pid) = self.pid else {
+            return;
+        };
+        #[cfg(unix)]
+        {
+            let _ = Command::new("kill")
+                .args(["-KILL", "--", &format!("-{pid}")])
+                .status();
+        }
+    }
 }
 
 async fn drain_bounded<R>(mut reader: R) -> io::Result<CapturedStream>
@@ -323,8 +366,9 @@ fn prepare_sandbox_dirs(cwd: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::{execute_bash, BashCommandInput};
+    use super::{effective_timeout_ms, execute_bash, BashCommandInput};
     use crate::sandbox::FilesystemIsolationMode;
+    use std::time::Duration;
 
     #[test]
     fn executes_simple_command() {
@@ -362,6 +406,67 @@ mod tests {
         .expect("bash command should execute");
 
         assert!(!output.sandbox_status.expect("sandbox status").enabled);
+    }
+
+    #[test]
+    fn configured_default_timeout_is_opt_in_and_explicit_timeout_wins() {
+        assert_eq!(effective_timeout_ms(None, None), None);
+        assert_eq!(effective_timeout_ms(None, Some("")), None);
+        assert_eq!(effective_timeout_ms(None, Some("0")), None);
+        assert_eq!(effective_timeout_ms(None, Some("invalid")), None);
+        assert_eq!(effective_timeout_ms(None, Some("900000")), Some(900_000));
+        assert_eq!(
+            effective_timeout_ms(Some(1_234), Some("900000")),
+            Some(1_234)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn timeout_terminates_the_entire_shell_process_group() {
+        let pid_file = std::env::temp_dir().join(format!(
+            "claw-bash-timeout-child-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let command = format!(
+            "sleep 30 & child=$!; printf '%s' \"$child\" > {}; wait \"$child\"",
+            pid_file.display()
+        );
+        let output = execute_bash(BashCommandInput {
+            command,
+            timeout: Some(100),
+            description: None,
+            run_in_background: Some(false),
+            dangerously_disable_sandbox: Some(true),
+            namespace_restrictions: None,
+            isolate_network: None,
+            filesystem_mode: None,
+            allowed_mounts: None,
+        })
+        .expect("timed command should return a structured result");
+
+        assert!(output.interrupted);
+        assert_eq!(
+            output.return_code_interpretation.as_deref(),
+            Some("timeout")
+        );
+        let child_pid = std::fs::read_to_string(&pid_file)
+            .expect("child pid should be recorded")
+            .trim()
+            .parse::<u32>()
+            .expect("child pid should be numeric");
+        for _ in 0..50 {
+            if !std::path::Path::new(&format!("/proc/{child_pid}")).exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !std::path::Path::new(&format!("/proc/{child_pid}")).exists(),
+            "timed-out shell descendant {child_pid} survived"
+        );
+        let _ = std::fs::remove_file(pid_file);
     }
 }
 

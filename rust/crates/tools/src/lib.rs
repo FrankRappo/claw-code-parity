@@ -386,7 +386,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "bash",
-            description: "Execute a shell command in the current workspace.",
+            description: "Execute a shell command in the current workspace. The optional timeout is in milliseconds. Use an explicit finite timeout for remote, interactive, or otherwise potentially blocking commands; an operator may also configure an opt-in deployment default. Start intentional persistent tunnels, sockets, servers, or watchers as managed background work instead of an unlimited foreground command.",
             input_schema: json!({
                 "type": "object",
                 "properties": {

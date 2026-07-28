@@ -57,6 +57,20 @@ running process group. A future approval-button mode would require a separate
 asynchronous stdin/permission protocol and is not mixed with the current
 `danger-full-access` deployment.
 
+The dedicated bridge sets `CLAW_BASH_DEFAULT_TIMEOUT_MS=900000` as an opt-in
+15-minute ceiling for foreground Bash calls that omit their own timeout.
+Explicit finite tool timeouts override that default, so known long builds can
+request a larger bound or run as managed background work. On timeout, Claw
+terminates the complete shell process group, returns a structured timeout tool
+result, and lets the durable recovery loop choose a different path; it does not
+restart the bridge, Telegram bot, or Gemma service. Other Claw installations
+remain unlimited unless they set the same environment variable.
+Intentional persistent SSH tunnels, SOCKS proxies, servers, and watchers must
+use `run_in_background=true` or a managed systemd/tmux process with a recorded
+PID and health check. Background Bash work is not subject to the foreground
+default, and the existing model/reverse-forward systemd services are outside
+the Claw tool process group.
+
 Control commands use a separate Telegram worker pool, so `/progress`, `/status`,
 `/queue`, `/pause`, `/continue`, and `/stop` remain responsive while a long turn
 occupies the normal request pool. Live steering is process-boundary safe rather
