@@ -123,6 +123,11 @@ CLAW_VISION_SYSTEM_PROMPT = (
 )
 MODE_GEMMA = "gemma"
 MODE_CLAW = "claw"
+NEW_CLAW_NAME_PROMPT = (
+    "Введите название новой Claw-сессии и ответьте на это сообщение.\n"
+    "Имя необязательно: отправьте «-» или /newclaw, чтобы создать сессию "
+    "с автоматическим названием. /cancel отменяет создание."
+)
 CONTROL_TEXTS = {
     "/stop",
     "/status",
@@ -315,13 +320,15 @@ def split_telegram_text(text, limit=3900):
     return chunks
 
 
-def send_message(chat_id, text, reply_to=None, keyboard=True):
+def send_message(chat_id, text, reply_to=None, keyboard=True, reply_markup=None):
     chunks = split_telegram_text(text)
     for index, part in enumerate(chunks):
         payload = {"chat_id": chat_id, "text": part, "disable_web_page_preview": True}
         if reply_to and index == 0:
             payload["reply_parameters"] = {"message_id": reply_to}
-        if keyboard and index == len(chunks) - 1:
+        if reply_markup is not None and index == len(chunks) - 1:
+            payload["reply_markup"] = reply_markup
+        elif keyboard and index == len(chunks) - 1:
             payload["reply_markup"] = main_keyboard()
         tg("sendMessage", payload, timeout=60)
 
@@ -343,6 +350,25 @@ def allowed_user(user):
     if not ALLOWED and not ALLOWED_USERNAMES:
         return True
     return user_id in ALLOWED or bool(username and username in ALLOWED_USERNAMES)
+
+
+def is_new_claw_name_reply(message):
+    replied = message.get("reply_to_message") or {}
+    replied_from = replied.get("from") or {}
+    replied_text = str(replied.get("text") or "")
+    return bool(
+        replied_from.get("is_bot")
+        and replied_text.startswith("Введите название новой Claw-сессии")
+    )
+
+
+def requested_claw_name(text):
+    value = str(text or "").strip()
+    if value in {"-", "/newclaw"}:
+        return ""
+    if value.startswith("/newclaw "):
+        return value.partition(" ")[2].strip()
+    return value
 
 
 def commands_text():
@@ -1217,6 +1243,32 @@ def handle_message(message):
             reply_to=message_id,
         )
         return
+    if is_new_claw_name_reply(message):
+        if text.lower() == "/cancel":
+            send_message(
+                chat_id,
+                "Создание новой Claw-сессии отменено. Текущий проект не изменён.",
+                reply_to=message_id,
+            )
+            return
+        name = requested_claw_name(text)
+        try:
+            response = claw_request(
+                "/v1/projects/new",
+                {"chat_id": chat_id, "name": name},
+                timeout=30,
+            )
+            set_chat_mode(chat_id, MODE_CLAW)
+            project = response["project"]
+            send_message(
+                chat_id,
+                f"Создана новая Claw-сессия: {project['name']} [{project['id']}].\n"
+                "Следующее сообщение станет её первым заданием.",
+                reply_to=message_id,
+            )
+        except ClawBridgeError as error:
+            send_message(chat_id, f"Не удалось создать сессию: {error}", reply_to=message_id)
+        return
     if text == "/" or text.startswith("/start") or text.startswith("/help"):
         send_message(
             chat_id,
@@ -1259,8 +1311,21 @@ def handle_message(message):
         except ClawBridgeError as error:
             send_message(chat_id, f"Claw недоступен: {error}", reply_to=message_id)
         return
-    if text == "🆕 Новый проект" or text.startswith("/newclaw"):
-        name = text.partition(" ")[2].strip() if text.startswith("/newclaw") else ""
+    if text == "🆕 Новый проект":
+        send_message(
+            chat_id,
+            NEW_CLAW_NAME_PROMPT,
+            reply_to=message_id,
+            keyboard=False,
+            reply_markup={
+                "force_reply": True,
+                "selective": True,
+                "input_field_placeholder": "Название Claw-сессии",
+            },
+        )
+        return
+    if text.startswith("/newclaw"):
+        name = requested_claw_name(text)
         try:
             response = claw_request(
                 "/v1/projects/new",
@@ -1271,8 +1336,8 @@ def handle_message(message):
             project = response["project"]
             send_message(
                 chat_id,
-                f"Создан новый проект: {project['name']} [{project['id']}].\n"
-                "Следующее сообщение станет первым заданием новой Claw-сессии.",
+                f"Создана новая Claw-сессия: {project['name']} [{project['id']}].\n"
+                "Следующее сообщение станет её первым заданием.",
                 reply_to=message_id,
             )
         except ClawBridgeError as error:
@@ -1619,7 +1684,7 @@ def handle_message(message):
 
 def is_control_message(message):
     text = (message.get("text") or message.get("caption") or "").strip()
-    return text in CONTROL_TEXTS or any(
+    return is_new_claw_name_reply(message) or text in CONTROL_TEXTS or any(
         text.startswith(prefix)
         for prefix in (
             "/stop ",

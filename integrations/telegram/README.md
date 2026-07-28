@@ -5,7 +5,10 @@ deployment without adding a separate OCR menu.
 
 ## User model
 
-- **New project** creates a new workspace and a fresh Claw session.
+- **New project** opens Telegram's reply field for an optional manual session
+  name, then creates a new workspace and a fresh Claw session. Reply with `-`
+  or use `/newclaw` without an argument for an automatic name; ignoring or
+  cancelling the prompt leaves the current project usable and is not a blocker.
 - Messages continue the active project's saved session.
 - **Stop** interrupts only the running operation; completed context remains.
 - **Progress** (`/progress` or **📊 Ход работы**) reports the current model/tool

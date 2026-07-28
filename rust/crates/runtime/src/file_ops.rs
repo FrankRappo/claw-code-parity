@@ -181,7 +181,9 @@ pub fn read_file(
 
     // Check file size before reading
     let metadata = fs::metadata(&absolute_path)?;
-    if !unrestricted_deployment_enabled() && metadata.len() > MAX_READ_SIZE {
+    // Deployment permissions may remove workspace restrictions, but they must
+    // never disable the process-memory safety bound for a single file read.
+    if metadata.len() > MAX_READ_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -645,7 +647,7 @@ mod tests {
 
     use super::{
         edit_file, glob_search, grep_search, is_symlink_escape, read_file, read_file_in_workspace,
-        write_file, GrepSearchInput, MAX_WRITE_SIZE,
+        write_file, GrepSearchInput, MAX_READ_SIZE, MAX_WRITE_SIZE,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -687,6 +689,22 @@ mod tests {
         let error = result.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("binary"));
+    }
+
+    #[test]
+    fn rejects_oversized_reads_even_in_unrestricted_deployments() {
+        let path = temp_path("oversize-read.txt");
+        let file = std::fs::File::create(&path).expect("oversized fixture should create");
+        file.set_len(MAX_READ_SIZE + 1)
+            .expect("oversized fixture should resize");
+
+        let result = read_file(path.to_string_lossy().as_ref(), None, None);
+
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("too large"));
+        std::fs::remove_file(path).expect("fixture should be removable");
     }
 
     #[test]

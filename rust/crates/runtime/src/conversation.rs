@@ -20,6 +20,8 @@ use crate::usage::{TokenUsage, UsageTracker};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
+const AUTO_COMPACTION_TARGET_NUMERATOR: usize = 3;
+const AUTO_COMPACTION_TARGET_DENOMINATOR: usize = 5;
 const AUTONOMOUS_PLAN_ENV_VAR: &str = "CLAW_AUTONOMOUS_PLAN";
 const AUTONOMOUS_PLAN_MAX_STALLS: usize = 4;
 
@@ -331,7 +333,7 @@ where
         // Compact before the request as well as after it. The previous
         // post-turn-only behavior could submit an oversized request when the
         // provider context was smaller than the default compaction threshold.
-        let pre_turn_auto_compaction = self.maybe_auto_compact_before_turn(&user_input)?;
+        let mut auto_compaction = self.maybe_auto_compact_before_turn(&user_input)?;
         self.session
             .push_user_text(user_input)
             .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -349,6 +351,13 @@ where
                 );
                 self.record_turn_failed(iterations, &error);
                 return Err(error);
+            }
+
+            // Tool results are appended inside this loop. A single large tool
+            // output can therefore overflow the provider context before the
+            // normal post-turn compaction gets a chance to run.
+            if let Some(event) = self.maybe_auto_compact_before_request()? {
+                merge_auto_compaction_event(&mut auto_compaction, event);
             }
 
             let request = ApiRequest {
@@ -508,11 +517,9 @@ where
             }
         }
 
-        let auto_compaction = if pre_turn_auto_compaction.is_some() {
-            pre_turn_auto_compaction
-        } else {
-            self.maybe_auto_compact()?
-        };
+        if auto_compaction.is_none() {
+            auto_compaction = self.maybe_auto_compact()?;
+        }
 
         let summary = TurnSummary {
             assistant_messages,
@@ -572,12 +579,31 @@ where
             return Ok(None);
         }
 
+        self.compact_for_auto_threshold()
+    }
+
+    fn maybe_auto_compact_before_request(
+        &mut self,
+    ) -> Result<Option<AutoCompactionEvent>, RuntimeError> {
+        // Pre-turn compaction already handles user requests. Restrict this
+        // additional guard to the growth introduced by completed tool calls
+        // so a just-submitted user instruction is never compacted away.
+        if !matches!(
+            self.session.messages.last(),
+            Some(message) if message.role == crate::session::MessageRole::Tool
+        ) || estimate_session_tokens(&self.session)
+            < self.auto_compaction_input_tokens_threshold as usize
+        {
+            return Ok(None);
+        }
+
+        self.compact_for_auto_threshold()
+    }
+
+    fn compact_for_auto_threshold(&mut self) -> Result<Option<AutoCompactionEvent>, RuntimeError> {
         let result = compact_session_durable(
             &self.session,
-            CompactionConfig {
-                max_estimated_tokens: 0,
-                ..CompactionConfig::default()
-            },
+            auto_compaction_config(&self.session, self.auto_compaction_input_tokens_threshold),
         )
         .map_err(|error| RuntimeError::new(format!("durable compaction failed: {error}")))?;
 
@@ -607,21 +633,7 @@ where
             return Ok(None);
         }
 
-        let result = compact_session_durable(
-            &self.session,
-            CompactionConfig {
-                max_estimated_tokens: 0,
-                ..CompactionConfig::default()
-            },
-        )
-        .map_err(|error| RuntimeError::new(format!("durable compaction failed: {error}")))?;
-        if result.removed_message_count == 0 {
-            return Ok(None);
-        }
-        self.session = result.compacted_session;
-        Ok(Some(AutoCompactionEvent {
-            removed_message_count: result.removed_message_count,
-        }))
+        self.compact_for_auto_threshold()
     }
 
     fn completion_gate_instruction(&mut self) -> Result<Option<String>, RuntimeError> {
@@ -818,6 +830,41 @@ where
     }
 }
 
+fn merge_auto_compaction_event(
+    aggregate: &mut Option<AutoCompactionEvent>,
+    event: AutoCompactionEvent,
+) {
+    if let Some(current) = aggregate {
+        current.removed_message_count = current
+            .removed_message_count
+            .saturating_add(event.removed_message_count);
+    } else {
+        *aggregate = Some(event);
+    }
+}
+
+fn auto_compaction_config(session: &Session, threshold: u32) -> CompactionConfig {
+    let default = CompactionConfig::default();
+    let target = (threshold as usize).saturating_mul(AUTO_COMPACTION_TARGET_NUMERATOR)
+        / AUTO_COMPACTION_TARGET_DENOMINATOR;
+
+    for preserve_recent_messages in (0..=default.preserve_recent_messages).rev() {
+        let config = CompactionConfig {
+            preserve_recent_messages,
+            max_estimated_tokens: 0,
+        };
+        let candidate = compact_session(session, config);
+        if estimate_session_tokens(&candidate.compacted_session) <= target.max(1) {
+            return config;
+        }
+    }
+
+    CompactionConfig {
+        preserve_recent_messages: 0,
+        max_estimated_tokens: 0,
+    }
+}
+
 /// Reads the automatic compaction threshold from the environment.
 #[must_use]
 pub fn auto_compaction_threshold_from_env() -> u32 {
@@ -964,11 +1011,12 @@ impl ToolExecutor for StaticToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
-        AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
-        StaticToolExecutor, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        auto_compaction_config, build_assistant_message, parse_auto_compaction_threshold,
+        ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent, ConversationRuntime,
+        PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolExecutor,
+        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
-    use crate::compact::CompactionConfig;
+    use crate::compact::{compact_session, estimate_session_tokens, CompactionConfig};
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
     use crate::permissions::{
         PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
@@ -1799,7 +1847,90 @@ mod tests {
         assert_eq!(
             summary.auto_compaction,
             Some(AutoCompactionEvent {
-                removed_message_count: 2,
+                removed_message_count: 6,
+            })
+        );
+    }
+
+    #[test]
+    fn auto_compaction_reduces_an_oversized_recent_tail_to_the_safe_target() {
+        let mut session = Session::new();
+        session.messages = (0..4)
+            .map(|index| {
+                crate::session::ConversationMessage::tool_result(
+                    format!("tool-{index}"),
+                    "Bash",
+                    "x".repeat(100_000),
+                    false,
+                )
+            })
+            .collect();
+
+        let config = auto_compaction_config(&session, 100_000);
+        let compacted = compact_session(&session, config);
+
+        assert!(config.preserve_recent_messages < 4);
+        assert!(compacted.removed_message_count > 0);
+        assert!(
+            estimate_session_tokens(&compacted.compacted_session) <= 60_000,
+            "adaptive compaction must leave room for system prompts and tool schemas"
+        );
+    }
+
+    #[test]
+    fn compacts_large_tool_output_before_the_next_model_request() {
+        struct InspectMidTurnApi {
+            calls: usize,
+        }
+
+        impl ApiClient for InspectMidTurnApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                match self.calls {
+                    1 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-large".to_string(),
+                            name: "large_output".to_string(),
+                            input: String::new(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    2 => {
+                        let mut request_session = Session::new();
+                        request_session.messages = request.messages;
+                        assert!(
+                            estimate_session_tokens(&request_session) <= 600,
+                            "large tool output must be compacted before the next API call"
+                        );
+                        assert_eq!(request_session.messages[0].role, MessageRole::System);
+                        Ok(vec![
+                            AssistantEvent::TextDelta("done".to_string()),
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    _ => unreachable!("extra API call"),
+                }
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            InspectMidTurnApi { calls: 0 },
+            StaticToolExecutor::new().register("large_output", |_input| Ok("x".repeat(100_000))),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(1_000);
+
+        let summary = runtime
+            .run_turn("produce a large tool result", None)
+            .expect("tool loop should compact and continue");
+
+        assert_eq!(summary.iterations, 2);
+        assert_eq!(
+            summary.auto_compaction,
+            Some(AutoCompactionEvent {
+                removed_message_count: 3,
             })
         );
     }

@@ -1,9 +1,11 @@
 use std::env;
+use std::fmt::Write as _;
 use std::io;
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command as TokioCommand;
 use tokio::runtime::Builder;
 use tokio::time::timeout;
@@ -13,6 +15,9 @@ use crate::sandbox::{
     SandboxConfig, SandboxStatus,
 };
 use crate::ConfigLoader;
+
+const MAX_CAPTURED_STREAM_BYTES: usize = 256 * 1024;
+const OUTPUT_READ_BUFFER_BYTES: usize = 16 * 1024;
 
 /// Input schema for the built-in bash execution tool.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -110,7 +115,12 @@ async fn execute_bash_async(
     let mut command = prepare_tokio_command(&input.command, &cwd, &sandbox_status, true);
 
     let output_result = if let Some(timeout_ms) = input.timeout {
-        match timeout(Duration::from_millis(timeout_ms), command.output()).await {
+        match Box::pin(timeout(
+            Duration::from_millis(timeout_ms),
+            collect_bounded_output(&mut command),
+        ))
+        .await
+        {
             Ok(result) => (result?, false),
             Err(_) => {
                 return Ok(BashCommandOutput {
@@ -133,12 +143,12 @@ async fn execute_bash_async(
             }
         }
     } else {
-        (command.output().await?, false)
+        (Box::pin(collect_bounded_output(&mut command)).await?, false)
     };
 
     let (output, interrupted) = output_result;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let stdout = render_captured_stream(&output.stdout, "stdout");
+    let stderr = render_captured_stream(&output.stderr, "stderr");
     let no_output_expected = Some(stdout.trim().is_empty() && stderr.trim().is_empty());
     let return_code_interpretation = output.status.code().and_then(|code| {
         if code == 0 {
@@ -165,6 +175,76 @@ async fn execute_bash_async(
         persisted_output_size: None,
         sandbox_status: Some(sandbox_status),
     })
+}
+
+struct BoundedCommandOutput {
+    status: ExitStatus,
+    stdout: CapturedStream,
+    stderr: CapturedStream,
+}
+
+struct CapturedStream {
+    bytes: Vec<u8>,
+    total_bytes: u64,
+}
+
+async fn collect_bounded_output(command: &mut TokioCommand) -> io::Result<BoundedCommandOutput> {
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("bash stdout pipe was not created"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("bash stderr pipe was not created"))?;
+
+    let (status, stdout, stderr) =
+        tokio::join!(child.wait(), drain_bounded(stdout), drain_bounded(stderr));
+    Ok(BoundedCommandOutput {
+        status: status?,
+        stdout: stdout?,
+        stderr: stderr?,
+    })
+}
+
+async fn drain_bounded<R>(mut reader: R) -> io::Result<CapturedStream>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = Vec::with_capacity(MAX_CAPTURED_STREAM_BYTES);
+    let mut total_bytes = 0_u64;
+    let mut buffer = [0_u8; OUTPUT_READ_BUFFER_BYTES];
+
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        total_bytes = total_bytes.saturating_add(read as u64);
+        let remaining = MAX_CAPTURED_STREAM_BYTES.saturating_sub(bytes.len());
+        bytes.extend_from_slice(&buffer[..read.min(remaining)]);
+    }
+
+    Ok(CapturedStream { bytes, total_bytes })
+}
+
+fn render_captured_stream(output: &CapturedStream, stream_name: &str) -> String {
+    let mut rendered = String::from_utf8_lossy(&output.bytes).into_owned();
+    if output.total_bytes > output.bytes.len() as u64 {
+        let _ = write!(
+            rendered,
+            "\n\n[Claw truncated {stream_name}: captured the first {} of {} bytes. \
+             Redirect large output to a file and inspect it with bounded filters or line ranges.]",
+            output.bytes.len(),
+            output.total_bytes
+        );
+    }
+    rendered
 }
 
 fn sandbox_status_for_input(input: &BashCommandInput, cwd: &std::path::Path) -> SandboxStatus {
@@ -306,5 +386,27 @@ mod output_preservation_tests {
         .expect("large command output should execute");
 
         assert_eq!(output.stdout, expected);
+    }
+
+    #[test]
+    fn oversized_command_output_is_bounded_without_blocking_the_child() {
+        let emitted_bytes = MAX_CAPTURED_STREAM_BYTES * 3;
+        let output = execute_bash(BashCommandInput {
+            command: format!("python3 -c 'print(\"x\" * {emitted_bytes}, end=\"\")'"),
+            timeout: Some(5_000),
+            description: None,
+            run_in_background: Some(false),
+            dangerously_disable_sandbox: Some(true),
+            namespace_restrictions: None,
+            isolate_network: None,
+            filesystem_mode: None,
+            allowed_mounts: None,
+        })
+        .expect("oversized command output should be drained safely");
+
+        assert!(output.stdout.starts_with(&"x".repeat(1_024)));
+        assert!(output.stdout.contains("Claw truncated stdout"));
+        assert!(output.stdout.contains(&emitted_bytes.to_string()));
+        assert!(output.stdout.len() < MAX_CAPTURED_STREAM_BYTES + 512);
     }
 }

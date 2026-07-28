@@ -90,6 +90,7 @@ pub struct DurableCompactionCheckpoint {
     pub archive_path: PathBuf,
     pub checkpoint_path: PathBuf,
     pub recovery_context: String,
+    pub compaction_count: u32,
 }
 
 impl PartialEq for Session {
@@ -185,14 +186,14 @@ impl Session {
         let Some(session_path) = self.persistence_path() else {
             return Ok(None);
         };
-        let next_count = self.compaction.as_ref().map_or(1, |value| value.count + 1);
+        let preferred_count = self.compaction.as_ref().map_or(1, |value| value.count + 1);
         let memory_dir = durable_memory_dir(session_path, &self.session_id);
         let archive_dir = memory_dir.join("archive");
         fs::create_dir_all(&archive_dir)?;
 
-        let archive_path = archive_dir.join(format!("compaction-{next_count:06}.jsonl"));
         let archive_snapshot = self.render_jsonl_snapshot()?;
-        write_immutable(&archive_path, &archive_snapshot)?;
+        let (archive_path, next_count) =
+            write_immutable_archive(&archive_dir, preferred_count, &archive_snapshot)?;
         let mut archive_chain = fs::read_dir(&archive_dir)?
             .filter_map(Result::ok)
             .map(|entry| entry.path())
@@ -262,6 +263,7 @@ impl Session {
             archive_path,
             checkpoint_path,
             recovery_context,
+            compaction_count: next_count,
         }))
     }
 
@@ -962,27 +964,34 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), SessionError> {
     Ok(())
 }
 
-fn write_immutable(path: &Path, contents: &str) -> Result<(), SessionError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut file = match OpenOptions::new().write(true).create_new(true).open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let existing = fs::read_to_string(path)?;
-            if existing == contents {
-                return Ok(());
+fn write_immutable_archive(
+    archive_dir: &Path,
+    preferred_count: u32,
+    contents: &str,
+) -> Result<(PathBuf, u32), SessionError> {
+    let mut count = preferred_count;
+    loop {
+        let path = archive_dir.join(format!("compaction-{count:06}.jsonl"));
+        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let existing = fs::read_to_string(&path)?;
+                if existing == contents {
+                    return Ok((path, count));
+                }
+                count = count.checked_add(1).ok_or_else(|| {
+                    SessionError::Format(
+                        "durable compaction archive sequence is exhausted".to_string(),
+                    )
+                })?;
+                continue;
             }
-            return Err(SessionError::Format(format!(
-                "immutable archive already exists with different content: {}",
-                path.display()
-            )));
-        }
-        Err(error) => return Err(error.into()),
-    };
-    file.write_all(contents.as_bytes())?;
-    file.sync_all()?;
-    Ok(())
+            Err(error) => return Err(error.into()),
+        };
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        return Ok((path, count));
+    }
 }
 
 fn append_jsonl_event(path: &Path, value: &serde_json::Value) -> Result<(), SessionError> {
@@ -1263,6 +1272,50 @@ mod tests {
             "immutable archive must never be overwritten"
         );
         let memory_dir = checkpoint
+            .archive_path
+            .parent()
+            .and_then(Path::parent)
+            .expect("memory directory");
+        fs::remove_dir_all(memory_dir).expect("memory directory should be removable");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn allocates_a_new_archive_when_retry_content_changed() {
+        let path = temp_session_path("durable-compaction-retry");
+        let mut session = Session::new().with_persistence_path(path.clone());
+        session
+            .push_user_text("original work")
+            .expect("message should persist");
+        let first = session
+            .persist_compaction_checkpoint("first attempt", 1)
+            .expect("first checkpoint should persist")
+            .expect("persisted session should have durable paths");
+        let immutable_first =
+            fs::read_to_string(&first.archive_path).expect("first archive should read");
+
+        session
+            .push_user_text("recovery instruction added after a failed turn")
+            .expect("recovery message should persist");
+        let retry = session
+            .persist_compaction_checkpoint("retry", 2)
+            .expect("changed retry should allocate another archive")
+            .expect("retry should have durable paths");
+
+        assert_eq!(first.compaction_count, 1);
+        assert_eq!(retry.compaction_count, 2);
+        assert_ne!(retry.archive_path, first.archive_path);
+        assert!(retry.archive_path.ends_with("compaction-000002.jsonl"));
+        assert_eq!(
+            fs::read_to_string(&first.archive_path).expect("first archive should remain readable"),
+            immutable_first,
+            "the conflicting immutable archive must remain unchanged"
+        );
+        assert!(fs::read_to_string(&retry.archive_path)
+            .expect("retry archive should read")
+            .contains("recovery instruction added after a failed turn"));
+
+        let memory_dir = first
             .archive_path
             .parent()
             .and_then(Path::parent)

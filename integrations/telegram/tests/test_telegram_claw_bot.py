@@ -470,6 +470,78 @@ class ClawModeTests(unittest.TestCase):
         )
         self.assertEqual(bot.chat_mode(10), bot.MODE_CLAW)
 
+    def test_new_project_button_opens_optional_force_reply_name_prompt(self):
+        message = {
+            "chat": {"id": 10},
+            "from": {"id": 20},
+            "message_id": 30,
+            "text": "🆕 Новый проект",
+        }
+        with mock.patch.object(bot, "ALLOWED", set()), mock.patch.object(
+            bot, "ALLOWED_USERNAMES", set()
+        ), mock.patch.object(bot, "claw_request") as request, mock.patch.object(
+            bot, "send_message"
+        ) as send:
+            bot.handle_message(message)
+
+        request.assert_not_called()
+        self.assertIn("название новой Claw-сессии", send.call_args.args[1])
+        self.assertFalse(send.call_args.kwargs["keyboard"])
+        self.assertTrue(send.call_args.kwargs["reply_markup"]["force_reply"])
+
+    def test_reply_to_name_prompt_creates_named_session(self):
+        message = {
+            "chat": {"id": 10},
+            "from": {"id": 20},
+            "message_id": 31,
+            "text": "Аудит инфраструктуры",
+            "reply_to_message": {
+                "text": bot.NEW_CLAW_NAME_PROMPT,
+                "from": {"id": 999, "is_bot": True},
+            },
+        }
+        response = {
+            "project": {"id": "abc123", "name": "Аудит инфраструктуры"},
+            "ok": True,
+        }
+        with mock.patch.object(bot, "ALLOWED", set()), mock.patch.object(
+            bot, "ALLOWED_USERNAMES", set()
+        ), mock.patch.object(
+            bot, "claw_request", return_value=response
+        ) as request, mock.patch.object(
+            bot, "_persist_chat_modes"
+        ), mock.patch.object(bot, "send_message"):
+            bot.handle_message(message)
+
+        request.assert_called_once_with(
+            "/v1/projects/new",
+            {"chat_id": 10, "name": "Аудит инфраструктуры"},
+            timeout=30,
+        )
+        self.assertEqual(bot.chat_mode(10), bot.MODE_CLAW)
+        self.assertTrue(bot.is_control_message(message))
+
+    def test_name_prompt_can_be_cancelled_without_changing_project(self):
+        message = {
+            "chat": {"id": 10},
+            "from": {"id": 20},
+            "message_id": 31,
+            "text": "/cancel",
+            "reply_to_message": {
+                "text": bot.NEW_CLAW_NAME_PROMPT,
+                "from": {"id": 999, "is_bot": True},
+            },
+        }
+        with mock.patch.object(bot, "ALLOWED", set()), mock.patch.object(
+            bot, "ALLOWED_USERNAMES", set()
+        ), mock.patch.object(bot, "claw_request") as request, mock.patch.object(
+            bot, "send_message"
+        ) as send:
+            bot.handle_message(message)
+
+        request.assert_not_called()
+        self.assertIn("отменено", send.call_args.args[1])
+
     def test_claw_image_is_forwarded_without_separate_ocr_command(self):
         bot.CHAT_MODES[1] = bot.MODE_CLAW
         message = {

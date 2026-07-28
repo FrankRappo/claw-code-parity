@@ -174,9 +174,13 @@ pub fn compact_session_durable(
     }
     if let Some(compaction) = result.compacted_session.compaction.as_mut() {
         compaction.summary.clone_from(&augmented_summary);
+        compaction.count = checkpoint.compaction_count;
     }
     result.summary = augmented_summary;
     result.formatted_summary = format_compact_summary(&result.summary);
+    if let Some(session_path) = result.compacted_session.persistence_path() {
+        result.compacted_session.save_to_path(session_path)?;
+    }
     Ok(result)
 }
 
@@ -552,10 +556,12 @@ fn extract_summary_timeline(summary: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_key_files, compact_session, estimate_session_tokens, format_compact_summary,
-        get_compact_continuation_message, infer_pending_work, should_compact, CompactionConfig,
+        collect_key_files, compact_session, compact_session_durable, estimate_session_tokens,
+        format_compact_summary, get_compact_continuation_message, infer_pending_work,
+        should_compact, CompactionConfig,
     };
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
+    use std::fs;
 
     #[test]
     fn formats_compact_summary_like_upstream() {
@@ -677,6 +683,57 @@ mod tests {
             &second.compacted_session.messages[1].blocks[0],
             ContentBlock::Text { text } if text.contains("Please add regression tests for compaction.")
         ));
+    }
+
+    #[test]
+    fn durable_compaction_commits_the_compacted_session_before_returning() {
+        let mut session = Session::new();
+        let path = std::env::temp_dir().join(format!(
+            "claw-durable-compact-{}-{}.jsonl",
+            std::process::id(),
+            session.session_id
+        ));
+        session = session.with_persistence_path(path.clone());
+        session.messages = vec![
+            ConversationMessage::user_text("old request ".repeat(100)),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "old response ".repeat(100),
+            }]),
+            ConversationMessage::user_text("recent request"),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "recent response".to_string(),
+            }]),
+        ];
+        session
+            .save_to_path(&path)
+            .expect("original session should persist");
+
+        let result = compact_session_durable(
+            &session,
+            CompactionConfig {
+                preserve_recent_messages: 2,
+                max_estimated_tokens: 1,
+            },
+        )
+        .expect("durable compaction should succeed");
+        let restored = Session::load_from_path(&path).expect("compacted session should reload");
+
+        assert_eq!(
+            restored.compaction.as_ref().map(|value| value.count),
+            result
+                .compacted_session
+                .compaction
+                .as_ref()
+                .map(|value| value.count)
+        );
+        assert_eq!(restored.messages, result.compacted_session.messages);
+
+        let memory_dir = path
+            .parent()
+            .expect("temporary path parent")
+            .join(format!("{}.memory", session.session_id));
+        fs::remove_dir_all(memory_dir).expect("memory directory should be removable");
+        fs::remove_file(path).expect("session file should be removable");
     }
 
     #[test]
