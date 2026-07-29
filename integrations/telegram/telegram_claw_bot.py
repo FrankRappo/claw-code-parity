@@ -50,6 +50,18 @@ ENABLE_THINKING = os.environ.get("ENABLE_THINKING", "false").strip().lower() in 
 }
 HISTORY_TURNS = int(os.environ.get("HISTORY_TURNS", "6"))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "300"))
+TELEGRAM_SEND_ATTEMPTS = max(
+    1,
+    int(os.environ.get("TELEGRAM_SEND_ATTEMPTS", "3")),
+)
+TELEGRAM_SEND_RETRY_BASE_SECONDS = max(
+    0.0,
+    float(os.environ.get("TELEGRAM_SEND_RETRY_BASE_SECONDS", "1")),
+)
+TELEGRAM_SEND_MAX_RETRY_SECONDS = max(
+    TELEGRAM_SEND_RETRY_BASE_SECONDS,
+    float(os.environ.get("TELEGRAM_SEND_MAX_RETRY_SECONDS", "30")),
+)
 BOT_MAX_CONCURRENT_REQUESTS = max(
     1,
     int(os.environ.get("BOT_MAX_CONCURRENT_REQUESTS", "2")),
@@ -320,6 +332,56 @@ def split_telegram_text(text, limit=3900):
     return chunks
 
 
+def telegram_send_retry_delay(error, retry_number):
+    """Return a bounded Telegram retry delay without exposing request secrets."""
+
+    retry_after = None
+    headers = getattr(error, "headers", None)
+    if headers:
+        retry_after = headers.get("Retry-After")
+    if retry_after is None and isinstance(error, urllib.error.HTTPError):
+        try:
+            payload = json.loads(error.read().decode("utf-8", "replace"))
+            retry_after = payload.get("parameters", {}).get("retry_after")
+        except (AttributeError, OSError, TypeError, ValueError):
+            retry_after = None
+    try:
+        delay = float(retry_after)
+    except (TypeError, ValueError):
+        delay = TELEGRAM_SEND_RETRY_BASE_SECONDS * (2 ** (retry_number - 1))
+    return max(0.0, min(delay, TELEGRAM_SEND_MAX_RETRY_SECONDS))
+
+
+def is_retryable_telegram_send_error(error):
+    if isinstance(error, urllib.error.HTTPError):
+        return error.code in {429, 500, 502, 503, 504}
+    return isinstance(error, OSError)
+
+
+def send_telegram_payload(payload, timeout=60):
+    """Send one Telegram message with bounded retries for transient failures."""
+
+    for attempt in range(1, TELEGRAM_SEND_ATTEMPTS + 1):
+        try:
+            return tg("sendMessage", payload, timeout=timeout)
+        except Exception as error:
+            if (
+                not is_retryable_telegram_send_error(error)
+                or attempt >= TELEGRAM_SEND_ATTEMPTS
+            ):
+                raise
+            delay = telegram_send_retry_delay(error, attempt)
+            code = getattr(error, "code", None)
+            detail = f"http={code}" if code is not None else type(error).__name__
+            print(
+                "Telegram send retry:"
+                f" attempt={attempt + 1}/{TELEGRAM_SEND_ATTEMPTS}"
+                f" delay={delay:g}s error={detail}",
+                flush=True,
+            )
+            time.sleep(delay)
+
+
 def send_message(chat_id, text, reply_to=None, keyboard=True, reply_markup=None):
     chunks = split_telegram_text(text)
     for index, part in enumerate(chunks):
@@ -330,7 +392,7 @@ def send_message(chat_id, text, reply_to=None, keyboard=True, reply_markup=None)
             payload["reply_markup"] = reply_markup
         elif keyboard and index == len(chunks) - 1:
             payload["reply_markup"] = main_keyboard()
-        tg("sendMessage", payload, timeout=60)
+        send_telegram_payload(payload, timeout=60)
 
 
 def send_typing(chat_id):

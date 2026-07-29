@@ -153,6 +153,18 @@ of at most 3900 characters, with no character loss, for both ordinary Gemma and
 Claw. The ordinary Gemma chat remains separately configured at 4096 by default
 and up to 8192 through `/tokens`.
 
+Each outbound Telegram message is retried up to three times after transient
+transport failures, HTTP 429, or HTTP 5xx. Retries use bounded exponential
+backoff and honor Telegram's `retry_after` value up to 30 seconds. HTTP 4xx
+request errors other than 429 are not retried. An ambiguous connection loss can
+rarely produce a duplicate message because Telegram Bot API does not provide an
+idempotency key; preserving the final Claw result is preferred to silently
+losing it. The retry count and delays are configurable with
+`TELEGRAM_SEND_ATTEMPTS`, `TELEGRAM_SEND_RETRY_BASE_SECONDS`, and
+`TELEGRAM_SEND_MAX_RETRY_SECONDS`.
+The 2026-07-29 failure analysis and production validation are recorded in
+[`STATUS-DELIVERY-INCIDENT-20260729.md`](STATUS-DELIVERY-INCIDENT-20260729.md).
+
 The complete removal/retention rationale is recorded in
 [`UNRESTRICTED-DEPLOYMENT.md`](UNRESTRICTED-DEPLOYMENT.md).
 

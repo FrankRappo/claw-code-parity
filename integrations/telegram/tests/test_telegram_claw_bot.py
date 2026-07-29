@@ -294,6 +294,54 @@ class ExistingBotBehaviorTests(unittest.TestCase):
         )
         self.assertIn("reply_markup", payloads[-1])
 
+    def test_send_message_retries_transient_transport_failure(self):
+        with mock.patch.object(
+            bot,
+            "tg",
+            side_effect=[TimeoutError("temporary timeout"), {"ok": True}],
+        ) as telegram, mock.patch.object(bot.time, "sleep") as sleep:
+            bot.send_message(10, "Статус Claw")
+
+        self.assertEqual(telegram.call_count, 2)
+        sleep.assert_called_once_with(bot.TELEGRAM_SEND_RETRY_BASE_SECONDS)
+
+    def test_send_message_does_not_retry_non_retryable_http_error(self):
+        error = bot.urllib.error.HTTPError(
+            "https://api.telegram.org/redacted",
+            400,
+            "Bad Request",
+            {},
+            io.BytesIO(b'{"ok":false}'),
+        )
+        with mock.patch.object(bot, "tg", side_effect=error) as telegram, mock.patch.object(
+            bot.time, "sleep"
+        ) as sleep:
+            with self.assertRaises(bot.urllib.error.HTTPError):
+                bot.send_message(10, "Некорректный запрос")
+
+        telegram.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_send_message_honors_telegram_retry_after(self):
+        error = bot.urllib.error.HTTPError(
+            "https://api.telegram.org/redacted",
+            429,
+            "Too Many Requests",
+            {},
+            io.BytesIO(
+                b'{"ok":false,"parameters":{"retry_after":7}}'
+            ),
+        )
+        with mock.patch.object(
+            bot,
+            "tg",
+            side_effect=[error, {"ok": True}],
+        ) as telegram, mock.patch.object(bot.time, "sleep") as sleep:
+            bot.send_message(10, "Статус Claw")
+
+        self.assertEqual(telegram.call_count, 2)
+        sleep.assert_called_once_with(7.0)
+
     def test_tokens_command_allows_long_multi_message_answers(self):
         message = {
             "chat": {"id": 10},
