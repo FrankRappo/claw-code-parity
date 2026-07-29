@@ -59,6 +59,15 @@ CONTROL_SCHEMA_VERSION = 1
 PROJECT_MEMORY_SCHEMA_VERSION = 1
 CONTROL_TEXT_LIMIT = 32_000
 TURN_RECOVERY_ATTEMPTS = 3
+CONTEXT_ROLLOVER_ATTEMPTS = 1
+DEFAULT_AUTO_COMPACT_INPUT_TOKENS = 64_000
+CONTEXT_LIMIT_ERROR_MARKERS = (
+    "exceed_context_size_error",
+    "context_length_exceeded",
+    "context length exceeded",
+    "exceeds the available context size",
+    "maximum context length",
+)
 
 
 class BridgeError(RuntimeError):
@@ -154,7 +163,13 @@ class BridgeConfig:
                 1024, int(os.environ.get("CLAW_MAX_ATTACHMENT_BYTES", str(20 << 20)))
             ),
             auto_compact_input_tokens=max(
-                1, int(os.environ.get("CLAW_AUTO_COMPACT_INPUT_TOKENS", "110000"))
+                1,
+                int(
+                    os.environ.get(
+                        "CLAW_AUTO_COMPACT_INPUT_TOKENS",
+                        str(DEFAULT_AUTO_COMPACT_INPUT_TOKENS),
+                    )
+                ),
             ),
             gemma_base_url=os.environ.get(
                 "GOOGLE_BASE_URL", "http://127.0.0.1:18080/v1"
@@ -182,17 +197,21 @@ def utc_timestamp() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def atomic_write_text(path: Path, value: str) -> None:
+    """Write private text by replace so crashes cannot leave partial state."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    temporary.write_text(value, encoding="utf-8")
+    temporary.chmod(0o600)
+    os.replace(temporary, path)
+
+
 def atomic_write_json(path: Path, value: dict[str, Any]) -> None:
     """Write versioned state by replace so crashes cannot leave partial JSON."""
 
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-    temporary.write_text(
-        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+    atomic_write_text(
+        path, json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     )
-    temporary.chmod(0o600)
-    os.replace(temporary, path)
 
 
 def append_project_event(project: dict[str, Any], event: str, **fields: Any) -> None:
@@ -719,7 +738,12 @@ class ClawRunner:
         ]
         if self.config.allowed_tools:
             command.extend(["--allowedTools", self.config.allowed_tools])
-        if project.get("session_id"):
+        session_path = str(project.get("session_path") or "")
+        session_is_retired = (
+            bool(session_path)
+            and session_path in self._retired_session_paths(project)
+        )
+        if project.get("session_id") and not session_is_retired:
             # Prefer the exact persisted file. This remains unambiguous even
             # for sessions created by older Claw builds whose process-local ID
             # counters could collide across simultaneous worker processes.
@@ -995,6 +1019,173 @@ class ClawRunner:
         return False
 
     @staticmethod
+    def _is_context_limit_error(message: str) -> bool:
+        normalized = message.casefold()
+        return any(marker in normalized for marker in CONTEXT_LIMIT_ERROR_MARKERS)
+
+    @staticmethod
+    def _retired_session_paths(project: dict[str, Any]) -> set[str]:
+        state_path = (
+            Path(project["workspace"])
+            / ".claw"
+            / "context-rollovers"
+            / "state.json"
+        )
+        try:
+            value = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return set()
+        retired = value.get("retired_sessions") if isinstance(value, dict) else []
+        return {
+            str(item.get("session_path"))
+            for item in retired
+            if isinstance(item, dict) and item.get("session_path")
+        }
+
+    @staticmethod
+    def _clear_retired_session(
+        project: dict[str, Any], retired_session_paths: set[str]
+    ) -> bool:
+        session_path = str(project.get("session_path") or "")
+        if session_path not in retired_session_paths:
+            return False
+        project["session_id"] = None
+        project["session_path"] = None
+        return True
+
+    @staticmethod
+    def _prepare_context_rollover(
+        project: dict[str, Any],
+        operation_id: str,
+        prompt: str,
+        error_message: str,
+    ) -> tuple[str, str | None]:
+        """Archive an oversized session and return a bounded fresh-session prompt.
+
+        This mirrors the durable OMX handoff pattern: exact state remains in
+        versioned files, while the next model call receives only a compact
+        locator and continuation contract.
+        """
+
+        workspace = Path(project["workspace"])
+        claw_state = workspace / ".claw"
+        previous_session_id = str(project.get("session_id") or "") or None
+        previous_session_path = str(project.get("session_path") or "") or None
+        checkpoint_id = create_project_checkpoint(
+            project, "before automatic context rollover"
+        )
+        rollover_id = (
+            f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-"
+            f"{uuid.uuid4().hex[:8]}"
+        )
+        rollover_directory = claw_state / "context-rollovers" / rollover_id
+        rollover_directory.mkdir(parents=True, mode=0o700)
+
+        archived_session = None
+        archive_warning = None
+        if previous_session_path:
+            source = Path(previous_session_path)
+            if source.is_file():
+                destination = rollover_directory / "session.jsonl"
+                try:
+                    shutil.copy2(source, destination)
+                    destination.chmod(0o600)
+                    archived_session = str(destination)
+                except OSError as error:
+                    archive_warning = str(error)[:500]
+
+        operator_prompt_path = rollover_directory / "operator-prompt.txt"
+        atomic_write_text(operator_prompt_path, prompt)
+        handoff_path = rollover_directory / "handoff.json"
+        atomic_write_json(
+            handoff_path,
+            {
+                "schema_version": 1,
+                "rollover_id": rollover_id,
+                "created_at": utc_timestamp(),
+                "operation_id": operation_id,
+                "reason": "provider_context_limit",
+                "operator_prompt_path": str(operator_prompt_path),
+                "operator_prompt_chars": len(prompt),
+                "operator_prompt_sha256": hashlib.sha256(
+                    prompt.encode("utf-8")
+                ).hexdigest(),
+                "previous_session_id": previous_session_id,
+                "previous_session_path": previous_session_path,
+                "archived_session_path": archived_session,
+                "archive_warning": archive_warning,
+                "checkpoint_id": checkpoint_id,
+                "durable_sources": {
+                    "plan": str(claw_state / "plan.json"),
+                    "project_memory": str(claw_state / "project-memory.json"),
+                    "control_state": str(claw_state / "control-state.json"),
+                    "events": str(claw_state / "events.jsonl"),
+                },
+                "provider_error_tail": error_message[-2_000:],
+                "provenance": {
+                    "source": "telegram_claw_bridge",
+                    "expires_at": None,
+                },
+            },
+        )
+        rollover_state_path = claw_state / "context-rollovers" / "state.json"
+        try:
+            rollover_state = json.loads(
+                rollover_state_path.read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError):
+            rollover_state = {"schema_version": 1, "retired_sessions": []}
+        retired_sessions = rollover_state.setdefault("retired_sessions", [])
+        if previous_session_path and not any(
+            isinstance(item, dict)
+            and item.get("session_path") == previous_session_path
+            for item in retired_sessions
+        ):
+            retired_sessions.append(
+                {
+                    "session_id": previous_session_id,
+                    "session_path": previous_session_path,
+                    "archived_session_path": archived_session,
+                    "rollover_id": rollover_id,
+                    "retired_at": utc_timestamp(),
+                }
+            )
+        rollover_state["schema_version"] = 1
+        rollover_state["latest_rollover_id"] = rollover_id
+        rollover_state["latest_handoff_path"] = str(handoff_path)
+        rollover_state["updated_at"] = utc_timestamp()
+        atomic_write_json(rollover_state_path, rollover_state)
+
+        project["session_id"] = None
+        project["session_path"] = None
+        append_project_event(
+            project,
+            "context_rollover_created",
+            operation_id=operation_id,
+            rollover_id=rollover_id,
+            checkpoint_id=checkpoint_id,
+            handoff_path=str(handoff_path),
+        )
+        recovery_prompt = (
+            "AUTOMATIC CONTEXT ROLLOVER. The previous model session exceeded the "
+            "provider context window and was archived without deleting any project "
+            "state. Continue in this fresh session; do not load the archived JSONL "
+            "transcript into the model context.\n\n"
+            f"Read the bounded handoff once: `{handoff_path}`.\n"
+            f"Read the exact operator instruction from: `{operator_prompt_path}`. "
+            "If it is large, read it in bounded chunks rather than returning the whole "
+            "file as one tool result.\n"
+            f"Durable checkpoint: `{checkpoint_id}`.\n"
+            "The handoff contains integrity metadata and pointers to the durable plan, "
+            "project memory, control state, event journal, current workspace files, "
+            "and immutable prior-session archive. Treat those files as authoritative, "
+            "preserve idempotency, inspect existing effects before repeating side "
+            "effects, and continue autonomously until the plan is complete and "
+            "verified."
+        )
+        return recovery_prompt, previous_session_path
+
+    @staticmethod
     def _write_progress_file(path: Path, payload: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(
@@ -1197,6 +1388,8 @@ class ClawRunner:
         current_prompt = prompt
         current_control: dict[str, Any] | None = None
         failure_attempts = 0
+        context_rollovers = 0
+        retired_session_paths = self._retired_session_paths(project)
         started_at = time.time()
         append_project_event(
             project,
@@ -1291,6 +1484,8 @@ class ClawRunner:
 
             if process.returncode != 0:
                 adopted_session = self._adopt_latest_session(project)
+                if self._clear_retired_session(project, retired_session_paths):
+                    adopted_session = False
                 with self._active_lock:
                     paused = bool(self._read_control(project).get("paused"))
                     cancelled = self._cancelled_operation_ids.get(chat_id)
@@ -1327,6 +1522,41 @@ class ClawRunner:
                         active_operation_id,
                         prompt=current_prompt,
                         state="paused",
+                    )
+                    continue
+
+                message = (
+                    stderr.strip()
+                    or stdout.strip()
+                    or f"exit code {process.returncode}"
+                )
+                if self._is_context_limit_error(message):
+                    if context_rollovers >= CONTEXT_ROLLOVER_ATTEMPTS:
+                        self._finish_active_task(
+                            project, active_operation_id, "blocked"
+                        )
+                        raise BridgeError(
+                            "Claw turn failed after automatic context rollover: "
+                            f"{message[-2_000:]}",
+                            HTTPStatus.BAD_GATEWAY,
+                        )
+                    current_prompt, retired_session_path = (
+                        self._prepare_context_rollover(
+                            project,
+                            active_operation_id,
+                            current_prompt,
+                            message,
+                        )
+                    )
+                    if retired_session_path:
+                        retired_session_paths.add(retired_session_path)
+                    context_rollovers += 1
+                    failure_attempts = 0
+                    self._update_active_task(
+                        project,
+                        active_operation_id,
+                        prompt=current_prompt,
+                        state="recovering",
                     )
                     continue
 
@@ -1370,11 +1600,6 @@ class ClawRunner:
                     )
                     continue
 
-                message = (
-                    stderr.strip()
-                    or stdout.strip()
-                    or f"exit code {process.returncode}"
-                )
                 recovered_result = None
                 if (
                     "assistant stream produced no content" in message

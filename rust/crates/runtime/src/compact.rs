@@ -1,4 +1,5 @@
 use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session, SessionError};
+use crate::summary_compression::compress_summary_text;
 
 const COMPACT_CONTINUATION_PREAMBLE: &str =
     "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n";
@@ -114,8 +115,10 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
         .saturating_sub(config.preserve_recent_messages);
     let removed = &session.messages[compacted_prefix_len..keep_from];
     let preserved = session.messages[keep_from..].to_vec();
-    let summary =
-        merge_compact_summaries(existing_summary.as_deref(), &summarize_messages(removed));
+    let summary = compress_compact_summary(&merge_compact_summaries(
+        existing_summary.as_deref(),
+        &summarize_messages(removed),
+    ));
     let formatted_summary = format_compact_summary(&summary);
     let continuation = get_compact_continuation_message(&summary, true, !preserved.is_empty());
 
@@ -314,6 +317,16 @@ fn merge_compact_summaries(existing_summary: Option<&str>, new_summary: &str) ->
 
     lines.push("</summary>".to_string());
     lines.join("\n")
+}
+
+fn compress_compact_summary(summary: &str) -> String {
+    let formatted = format_compact_summary(summary);
+    let compressed = compress_summary_text(&formatted);
+    let body = compressed
+        .strip_prefix("Summary:\n")
+        .unwrap_or(&compressed)
+        .trim();
+    format!("<summary>\n{body}\n</summary>")
 }
 
 fn summarize_block(block: &ContentBlock) -> String {
@@ -770,6 +783,69 @@ mod tests {
         });
         assert!(summary.ends_with('…'));
         assert!(summary.chars().count() <= 161);
+    }
+
+    #[test]
+    fn bounds_repeated_compaction_summary_growth() {
+        let mut session = Session::new();
+        for index in 0..80 {
+            let request = format!(
+                "Request {index}: continue implementation in compact.rs {}",
+                "x".repeat(240)
+            );
+            let response = format!(
+                "Current work {index}: continue with remaining tests {}",
+                "y".repeat(240)
+            );
+            session
+                .messages
+                .push(ConversationMessage::user_text(request));
+            session
+                .messages
+                .push(ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: response,
+                }]));
+        }
+
+        let first = compact_session(
+            &session,
+            CompactionConfig {
+                preserve_recent_messages: 2,
+                max_estimated_tokens: 1,
+            },
+        );
+        let mut repeated = first.compacted_session;
+        for index in 0..20 {
+            repeated
+                .messages
+                .push(ConversationMessage::user_text(format!(
+                    "Follow-up {index}: next remaining task"
+                )));
+            repeated
+                .messages
+                .push(ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: format!("Working on follow-up {index}"),
+                }]));
+            repeated = compact_session(
+                &repeated,
+                CompactionConfig {
+                    preserve_recent_messages: 2,
+                    max_estimated_tokens: 1,
+                },
+            )
+            .compacted_session;
+        }
+
+        let summary_text = match &repeated.messages[0].blocks[0] {
+            ContentBlock::Text { text } => text,
+            other => panic!("expected text summary, got {other:?}"),
+        };
+        assert!(
+            summary_text.chars().count() < 2_000,
+            "compaction handoff must remain bounded across repeated rollovers"
+        );
+        assert!(summary_text.contains("Summary:"));
+        assert!(summary_text.contains("Current work:"));
     }
 
     #[test]

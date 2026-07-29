@@ -35,15 +35,16 @@ tool, environment, or output-truncation blockers.
 | Simultaneously active built-in child Agents | **1** | The server has exactly two inference slots: parent plus one child. A shared OS advisory `flock` enforces this across separate top-level Claw processes, releases automatically if a process dies, and also prevents recursive fan-out. |
 | Simultaneous top-level bridge turns | **2** | Matches the same two physical model slots. Extra chats wait rather than overcommitting inference. |
 | Claw completion ceiling | **32,000 tokens** | Matches the current default Opus completion budget in Claw Code. It is only a ceiling; EOS still ends short answers normally. |
-| Automatic compaction input point | **110,000 tokens** | Measured for a 163,840-token slot. It preserves room for the complete system/project prompt, all tool schemas/results, and up to 32,000 output tokens. |
+| Automatic compaction conversation point | **64,000 tokens** | The 163,840-token provider request also includes a large fixed system prompt and tool schemas. This lower persisted-message budget preserves real request and completion headroom. |
 | Telegram message chunk | **3,900 characters** | Telegram's message-size protocol requires chunking; the sender preserves every returned character in order. |
 | Incoming attachment | **20 MiB** | Matches the deployed Telegram download path. The bridge request-body limit is 64 MiB so base64 expansion does not reduce this effective size. |
 | Per-chat serialization | **1 active turn per chat** | Prevents two processes from writing the same Claw session simultaneously. It does not restrict different chats. |
 | Loopback bridge plus bearer authentication | enabled | Protects the control transport; it does not limit Claw's outbound network, tools, filesystem, or credentials. |
 
 `/stop` remains the explicit cancellation mechanism. Automatic compaction is
-not disabled or moved: `110000` is the verified operating point requested by
-the deployment owner.
+not disabled. The prior `110000` setting was retired after a production request
+reached 164,974 tokens and exceeded the 163,840-token physical slot despite
+session-only compaction.
 
 ## Autonomous continuity retained
 
@@ -53,6 +54,9 @@ the deployment owner.
 - Compaction is transactional: immutable full archives are created before
   message removal, checkpoints are atomically replaced, and archive retries are
   idempotent.
+- Repeated summaries are size-bounded. A provider context-limit error triggers
+  one protected session rollover with an exact private handoff and archived
+  JSONL, rather than retrying the same oversized session.
 - Project memory, active-task state, live steering, `/next` queue entries, and
   pause state are schema-versioned and rehydrated into a resumed process.
 - Audit events are append-only and filesystem checkpoints preserve Git tracked

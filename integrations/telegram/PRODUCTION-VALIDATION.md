@@ -26,8 +26,9 @@ public addresses, private paths, model weights, or Telegram chat identifiers.
   child role receives the complete built-in tool registry. A shared OS advisory
   `flock` permits only one child across all top-level Claw processes, releases
   automatically after a crashed owner, and prevents recursive fan-out.
-- Automatic compaction begins at 110000 input tokens for the measured 163840-
-  token Gemma slot.
+- Automatic compaction begins at 64000 persisted conversation tokens for the
+  measured 163840-token Gemma slot, reserving space for fixed system/tool
+  request sections and output.
 - Compaction archives the complete pre-compaction JSONL immutably, atomically
   updates a versioned recovery checkpoint, and rehydrates plan/project memory.
 - Autonomous plans cannot finalize with pending items or without concrete
@@ -68,7 +69,7 @@ public addresses, private paths, model weights, or Telegram chat identifiers.
 | Sub-agent policy | The `Agent` tool uses the deployment's `gemma4` default, exposes the complete built-in tool set to every child role, and retains one cross-process active-child lock. |
 | Deployed long-output smoke | The installed bot reconstructed a five-message fixture without character loss; the largest chunk was exactly 3900 characters, only the first replied to the source message, and only the last carried the keyboard. |
 | Deployed sub-agent E2E | A parent Claw turn launched one `Explore` Agent without specifying a model, waited for it, read its marker, and returned the expected parent marker in 80.907 s. The persisted child manifest reported `model=gemma4`, `status=completed`, and no error. |
-| Durable-control API | The deployed `/v1/status` reported `autonomous_plan=true`, `durable_memory=true`, `live_steering=true`, and the 110000-token compaction threshold. `/next`, `/queue`, `/pause`, `/continue`, and `/stop` all returned HTTP 200 against an isolated production project. |
+| Durable-control API | The deployed `/v1/status` reported `autonomous_plan=true`, `durable_memory=true`, and `live_steering=true`. The original validation used a 110000-token conversation threshold; the 2026-07-29 context incident replaced it with 64000. `/next`, `/queue`, `/pause`, `/continue`, and `/stop` all returned HTTP 200 against an isolated production project. |
 | Live steering and recovery | An active production E2E turn was interrupted twice through `/v1/steer`, including recovery from a model-selected unbounded `tail -f`. Both calls returned `accepted=true` and `interrupted=true`; the bridge resumed the same durable session and superseded the older control message. |
 | Autonomous completion gate | The steered turn created `e2e-proof.txt` with the corrected exact value, read it back, and finished only after every durable plan item was `completed` with non-empty evidence. The persisted task ended `completed`, no queue item remained pending, and three rollback checkpoints existed. |
 | Deployed Telegram controls | The installed bot loaded successfully with Pause and Continue buttons and the `/progress` and `/queue` command paths. The bot, bridge, model tunnel, and reverse forward remained active with zero service restarts after deployment. |
@@ -133,9 +134,17 @@ the deployed live smoke test returned a marker and session metadata normally.
 
 ## Context behavior
 
-The model server has two 163840-token slots. Claw compacts before a request
-would exceed 110000 input tokens, leaving 53840 tokens of headroom for system
-instructions, tool results, Vision tokens, continued turns, and output.
+The model server has two 163840-token slots. Claw compacts persisted
+conversation history at 64000 estimated tokens. This threshold intentionally
+does not treat the entire provider slot as conversation capacity: system
+instructions, tool schemas, Vision tokens, continued turns, and output consume
+the same physical request budget.
+
+The previous 110000 setting was disproved by a live failure on 2026-07-29:
+after repeated compactions the provider assembled a 164,974-token request and
+rejected it against the 163,840-token slot. Regression coverage now verifies a
+single automatic archive + private handoff + fresh-session retry, with the
+durable plan and workspace preserved.
 
 This yields long-lived logical projects across restarts and repeated
 compactions, not an infinite lossless transcript inside one model call. Older

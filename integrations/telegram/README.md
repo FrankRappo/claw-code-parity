@@ -132,12 +132,14 @@ JSON output includes `session_id` and `session_path`. This makes completed
 project context recoverable after a process or server restart. The active model
 context is automatically compacted before an oversized request using
 `CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS`; set the bridge's
-`CLAW_AUTO_COMPACT_INPUT_TOKENS` to roughly 65–70% of the verified Gemma context
-per slot.
+`CLAW_AUTO_COMPACT_INPUT_TOKENS` to the measured safe conversation budget after
+reserving the provider's system prompt, tool schemas, images, and completion.
 
-The measured Gemma deployment exposes two 163840-token slots and uses a 110000-
-token threshold. A project can continue through repeated compactions, but one
-model call can never exceed its physical slot. Before removing any message,
+The measured Gemma deployment exposes two 163840-token slots and uses a
+64000-token conversation threshold. The older 110000 threshold counted only
+persisted conversation messages and failed once the fixed system/tool request
+overhead was included. A project can continue through repeated compactions, but
+one model call can never exceed its physical slot. Before removing any message,
 compaction writes an immutable full JSONL archive and an atomic versioned
 checkpoint containing the plan, project memory, provenance, archive chain, and
 resume summary. The latest checkpoint is automatically injected on every new
@@ -145,9 +147,18 @@ Claw process. Active-task and control state are also persisted; `/continue` can
 recover an in-flight task after a bridge/process restart without guessing its
 prompt.
 
+Compaction summaries are bounded before reuse so repeated compactions cannot
+grow the synthetic handoff indefinitely. If the provider still reports a
+context-limit error, the bridge performs one automatic OMX-style rollover:
+it creates a project checkpoint, copies the exact old session to a protected
+archive, writes the full operator prompt and durable-state pointers to a
+mode-0600 handoff, clears only the model-session reference, and retries once in
+a fresh model session. The workspace, plan, project memory, control queue, and
+audit history remain in the same project.
+
 The bridge uses a 32000-token completion ceiling, matching the current Claw Code
 default Opus budget. It is not a target length: normal responses stop naturally.
-The 110000 automatic-compaction point is unchanged. Telegram
+The 64000 automatic-compaction point leaves provider-level headroom. Telegram
 responses are divided on paragraph/newline/word boundaries into ordered chunks
 of at most 3900 characters, with no character loss, for both ordinary Gemma and
 Claw. The ordinary Gemma chat remains separately configured at 4096 by default

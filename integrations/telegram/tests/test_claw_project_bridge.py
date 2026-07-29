@@ -55,7 +55,7 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(config.permission_mode, "danger-full-access")
         self.assertTrue(config.unrestricted)
         self.assertEqual(config.gemma_max_output_tokens, 32000)
-        self.assertEqual(config.auto_compact_input_tokens, 110000)
+        self.assertEqual(config.auto_compact_input_tokens, 64000)
         self.assertIsNone(config.turn_timeout)
         self.assertIsNone(config.ocr_timeout)
 
@@ -318,6 +318,208 @@ raise SystemExit(1)
                 ["--resume", "/sessions/session-42.jsonl", "prompt", "continue"],
             )
             self.assertIn("danger-full-access", resumed)
+
+    def test_context_limit_archives_session_and_retries_with_bounded_handoff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            sessions = workspace / ".claw" / "sessions"
+            sessions.mkdir(parents=True)
+            old_session = sessions / "session-old.jsonl"
+            old_session_contents = (
+                json.dumps(
+                    {
+                        "type": "session_meta",
+                        "version": 1,
+                        "session_id": "session-old",
+                    }
+                )
+                + "\n"
+            )
+            old_session.write_text(old_session_contents, encoding="utf-8")
+            (workspace / ".claw" / "plan.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "todos": [
+                            {
+                                "content": "Finish the gateway",
+                                "status": "in_progress",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            fake_claw = root / "claw"
+            fake_claw.write_text(
+                """#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+
+workspace = pathlib.Path.cwd()
+attempts = workspace / ".claw" / "fake-attempts.jsonl"
+with attempts.open("a", encoding="utf-8") as stream:
+    stream.write(json.dumps(sys.argv[1:]) + "\\n")
+if "--resume" in sys.argv:
+    print(
+        "error: api returned 400 Bad Request (exceed_context_size_error): "
+        "request exceeds the available context size",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+session = workspace / ".claw" / "sessions" / "session-fresh.jsonl"
+session.write_text(
+    json.dumps(
+        {"type": "session_meta", "version": 1, "session_id": "session-fresh"}
+    )
+    + "\\n",
+    encoding="utf-8",
+)
+print(
+    json.dumps(
+        {
+            "message": "continued from compact handoff",
+            "session_id": "session-fresh",
+            "session_path": str(session),
+        }
+    )
+)
+""",
+                encoding="utf-8",
+            )
+            fake_claw.chmod(0o755)
+            runner = bridge.ClawRunner(test_config(root))
+            project = {
+                "workspace": str(workspace),
+                "session_id": "session-old",
+                "session_path": str(old_session),
+            }
+            operator_prompt = "Continue the exact operator task without losing files."
+
+            result = runner.run_turn(
+                "7", project, operator_prompt, "operation-rollover"
+            )
+
+            self.assertEqual(result["message"], "continued from compact handoff")
+            self.assertEqual(project["session_id"], "session-fresh")
+            attempts = [
+                json.loads(line)
+                for line in (
+                    workspace / ".claw" / "fake-attempts.jsonl"
+                ).read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(len(attempts), 2)
+            self.assertIn("--resume", attempts[0])
+            self.assertNotIn("--resume", attempts[1])
+            self.assertIn("AUTOMATIC CONTEXT ROLLOVER", attempts[1][-1])
+
+            rollovers = list(
+                path
+                for path in (
+                    workspace / ".claw" / "context-rollovers"
+                ).iterdir()
+                if path.is_dir()
+            )
+            self.assertEqual(len(rollovers), 1)
+            handoff_path = rollovers[0] / "handoff.json"
+            handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
+            operator_prompt_path = Path(handoff["operator_prompt_path"])
+            self.assertEqual(
+                operator_prompt_path.read_text(encoding="utf-8"), operator_prompt
+            )
+            self.assertEqual(
+                operator_prompt_path.stat().st_mode & 0o777, 0o600
+            )
+            self.assertNotIn("operator_prompt", handoff)
+            self.assertEqual(handoff["previous_session_id"], "session-old")
+            self.assertEqual(
+                (rollovers[0] / "session.jsonl").read_text(encoding="utf-8"),
+                old_session_contents,
+            )
+            self.assertEqual(handoff_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(
+                json.loads(
+                    (workspace / ".claw" / "plan.json").read_text(encoding="utf-8")
+                )["todos"][0]["status"],
+                "in_progress",
+            )
+            events = (
+                workspace / ".claw" / "events.jsonl"
+            ).read_text(encoding="utf-8")
+            self.assertIn("context_rollover_created", events)
+            self.assertNotIn("turn_recovery_scheduled", events)
+            stale_project = {
+                "workspace": str(workspace),
+                "session_id": "session-old",
+                "session_path": str(old_session),
+            }
+            restart_command = runner._command(
+                stale_project, "recover after bridge restart"
+            )
+            self.assertNotIn("--resume", restart_command)
+            rollover_state = json.loads(
+                (
+                    workspace / ".claw" / "context-rollovers" / "state.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                rollover_state["retired_sessions"][0]["session_path"],
+                str(old_session),
+            )
+
+    def test_context_limit_rollover_is_attempted_only_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            sessions = workspace / ".claw" / "sessions"
+            sessions.mkdir(parents=True)
+            old_session = sessions / "session-old.jsonl"
+            old_session.write_text(
+                json.dumps(
+                    {
+                        "type": "session_meta",
+                        "version": 1,
+                        "session_id": "session-old",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            fake_claw = root / "claw"
+            fake_claw.write_text(
+                """#!/usr/bin/env python3
+import pathlib
+import sys
+
+attempts = pathlib.Path.cwd() / ".claw" / "attempt-count"
+count = int(attempts.read_text() or "0") if attempts.exists() else 0
+attempts.write_text(str(count + 1))
+print(
+    "error: api returned 400 (context_length_exceeded): maximum context length",
+    file=sys.stderr,
+)
+raise SystemExit(1)
+""",
+                encoding="utf-8",
+            )
+            fake_claw.chmod(0o755)
+            runner = bridge.ClawRunner(test_config(root))
+            project = {
+                "workspace": str(workspace),
+                "session_id": "session-old",
+                "session_path": str(old_session),
+            }
+
+            with self.assertRaisesRegex(
+                bridge.BridgeError, "after automatic context rollover"
+            ):
+                runner.run_turn("7", project, "continue", "operation-rollover")
+
+            self.assertEqual(
+                (workspace / ".claw" / "attempt-count").read_text(), "2"
+            )
 
     def test_command_can_still_apply_an_explicit_tool_allowlist(self):
         with tempfile.TemporaryDirectory() as directory:
