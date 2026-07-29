@@ -146,6 +146,22 @@ rejected it against the 163,840-token slot. Regression coverage now verifies a
 single automatic archive + private handoff + fresh-session retry, with the
 durable plan and workspace preserved.
 
+Post-fix evidence collected on 2026-07-29:
+
+- all 74 Telegram integration tests passed locally;
+- the complete runtime suite passed with 401 tests and one pre-existing ignored
+  flaky MCP test;
+- all 33 project-bridge tests passed again from the deployed VM121 source;
+- an isolated authenticated HTTP E2E created an initial session, forced the
+  exact `exceed_context_size_error`, then verified a different fresh session,
+  one archived retired session, a preserved plan, and mode-0600 handoff/prompt
+  artifacts;
+- the deployed bridge smoke endpoint reported
+  `auto_compact_input_tokens=64000`, unrestricted tools enabled, and the
+  32,000-token completion ceiling;
+- the deployed release binary SHA-256 was
+  `fbaeb9563d1324e37a3a6747ddf21ff94611ee8557f7516f863ea2b5421c9b8c`.
+
 This yields long-lived logical projects across restarts and repeated
 compactions, not an infinite lossless transcript inside one model call. Older
 history is summarized. Durable facts that must remain exact should be written
