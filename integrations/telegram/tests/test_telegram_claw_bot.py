@@ -164,6 +164,92 @@ class LlmPayloadTests(unittest.TestCase):
             bot.ENABLE_THINKING,
         )
 
+    def test_llm_waits_for_backend_health_after_reboot(self):
+        unavailable = bot.urllib.error.URLError(ConnectionRefusedError("offline"))
+        completion = {
+            "choices": [{"message": {"content": "Сервис восстановлен"}}],
+            "usage": {},
+        }
+        with mock.patch.object(
+            bot,
+            "http_json",
+            side_effect=[unavailable, {"status": "ok"}, completion],
+        ) as request, mock.patch.object(
+            bot,
+            "LLM_RECOVERY_WAIT_SECONDS",
+            10.0,
+        ), mock.patch.object(
+            bot,
+            "LLM_RECOVERY_POLL_SECONDS",
+            2.0,
+        ), mock.patch.object(
+            bot.time,
+            "monotonic",
+            side_effect=[0.0, 0.0, 2.0, 3.0],
+        ), mock.patch.object(bot.time, "sleep") as sleep:
+            content, _, _ = bot.llm_chat(
+                [{"role": "user", "content": "Проверка после reboot"}],
+                64,
+            )
+
+        self.assertEqual(content, "Сервис восстановлен")
+        self.assertEqual(
+            [call.args[0] for call in request.call_args_list],
+            [
+                f"{bot.LLM_BASE_URL}/health",
+                f"{bot.LLM_BASE_URL}/health",
+                f"{bot.LLM_BASE_URL}/v1/chat/completions",
+            ],
+        )
+        self.assertIsNone(request.call_args_list[0].kwargs.get("payload"))
+        self.assertIsNone(request.call_args_list[1].kwargs.get("payload"))
+        sleep.assert_called_once_with(2.0)
+
+    def test_llm_health_wait_does_not_retry_permanent_http_error(self):
+        error = bot.urllib.error.HTTPError(
+            f"{bot.LLM_BASE_URL}/health",
+            404,
+            "Not Found",
+            {},
+            io.BytesIO(b"not found"),
+        )
+        with mock.patch.object(bot, "http_json", side_effect=error) as request, mock.patch.object(
+            bot.time, "sleep"
+        ) as sleep:
+            with self.assertRaises(bot.urllib.error.HTTPError):
+                bot.llm_chat([{"role": "user", "content": "test"}], 64)
+
+        request.assert_called_once_with(
+            f"{bot.LLM_BASE_URL}/health",
+            timeout=bot.LLM_RECOVERY_PROBE_TIMEOUT,
+        )
+        sleep.assert_not_called()
+
+    def test_llm_health_wait_stops_at_the_recovery_deadline(self):
+        unavailable = bot.urllib.error.URLError(ConnectionRefusedError("offline"))
+        with mock.patch.object(
+            bot,
+            "http_json",
+            side_effect=[unavailable, unavailable],
+        ) as request, mock.patch.object(
+            bot,
+            "LLM_RECOVERY_WAIT_SECONDS",
+            3.0,
+        ), mock.patch.object(
+            bot,
+            "LLM_RECOVERY_POLL_SECONDS",
+            5.0,
+        ), mock.patch.object(
+            bot.time,
+            "monotonic",
+            side_effect=[0.0, 0.0, 1.0, 3.0],
+        ), mock.patch.object(bot.time, "sleep") as sleep:
+            with self.assertRaises(bot.urllib.error.URLError):
+                bot.llm_chat([{"role": "user", "content": "test"}], 64)
+
+        self.assertEqual(request.call_count, 2)
+        sleep.assert_called_once_with(2.0)
+
     def test_claw_vision_preprocessing_has_no_automatic_timeout(self):
         process = mock.Mock()
         process.communicate.return_value = (

@@ -164,6 +164,15 @@ of at most 3900 characters, with no character loss, for both ordinary Gemma and
 Claw. The ordinary Gemma chat remains separately configured at 4096 by default
 and up to 8192 through `/tokens`.
 
+Before an ordinary Gemma completion, the bot probes the local model health
+endpoint. If a host reboot temporarily removes the SSH tunnel or leaves the
+model warming up, the bot waits for recovery for up to 180 seconds instead of
+immediately returning a transport error. Only the health probe is repeated;
+the completion request is submitted once after the backend is healthy. The
+window, poll interval, and per-probe timeout are configurable with
+`LLM_RECOVERY_WAIT_SECONDS`, `LLM_RECOVERY_POLL_SECONDS`, and
+`LLM_RECOVERY_PROBE_TIMEOUT`. Permanent HTTP errors are not retried.
+
 Each outbound Telegram message is retried up to three times after transient
 transport failures, HTTP 429, or HTTP 5xx. Retries use bounded exponential
 backoff and honor Telegram's `retry_after` value up to 30 seconds. HTTP 4xx

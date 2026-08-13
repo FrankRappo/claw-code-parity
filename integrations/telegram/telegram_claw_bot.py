@@ -50,6 +50,18 @@ ENABLE_THINKING = os.environ.get("ENABLE_THINKING", "false").strip().lower() in 
 }
 HISTORY_TURNS = int(os.environ.get("HISTORY_TURNS", "6"))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "300"))
+LLM_RECOVERY_WAIT_SECONDS = max(
+    0.0,
+    float(os.environ.get("LLM_RECOVERY_WAIT_SECONDS", "180")),
+)
+LLM_RECOVERY_POLL_SECONDS = max(
+    0.1,
+    float(os.environ.get("LLM_RECOVERY_POLL_SECONDS", "5")),
+)
+LLM_RECOVERY_PROBE_TIMEOUT = max(
+    0.1,
+    float(os.environ.get("LLM_RECOVERY_PROBE_TIMEOUT", "3")),
+)
 TELEGRAM_SEND_ATTEMPTS = max(
     1,
     int(os.environ.get("TELEGRAM_SEND_ATTEMPTS", "3")),
@@ -283,6 +295,45 @@ def http_json(url, payload=None, timeout=REQUEST_TIMEOUT, extra_headers=None):
     effective_timeout = None if timeout is not None and timeout <= 0 else timeout
     with urllib.request.urlopen(request, timeout=effective_timeout) as response:
         return json.loads(response.read().decode("utf-8", "replace"))
+
+
+def is_retryable_backend_error(error):
+    if isinstance(error, urllib.error.HTTPError):
+        return error.code in {408, 425, 429, 500, 502, 503, 504}
+    return isinstance(
+        error,
+        (urllib.error.URLError, TimeoutError, ConnectionError, OSError),
+    )
+
+
+def wait_for_llm_backend():
+    """Wait briefly for the local model tunnel to recover after a reboot."""
+
+    deadline = time.monotonic() + LLM_RECOVERY_WAIT_SECONDS
+    attempt = 1
+    while True:
+        try:
+            http_json(
+                f"{LLM_BASE_URL}/health",
+                timeout=LLM_RECOVERY_PROBE_TIMEOUT,
+            )
+            return
+        except Exception as error:
+            if not is_retryable_backend_error(error):
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            delay = min(LLM_RECOVERY_POLL_SECONDS, remaining)
+            code = getattr(error, "code", None)
+            detail = f"http={code}" if code is not None else type(error).__name__
+            print(
+                "LLM backend recovery wait:"
+                f" attempt={attempt} delay={delay:g}s error={detail}",
+                flush=True,
+            )
+            time.sleep(delay)
+            attempt += 1
 
 
 def load_system_prompt():
@@ -703,6 +754,7 @@ def llm_chat(messages, max_tokens, temperature=TEMPERATURE, timeout=REQUEST_TIME
         "chat_template_kwargs": {"enable_thinking": ENABLE_THINKING},
     }
     started = time.monotonic()
+    wait_for_llm_backend()
     response = http_json(
         f"{LLM_BASE_URL}/v1/chat/completions",
         payload,
