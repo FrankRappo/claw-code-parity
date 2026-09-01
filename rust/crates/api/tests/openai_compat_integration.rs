@@ -274,6 +274,56 @@ async fn openai_streaming_requests_opt_into_usage_chunks() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
+async fn google_gemma_streams_visible_text_with_usage_and_hides_thought_tags() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let sse = concat!(
+        "data: {\"id\":\"chatcmpl_gemma\",\"model\":\"gemma-4-31b-it\",\"choices\":[{\"delta\":{\"content\":\"<tho\"}}]}\n\n",
+        "data: {\"id\":\"chatcmpl_gemma\",\"choices\":[{\"delta\":{\"content\":\"ught>private reasoning</thought>Visible\"}}]}\n\n",
+        "data: {\"id\":\"chatcmpl_gemma\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"id\":\"chatcmpl_gemma\",\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":7}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response("200 OK", "text/event-stream", sse)],
+    )
+    .await;
+
+    let client = OpenAiCompatClient::new("google-test-key", OpenAiCompatConfig::google())
+        .with_base_url(server.base_url());
+    let mut request = sample_request(true);
+    request.model = "gemma-4-31b-it".to_string();
+    let mut stream = client
+        .stream_message(&request)
+        .await
+        .expect("stream should start");
+
+    let mut visible = String::new();
+    let mut usage = None;
+    while let Some(event) = stream.next_event().await.expect("event should parse") {
+        match event {
+            StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                delta: ContentBlockDelta::TextDelta { text },
+                ..
+            }) => visible.push_str(&text),
+            StreamEvent::MessageDelta(delta) => usage = Some(delta.usage),
+            _ => {}
+        }
+    }
+
+    assert_eq!(visible, "Visible");
+    let usage = usage.expect("usage event");
+    assert_eq!(usage.input_tokens, 12);
+    assert_eq!(usage.output_tokens, 7);
+
+    let captured = state.lock().await;
+    let request: serde_json::Value = serde_json::from_str(&captured[0].body).expect("json body");
+    assert_eq!(request["stream_options"], json!({"include_usage": true}));
+    assert_eq!(request["reasoning_effort"], json!("high"));
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
 async fn provider_client_dispatches_xai_requests_from_env() {
     let _lock = env_lock();
     let _api_key = ScopedEnvVar::set("XAI_API_KEY", "xai-test-key");

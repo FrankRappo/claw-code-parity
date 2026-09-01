@@ -16,7 +16,8 @@ use super::{Provider, ProviderFuture};
 
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
-pub const DEFAULT_GOOGLE_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/openai/";
+pub const DEFAULT_GOOGLE_BASE_URL: &str =
+    "https://generativelanguage.googleapis.com/v1beta/openai/";
 pub const DEFAULT_GROQ_BASE_URL: &str = "https://api.groq.com/openai/v1";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
@@ -155,10 +156,16 @@ impl OpenAiCompatClient {
             stream: false,
             ..request.clone()
         };
+        let estimated_input_tokens = estimate_request_tokens(&request, self.config());
         let response = self.send_with_retry(&request).await?;
         let request_id = request_id_from_headers(response.headers());
         let payload = response.json::<ChatCompletionResponse>().await?;
-        let mut normalized = normalize_response(&request.model, payload)?;
+        let mut normalized = normalize_response(
+            &request.model,
+            payload,
+            self.config(),
+            estimated_input_tokens,
+        )?;
         if normalized.request_id.is_none() {
             normalized.request_id = request_id;
         }
@@ -169,16 +176,16 @@ impl OpenAiCompatClient {
         &self,
         request: &MessageRequest,
     ) -> Result<MessageStream, ApiError> {
-        let response = self
-            .send_with_retry(&request.clone().with_streaming())
-            .await?;
+        let request = request.clone().with_streaming();
+        let estimated_input_tokens = estimate_request_tokens(&request, self.config());
+        let response = self.send_with_retry(&request).await?;
         Ok(MessageStream {
             request_id: request_id_from_headers(response.headers()),
             response,
             parser: OpenAiSseParser::new(),
             pending: VecDeque::new(),
             done: false,
-            state: StreamState::new(request.model.clone()),
+            state: StreamState::new(request.model.clone(), self.config(), estimated_input_tokens),
         })
     }
 
@@ -339,10 +346,14 @@ struct StreamState {
     stop_reason: Option<String>,
     usage: Option<Usage>,
     tool_calls: BTreeMap<u32, ToolCallState>,
+    estimated_input_tokens: u32,
+    observed_output_bytes: usize,
+    thought_stripper: Option<ThoughtStripper>,
 }
 
 impl StreamState {
-    fn new(model: String) -> Self {
+    fn new(model: String, config: OpenAiCompatConfig, estimated_input_tokens: u32) -> Self {
+        let thought_stripper = is_google_gemma(config, &model).then(ThoughtStripper::default);
         Self {
             model,
             message_started: false,
@@ -352,7 +363,29 @@ impl StreamState {
             stop_reason: None,
             usage: None,
             tool_calls: BTreeMap::new(),
+            estimated_input_tokens,
+            observed_output_bytes: 0,
+            thought_stripper,
         }
+    }
+
+    fn push_visible_text(&mut self, text: String, events: &mut Vec<StreamEvent>) {
+        if text.is_empty() {
+            return;
+        }
+        if !self.text_started {
+            self.text_started = true;
+            events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                index: 0,
+                content_block: OutputContentBlock::Text {
+                    text: String::new(),
+                },
+            }));
+        }
+        events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+            index: 0,
+            delta: ContentBlockDelta::TextDelta { text },
+        }));
     }
 
     fn ingest_chunk(&mut self, chunk: ChatCompletionChunk) -> Result<Vec<StreamEvent>, ApiError> {
@@ -390,22 +423,20 @@ impl StreamState {
 
         for choice in chunk.choices {
             if let Some(content) = choice.delta.content.filter(|value| !value.is_empty()) {
-                if !self.text_started {
-                    self.text_started = true;
-                    events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
-                        index: 0,
-                        content_block: OutputContentBlock::Text {
-                            text: String::new(),
-                        },
-                    }));
-                }
-                events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
-                    index: 0,
-                    delta: ContentBlockDelta::TextDelta { text: content },
-                }));
+                self.observed_output_bytes =
+                    self.observed_output_bytes.saturating_add(content.len());
+                let visible = self
+                    .thought_stripper
+                    .as_mut()
+                    .map_or(content.clone(), |stripper| stripper.push(&content));
+                self.push_visible_text(visible, &mut events);
             }
 
             for tool_call in choice.delta.tool_calls {
+                self.observed_output_bytes = self
+                    .observed_output_bytes
+                    .saturating_add(tool_call.function.name.as_deref().map_or(0, str::len))
+                    .saturating_add(tool_call.function.arguments.as_deref().map_or(0, str::len));
                 let state = self.tool_calls.entry(tool_call.index).or_default();
                 state.apply(tool_call);
                 let block_index = state.block_index();
@@ -453,6 +484,10 @@ impl StreamState {
         self.finished = true;
 
         let mut events = Vec::new();
+        if let Some(stripper) = self.thought_stripper.as_mut() {
+            let visible = stripper.finish();
+            self.push_visible_text(visible, &mut events);
+        }
         if self.text_started && !self.text_finished {
             self.text_finished = true;
             events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
@@ -479,6 +514,16 @@ impl StreamState {
         }
 
         if self.message_started {
+            let usage = self
+                .usage
+                .clone()
+                .filter(|usage| !usage_is_empty(usage))
+                .unwrap_or_else(|| Usage {
+                    input_tokens: self.estimated_input_tokens,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                    output_tokens: estimate_tokens_from_bytes(self.observed_output_bytes),
+                });
             events.push(StreamEvent::MessageDelta(MessageDeltaEvent {
                 delta: MessageDelta {
                     stop_reason: Some(
@@ -488,17 +533,79 @@ impl StreamState {
                     ),
                     stop_sequence: None,
                 },
-                usage: self.usage.clone().unwrap_or(Usage {
-                    input_tokens: 0,
-                    cache_creation_input_tokens: 0,
-                    cache_read_input_tokens: 0,
-                    output_tokens: 0,
-                }),
+                usage,
             }));
             events.push(StreamEvent::MessageStop(MessageStopEvent {}));
         }
         Ok(events)
     }
+}
+
+const THOUGHT_OPEN: &str = "<thought>";
+const THOUGHT_CLOSE: &str = "</thought>";
+
+#[derive(Debug, Default)]
+struct ThoughtStripper {
+    pending: String,
+    inside_thought: bool,
+}
+
+impl ThoughtStripper {
+    fn push(&mut self, chunk: &str) -> String {
+        self.pending.push_str(chunk);
+        let mut visible = String::new();
+
+        loop {
+            let marker = if self.inside_thought {
+                THOUGHT_CLOSE
+            } else {
+                THOUGHT_OPEN
+            };
+            if let Some(index) = self.pending.find(marker) {
+                if !self.inside_thought {
+                    visible.push_str(&self.pending[..index]);
+                }
+                self.pending.drain(..index + marker.len());
+                self.inside_thought = !self.inside_thought;
+                continue;
+            }
+
+            let retained = partial_marker_suffix_len(&self.pending, marker);
+            let split_at = self.pending.len().saturating_sub(retained);
+            if self.inside_thought {
+                self.pending.drain(..split_at);
+            } else {
+                visible.push_str(&self.pending[..split_at]);
+                self.pending.drain(..split_at);
+            }
+            break;
+        }
+
+        visible
+    }
+
+    fn finish(&mut self) -> String {
+        if self.inside_thought {
+            self.pending.clear();
+            String::new()
+        } else {
+            std::mem::take(&mut self.pending)
+        }
+    }
+}
+
+fn partial_marker_suffix_len(value: &str, marker: &str) -> usize {
+    (1..marker.len())
+        .rev()
+        .find(|length| value.ends_with(&marker[..*length]))
+        .unwrap_or(0)
+}
+
+fn strip_thought_blocks(value: &str) -> String {
+    let mut stripper = ThoughtStripper::default();
+    let mut visible = stripper.push(value);
+    visible.push_str(&stripper.finish());
+    visible
 }
 
 #[derive(Debug, Default)]
@@ -691,6 +798,10 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
         payload["stream_options"] = json!({ "include_usage": true });
     }
 
+    if is_google_gemma(config, &request.model) {
+        payload["reasoning_effort"] = Value::String(google_reasoning_effort());
+    }
+
     if let Some(tools) = &request.tools {
         payload["tools"] =
             Value::Array(tools.iter().map(openai_tool_definition).collect::<Vec<_>>());
@@ -789,12 +900,50 @@ fn openai_tool_choice(tool_choice: &ToolChoice) -> Value {
 }
 
 fn should_request_stream_usage(config: OpenAiCompatConfig) -> bool {
-    matches!(config.provider_name, "OpenAI")
+    matches!(config.provider_name, "OpenAI" | "Google")
+}
+
+fn is_google_gemma(config: OpenAiCompatConfig, model: &str) -> bool {
+    config.provider_name == "Google" && model.to_ascii_lowercase().starts_with("gemma-4")
+}
+
+fn google_reasoning_effort() -> String {
+    match std::env::var("CLAW_GOOGLE_REASONING_EFFORT")
+        .unwrap_or_else(|_| "high".to_string())
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "minimal" => "minimal".to_string(),
+        _ => "high".to_string(),
+    }
+}
+
+fn estimate_request_tokens(request: &MessageRequest, config: OpenAiCompatConfig) -> u32 {
+    let bytes = serde_json::to_vec(&build_chat_completion_request(request, config))
+        .map_or(0, |payload| payload.len());
+    estimate_tokens_from_bytes(bytes)
+}
+
+fn estimate_tokens_from_bytes(bytes: usize) -> u32 {
+    if bytes == 0 {
+        return 0;
+    }
+    u32::try_from(bytes.saturating_add(3) / 4).unwrap_or(u32::MAX)
+}
+
+fn usage_is_empty(usage: &Usage) -> bool {
+    usage.input_tokens == 0
+        && usage.output_tokens == 0
+        && usage.cache_creation_input_tokens == 0
+        && usage.cache_read_input_tokens == 0
 }
 
 fn normalize_response(
     model: &str,
     response: ChatCompletionResponse,
+    config: OpenAiCompatConfig,
+    estimated_input_tokens: u32,
 ) -> Result<MessageResponse, ApiError> {
     let choice = response
         .choices
@@ -804,19 +953,43 @@ fn normalize_response(
             "chat completion response missing choices",
         ))?;
     let mut content = Vec::new();
-    if let Some(text) = choice.message.content.filter(|value| !value.is_empty()) {
+    let raw_text = choice.message.content.unwrap_or_default();
+    let mut observed_output_bytes = raw_text.len();
+    let text = if is_google_gemma(config, model) {
+        strip_thought_blocks(&raw_text)
+    } else {
+        raw_text
+    };
+    if !text.is_empty() {
         content.push(OutputContentBlock::Text { text });
     }
     for (idx, tool_call) in choice.message.tool_calls.into_iter().enumerate() {
-        let id = tool_call
-            .id
-            .unwrap_or_else(|| format!("tool_call_{idx}"));
+        observed_output_bytes = observed_output_bytes
+            .saturating_add(tool_call.function.name.len())
+            .saturating_add(tool_call.function.arguments.len());
+        let id = tool_call.id.unwrap_or_else(|| format!("tool_call_{idx}"));
         content.push(OutputContentBlock::ToolUse {
             id,
             name: tool_call.function.name,
             input: parse_tool_arguments(&tool_call.function.arguments),
         });
     }
+
+    let usage = response
+        .usage
+        .map(|usage| Usage {
+            input_tokens: usage.prompt_tokens,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            output_tokens: usage.completion_tokens,
+        })
+        .filter(|usage| !usage_is_empty(usage))
+        .unwrap_or_else(|| Usage {
+            input_tokens: estimated_input_tokens,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            output_tokens: estimate_tokens_from_bytes(observed_output_bytes),
+        });
 
     Ok(MessageResponse {
         id: response.id.unwrap_or_default(),
@@ -828,18 +1001,7 @@ fn normalize_response(
             .finish_reason
             .map(|value| normalize_finish_reason(&value)),
         stop_sequence: None,
-        usage: Usage {
-            input_tokens: response
-                .usage
-                .as_ref()
-                .map_or(0, |usage| usage.prompt_tokens),
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-            output_tokens: response
-                .usage
-                .as_ref()
-                .map_or(0, |usage| usage.completion_tokens),
-        },
+        usage,
         request_id: None,
     })
 }
@@ -985,7 +1147,8 @@ impl StringExt for String {
 mod tests {
     use super::{
         build_chat_completion_request, chat_completions_endpoint, normalize_finish_reason,
-        openai_tool_choice, parse_tool_arguments, OpenAiCompatClient, OpenAiCompatConfig,
+        openai_tool_choice, parse_tool_arguments, strip_thought_blocks, OpenAiCompatClient,
+        OpenAiCompatConfig, ThoughtStripper,
     };
     use crate::error::ApiError;
     use crate::types::{
@@ -1069,6 +1232,40 @@ mod tests {
         );
 
         assert!(payload.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn google_gemma_requests_usage_and_high_reasoning() {
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "gemma-4-31b-it".to_string(),
+                max_tokens: 64,
+                messages: vec![InputMessage::user_text("hello")],
+                system: None,
+                tools: None,
+                tool_choice: None,
+                stream: true,
+            },
+            OpenAiCompatConfig::google(),
+        );
+
+        assert_eq!(payload["stream_options"], json!({"include_usage": true}));
+        assert_eq!(payload["reasoning_effort"], json!("high"));
+    }
+
+    #[test]
+    fn strips_google_thought_tags_even_when_stream_markers_are_split() {
+        let mut stripper = ThoughtStripper::default();
+        let mut visible = stripper.push("<tho");
+        visible.push_str(&stripper.push("ught>private reasoning</thou"));
+        visible.push_str(&stripper.push("ght>public answer"));
+        visible.push_str(&stripper.finish());
+
+        assert_eq!(visible, "public answer");
+        assert_eq!(
+            strip_thought_blocks("before<thought>hidden</thought>after"),
+            "beforeafter"
+        );
     }
 
     #[test]
