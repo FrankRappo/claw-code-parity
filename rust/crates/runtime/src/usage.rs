@@ -58,6 +58,14 @@ impl UsageCostEstimate {
 #[must_use]
 pub fn pricing_for_model(model: &str) -> Option<ModelPricing> {
     let normalized = model.to_ascii_lowercase();
+    if normalized.starts_with("gemma-4") || matches!(normalized.as_str(), "gemma" | "gemma4") {
+        return Some(ModelPricing {
+            input_cost_per_million: 0.0,
+            output_cost_per_million: 0.0,
+            cache_creation_cost_per_million: 0.0,
+            cache_read_cost_per_million: 0.0,
+        });
+    }
     if normalized.contains("haiku") {
         return Some(ModelPricing {
             input_cost_per_million: 1.0,
@@ -276,6 +284,22 @@ mod tests {
         let opus_cost = usage.estimate_cost_usd_with_pricing(opus);
         assert_eq!(format_usd(haiku_cost.total_cost_usd()), "$3.5000");
         assert_eq!(format_usd(opus_cost.total_cost_usd()), "$52.5000");
+    }
+
+    #[test]
+    fn reports_hosted_gemma4_as_free() {
+        let usage = TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 500_000,
+            cache_creation_input_tokens: 100_000,
+            cache_read_input_tokens: 200_000,
+        };
+        let pricing = pricing_for_model("gemma-4-31b-it").expect("Gemma 4 pricing");
+        let cost = usage.estimate_cost_usd_with_pricing(pricing);
+        assert_eq!(format_usd(cost.total_cost_usd()), "$0.0000");
+        let lines = usage.summary_lines_for_model("usage", Some("gemma-4-31b-it"));
+        assert!(lines[0].contains("estimated_cost=$0.0000"));
+        assert!(!lines[0].contains("pricing=estimated-default"));
     }
 
     #[test]

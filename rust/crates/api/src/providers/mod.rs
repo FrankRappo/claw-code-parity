@@ -383,7 +383,7 @@ pub fn max_tokens_for_model(model: &str) -> u32 {
         return std::env::var("CLAW_GEMMA_MAX_OUTPUT_TOKENS")
             .ok()
             .and_then(|value| value.parse::<u32>().ok())
-            .unwrap_or(4_096);
+            .map_or(8_192, |value| value.clamp(1_024, 32_768));
     }
     if canonical.contains("opus") {
         32_000
@@ -416,5 +416,6 @@ mod tests {
     fn keeps_existing_max_token_heuristic() {
         assert_eq!(max_tokens_for_model("opus"), 32_000);
         assert_eq!(max_tokens_for_model("grok-3"), 64_000);
+        assert_eq!(max_tokens_for_model("gemma4"), 8_192);
     }
 }

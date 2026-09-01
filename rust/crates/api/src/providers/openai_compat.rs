@@ -21,9 +21,9 @@ pub const DEFAULT_GOOGLE_BASE_URL: &str =
 pub const DEFAULT_GROQ_BASE_URL: &str = "https://api.groq.com/openai/v1";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
-const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
-const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(2);
-const DEFAULT_MAX_RETRIES: u32 = 2;
+const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(500);
+const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(8);
+const DEFAULT_MAX_RETRIES: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenAiCompatConfig {
