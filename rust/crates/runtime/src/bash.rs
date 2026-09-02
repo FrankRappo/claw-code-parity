@@ -1,5 +1,5 @@
 use std::env;
-use std::io;
+use std::io::{self, Write};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -18,6 +18,7 @@ use crate::ConfigLoader;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BashCommandInput {
     pub command: String,
+    pub stdin: Option<String>,
     pub timeout: Option<u64>,
     pub description: Option<String>,
     #[serde(rename = "run_in_background")]
@@ -73,11 +74,20 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
 
     if input.run_in_background.unwrap_or(false) {
         let mut child = prepare_command(&input.command, &cwd, &sandbox_status, false);
-        let child = child
-            .stdin(Stdio::null())
+        child
+            .stdin(if input.stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
+            .stderr(Stdio::null());
+        let mut child = child.spawn()?;
+        if let (Some(stdin_data), Some(mut child_stdin)) =
+            (input.stdin.as_deref(), child.stdin.take())
+        {
+            child_stdin.write_all(stdin_data.as_bytes())?;
+        }
 
         return Ok(BashCommandOutput {
             stdout: String::new(),
@@ -108,11 +118,27 @@ async fn execute_bash_async(
     cwd: std::path::PathBuf,
 ) -> io::Result<BashCommandOutput> {
     let mut command = prepare_tokio_command(&input.command, &cwd, &sandbox_status, true);
+    let stdin_data = input.stdin.as_deref();
 
     let output_result = if let Some(timeout_ms) = input.timeout {
-        match timeout(Duration::from_millis(timeout_ms), command.output()).await {
+        command
+            .stdin(if stdin_data.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_timeout_process(&mut command);
+        let mut child = command.spawn()?;
+        write_tokio_stdin(&mut child, stdin_data).await?;
+        let process_id = child.id();
+        match timeout(Duration::from_millis(timeout_ms), child.wait_with_output()).await {
             Ok(result) => (result?, false),
             Err(_) => {
+                if let Some(process_id) = process_id {
+                    terminate_process_tree(process_id);
+                }
                 return Ok(BashCommandOutput {
                     stdout: String::new(),
                     stderr: format!("Command exceeded timeout of {timeout_ms} ms"),
@@ -132,6 +158,14 @@ async fn execute_bash_async(
                 });
             }
         }
+    } else if stdin_data.is_some() {
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn()?;
+        write_tokio_stdin(&mut child, stdin_data).await?;
+        (child.wait_with_output().await?, false)
     } else {
         (command.output().await?, false)
     };
@@ -165,6 +199,18 @@ async fn execute_bash_async(
         persisted_output_size: None,
         sandbox_status: Some(sandbox_status),
     })
+}
+
+async fn write_tokio_stdin(
+    child: &mut tokio::process::Child,
+    stdin_data: Option<&str>,
+) -> io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    if let (Some(stdin_data), Some(mut child_stdin)) = (stdin_data, child.stdin.take()) {
+        child_stdin.write_all(stdin_data.as_bytes()).await?;
+    }
+    Ok(())
 }
 
 fn sandbox_status_for_input(input: &BashCommandInput, cwd: &std::path::Path) -> SandboxStatus {
@@ -236,6 +282,36 @@ fn prepare_tokio_command(
     prepared
 }
 
+#[cfg(unix)]
+fn configure_timeout_process(command: &mut TokioCommand) {
+    use std::os::unix::process::CommandExt;
+    command.as_std_mut().process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_timeout_process(_command: &mut TokioCommand) {}
+
+#[cfg(windows)]
+fn terminate_process_tree(process_id: u32) {
+    let _ = Command::new("taskkill")
+        .args(["/PID", &process_id.to_string(), "/T", "/F"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(unix)]
+fn terminate_process_tree(process_id: u32) {
+    let _ = Command::new("kill")
+        .args(["-KILL", "--", &format!("-{process_id}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(all(not(windows), not(unix)))]
+fn terminate_process_tree(_process_id: u32) {}
+
 fn prepare_sandbox_dirs(cwd: &std::path::Path) {
     let _ = std::fs::create_dir_all(cwd.join(".sandbox-home"));
     let _ = std::fs::create_dir_all(cwd.join(".sandbox-tmp"));
@@ -250,6 +326,7 @@ mod tests {
     fn executes_simple_command() {
         let output = execute_bash(BashCommandInput {
             command: String::from("printf 'hello'"),
+            stdin: None,
             timeout: Some(1_000),
             description: None,
             run_in_background: Some(false),
@@ -270,6 +347,7 @@ mod tests {
     fn disables_sandbox_when_requested() {
         let output = execute_bash(BashCommandInput {
             command: String::from("printf 'hello'"),
+            stdin: None,
             timeout: Some(1_000),
             description: None,
             run_in_background: Some(false),
@@ -282,6 +360,111 @@ mod tests {
         .expect("bash command should execute");
 
         assert!(!output.sandbox_status.expect("sandbox status").enabled);
+    }
+
+    #[test]
+    fn passes_stdin_to_foreground_command() {
+        let output = execute_bash(BashCommandInput {
+            command: String::from("cat"),
+            stdin: Some(String::from("STDIN_OK")),
+            timeout: Some(1_000),
+            description: None,
+            run_in_background: Some(false),
+            dangerously_disable_sandbox: Some(true),
+            namespace_restrictions: None,
+            isolate_network: None,
+            filesystem_mode: None,
+            allowed_mounts: None,
+        })
+        .expect("bash should accept stdin");
+
+        assert_eq!(output.stdout, "STDIN_OK");
+        assert!(!output.interrupted);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_terminates_descendant_processes() {
+        let pid_path =
+            std::env::temp_dir().join(format!("clawd-bash-timeout-child-{}", std::process::id()));
+        let command = format!(
+            "sleep 30 & child=$!; printf %s \"$child\" > '{}'; wait",
+            pid_path.display()
+        );
+        let output = execute_bash(BashCommandInput {
+            command,
+            stdin: None,
+            timeout: Some(100),
+            description: None,
+            run_in_background: Some(false),
+            dangerously_disable_sandbox: Some(true),
+            namespace_restrictions: None,
+            isolate_network: None,
+            filesystem_mode: None,
+            allowed_mounts: None,
+        })
+        .expect("bash timeout should return output");
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let child_pid = std::fs::read_to_string(&pid_path).expect("child pid file");
+        let child_pid = child_pid.trim();
+        let alive = std::process::Command::new("kill")
+            .args(["-0", child_pid])
+            .status()
+            .is_ok_and(|status| status.success());
+        if alive {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", child_pid])
+                .status();
+        }
+        let _ = std::fs::remove_file(pid_path);
+
+        assert!(output.interrupted);
+        assert!(!alive, "timed out bash descendant remained alive");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn timeout_terminates_windows_descendant_processes() {
+        let pid_path =
+            std::env::temp_dir().join(format!("clawd-bash-timeout-child-{}", std::process::id()));
+        let escaped_path = pid_path.display().to_string().replace('"', "`\"");
+        let command = format!(
+            "powershell -NoProfile -NonInteractive -Command '$PID | Set-Content \
+             -NoNewline \"{escaped_path}\"; Start-Sleep -Seconds 30'"
+        );
+        let output = execute_bash(BashCommandInput {
+            command,
+            stdin: None,
+            timeout: Some(500),
+            description: None,
+            run_in_background: Some(false),
+            dangerously_disable_sandbox: Some(true),
+            namespace_restrictions: None,
+            isolate_network: None,
+            filesystem_mode: None,
+            allowed_mounts: None,
+        })
+        .expect("bash timeout should return output");
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let child_pid = std::fs::read_to_string(&pid_path).expect("child pid file");
+        let child_pid = child_pid.trim();
+        let tasklist = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {child_pid}"), "/FO", "CSV", "/NH"])
+            .output()
+            .expect("tasklist");
+        let tasklist = String::from_utf8_lossy(&tasklist.stdout);
+        let alive = tasklist.lines().any(|line| line.contains(child_pid));
+        if alive {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", child_pid, "/T", "/F"])
+                .status();
+        }
+        let _ = std::fs::remove_file(pid_path);
+
+        assert!(output.interrupted);
+        assert!(!alive, "timed out bash descendant remained alive");
     }
 }
 

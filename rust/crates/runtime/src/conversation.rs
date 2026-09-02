@@ -304,6 +304,8 @@ where
         // post-turn-only behavior could submit an oversized request when the
         // provider context was smaller than the default compaction threshold.
         let pre_turn_auto_compaction = self.maybe_auto_compact_before_turn(&user_input);
+        let mut auto_compaction_removed_message_count =
+            pre_turn_auto_compaction.map_or(0, |event| event.removed_message_count);
         self.session
             .push_user_text(user_input)
             .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -321,6 +323,11 @@ where
                 );
                 self.record_turn_failed(iterations, &error);
                 return Err(error);
+            }
+            if iterations > 1 {
+                if let Some(event) = self.maybe_auto_compact_estimated_session() {
+                    auto_compaction_removed_message_count += event.removed_message_count;
+                }
             }
 
             let request = ApiRequest {
@@ -473,7 +480,15 @@ where
             }
         }
 
-        let auto_compaction = pre_turn_auto_compaction.or_else(|| self.maybe_auto_compact());
+        if auto_compaction_removed_message_count == 0 {
+            if let Some(event) = self.maybe_auto_compact() {
+                auto_compaction_removed_message_count += event.removed_message_count;
+            }
+        }
+        let auto_compaction =
+            (auto_compaction_removed_message_count > 0).then_some(AutoCompactionEvent {
+                removed_message_count: auto_compaction_removed_message_count,
+            });
 
         let summary = TurnSummary {
             assistant_messages,
@@ -537,6 +552,29 @@ where
             return None;
         }
 
+        self.session = result.compacted_session;
+        Some(AutoCompactionEvent {
+            removed_message_count: result.removed_message_count,
+        })
+    }
+
+    fn maybe_auto_compact_estimated_session(&mut self) -> Option<AutoCompactionEvent> {
+        if estimate_session_tokens(&self.session)
+            < self.auto_compaction_input_tokens_threshold as usize
+        {
+            return None;
+        }
+
+        let result = compact_session(
+            &self.session,
+            CompactionConfig {
+                max_estimated_tokens: 0,
+                ..CompactionConfig::default()
+            },
+        );
+        if result.removed_message_count == 0 {
+            return None;
+        }
         self.session = result.compacted_session;
         Some(AutoCompactionEvent {
             removed_message_count: result.removed_message_count,
@@ -1605,6 +1643,62 @@ mod tests {
                 removed_message_count: 2,
             })
         );
+    }
+
+    #[test]
+    fn compacts_during_a_long_tool_loop_before_the_next_model_request() {
+        struct InspectApi {
+            calls: usize,
+        }
+
+        impl ApiClient for InspectApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    return Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-large".to_string(),
+                            name: "large".to_string(),
+                            input: "payload".to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                assert_eq!(request.messages[0].role, MessageRole::System);
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut session = Session::new();
+        session.messages = vec![
+            crate::session::ConversationMessage::user_text("old one"),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "old two".to_string(),
+            }]),
+            crate::session::ConversationMessage::user_text("old three"),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "old four".to_string(),
+            }]),
+        ];
+        let mut runtime = ConversationRuntime::new(
+            session,
+            InspectApi { calls: 0 },
+            StaticToolExecutor::new().register("large", |_| Ok("x".repeat(4_000))),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(100);
+
+        let summary = runtime
+            .run_turn("continue", None)
+            .expect("tool loop should continue after compaction");
+
+        assert!(summary
+            .auto_compaction
+            .is_some_and(|event| event.removed_message_count > 0));
     }
 
     #[test]

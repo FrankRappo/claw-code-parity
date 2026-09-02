@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -391,6 +392,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "command": { "type": "string" },
+                    "stdin": { "type": "string" },
                     "timeout": { "type": "integer", "minimum": 1 },
                     "description": { "type": "string" },
                     "run_in_background": { "type": "boolean" },
@@ -717,6 +719,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "command": { "type": "string" },
+                    "stdin": { "type": "string" },
                     "timeout": { "type": "integer", "minimum": 1 },
                     "description": { "type": "string" },
                     "run_in_background": { "type": "boolean" }
@@ -2171,6 +2174,7 @@ struct ReplInput {
 #[derive(Debug, Deserialize)]
 struct PowerShellInput {
     command: String,
+    stdin: Option<String>,
     timeout: Option<u64>,
     description: Option<String>,
     run_in_background: Option<bool>,
@@ -4764,6 +4768,7 @@ fn execute_powershell(input: PowerShellInput) -> std::io::Result<runtime::BashCo
         &input.command,
         input.timeout,
         input.run_in_background,
+        input.stdin.as_deref(),
     )
 }
 
@@ -4795,17 +4800,26 @@ fn execute_shell_command(
     command: &str,
     timeout: Option<u64>,
     run_in_background: Option<bool>,
+    stdin_data: Option<&str>,
 ) -> std::io::Result<runtime::BashCommandOutput> {
     if run_in_background.unwrap_or(false) {
-        let child = std::process::Command::new(shell)
+        let mut process = std::process::Command::new(shell);
+        process
             .arg("-NoProfile")
             .arg("-NonInteractive")
             .arg("-Command")
             .arg(command)
-            .stdin(std::process::Stdio::null())
+            .stdin(if stdin_data.is_some() {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::null()
+            })
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()?;
+            .stderr(std::process::Stdio::null());
+        let mut child = process.spawn()?;
+        if let (Some(stdin_data), Some(mut child_stdin)) = (stdin_data, child.stdin.take()) {
+            child_stdin.write_all(stdin_data.as_bytes())?;
+        }
         return Ok(runtime::BashCommandOutput {
             stdout: String::new(),
             stderr: String::new(),
@@ -4831,19 +4845,31 @@ fn execute_shell_command(
         .arg("-NonInteractive")
         .arg("-Command")
         .arg(command);
+    let capture = ShellOutputCapture::new()?;
     process
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stdin(if stdin_data.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
+        .stdout(capture.stdout_stdio()?)
+        .stderr(capture.stderr_stdio()?);
 
     if let Some(timeout_ms) = timeout {
+        configure_timeout_process(&mut process);
         let mut child = process.spawn()?;
+        if let (Some(stdin_data), Some(mut child_stdin)) = (stdin_data, child.stdin.take()) {
+            child_stdin.write_all(stdin_data.as_bytes())?;
+        }
         let started = Instant::now();
         loop {
             if let Some(status) = child.try_wait()? {
-                let output = child.wait_with_output()?;
+                let _ = child.wait();
+                let (stdout, stderr) = capture.read();
                 return Ok(runtime::BashCommandOutput {
-                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                    no_output_expected: Some(stdout.is_empty() && stderr.is_empty()),
+                    stdout,
+                    stderr,
                     raw_output_path: None,
                     interrupted: false,
                     is_image: None,
@@ -4855,7 +4881,6 @@ fn execute_shell_command(
                         .code()
                         .filter(|code| *code != 0)
                         .map(|code| format!("exit_code:{code}")),
-                    no_output_expected: Some(output.stdout.is_empty() && output.stderr.is_empty()),
                     structured_content: None,
                     persisted_output_path: None,
                     persisted_output_size: None,
@@ -4863,9 +4888,9 @@ fn execute_shell_command(
                 });
             }
             if started.elapsed() >= Duration::from_millis(timeout_ms) {
-                let _ = child.kill();
-                let output = child.wait_with_output()?;
-                let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                terminate_process_tree(&mut child);
+                let _ = child.wait();
+                let (stdout, stderr) = capture.read();
                 let stderr = if stderr.trim().is_empty() {
                     format!("Command exceeded timeout of {timeout_ms} ms")
                 } else {
@@ -4876,7 +4901,7 @@ Command exceeded timeout of {timeout_ms} ms",
                     )
                 };
                 return Ok(runtime::BashCommandOutput {
-                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                    stdout,
                     stderr,
                     raw_output_path: None,
                     interrupted: true,
@@ -4897,10 +4922,16 @@ Command exceeded timeout of {timeout_ms} ms",
         }
     }
 
-    let output = process.output()?;
+    let mut child = process.spawn()?;
+    if let (Some(stdin_data), Some(mut child_stdin)) = (stdin_data, child.stdin.take()) {
+        child_stdin.write_all(stdin_data.as_bytes())?;
+    }
+    let status = child.wait()?;
+    let (stdout, stderr) = capture.read();
     Ok(runtime::BashCommandOutput {
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        no_output_expected: Some(stdout.is_empty() && stderr.is_empty()),
+        stdout,
+        stderr,
         raw_output_path: None,
         interrupted: false,
         is_image: None,
@@ -4908,17 +4939,97 @@ Command exceeded timeout of {timeout_ms} ms",
         backgrounded_by_user: None,
         assistant_auto_backgrounded: None,
         dangerously_disable_sandbox: None,
-        return_code_interpretation: output
-            .status
+        return_code_interpretation: status
             .code()
             .filter(|code| *code != 0)
             .map(|code| format!("exit_code:{code}")),
-        no_output_expected: Some(output.stdout.is_empty() && output.stderr.is_empty()),
         structured_content: None,
         persisted_output_path: None,
         persisted_output_size: None,
         sandbox_status: None,
     })
+}
+
+static SHELL_OUTPUT_CAPTURE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+struct ShellOutputCapture {
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+}
+
+impl ShellOutputCapture {
+    fn new() -> std::io::Result<Self> {
+        let sequence = SHELL_OUTPUT_CAPTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let prefix = format!("claw-powershell-{}-{sequence}", std::process::id());
+        let directory = std::env::temp_dir();
+        let capture = Self {
+            stdout_path: directory.join(format!("{prefix}.stdout")),
+            stderr_path: directory.join(format!("{prefix}.stderr")),
+        };
+        std::fs::File::create(&capture.stdout_path)?;
+        std::fs::File::create(&capture.stderr_path)?;
+        Ok(capture)
+    }
+
+    fn stdout_stdio(&self) -> std::io::Result<std::process::Stdio> {
+        Ok(std::process::Stdio::from(std::fs::File::create(
+            &self.stdout_path,
+        )?))
+    }
+
+    fn stderr_stdio(&self) -> std::io::Result<std::process::Stdio> {
+        Ok(std::process::Stdio::from(std::fs::File::create(
+            &self.stderr_path,
+        )?))
+    }
+
+    fn read(&self) -> (String, String) {
+        (
+            std::fs::read_to_string(&self.stdout_path).unwrap_or_default(),
+            std::fs::read_to_string(&self.stderr_path).unwrap_or_default(),
+        )
+    }
+}
+
+impl Drop for ShellOutputCapture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.stdout_path);
+        let _ = std::fs::remove_file(&self.stderr_path);
+    }
+}
+
+#[cfg(unix)]
+fn configure_timeout_process(process: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    process.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_timeout_process(_process: &mut std::process::Command) {}
+
+#[cfg(windows)]
+fn terminate_process_tree(child: &mut std::process::Child) {
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &child.id().to_string(), "/T", "/F"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    let _ = child.kill();
+}
+
+#[cfg(unix)]
+fn terminate_process_tree(child: &mut std::process::Child) {
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", "--", &format!("-{}", child.id())])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    let _ = child.kill();
+}
+
+#[cfg(all(not(windows), not(unix)))]
+fn terminate_process_tree(child: &mut std::process::Child) {
+    let _ = child.kill();
 }
 
 fn resolve_cell_index(
@@ -6953,7 +7064,8 @@ mod tests {
             r#"#!/bin/sh
 while [ "$1" != "-Command" ] && [ $# -gt 0 ]; do shift; done
 shift
-printf 'pwsh:%s' "$1"
+input=$(cat)
+printf 'pwsh:%s:%s' "$1" "$input"
 "#,
         )
         .expect("write script");
@@ -6967,7 +7079,11 @@ printf 'pwsh:%s' "$1"
 
         let result = execute_tool(
             "PowerShell",
-            &json!({"command": "Write-Output hello", "timeout": 1000}),
+            &json!({
+                "command": "Write-Output hello",
+                "stdin": "STDIN_OK",
+                "timeout": 1000
+            }),
         )
         .expect("PowerShell should succeed");
 
@@ -6981,13 +7097,130 @@ printf 'pwsh:%s' "$1"
         let _ = std::fs::remove_dir_all(dir);
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
-        assert_eq!(output["stdout"], "pwsh:Write-Output hello");
+        assert_eq!(output["stdout"], "pwsh:Write-Output hello:STDIN_OK");
         assert!(output["stderr"].as_str().expect("stderr").is_empty());
 
         let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
         assert!(background_output["backgroundTaskId"].as_str().is_some());
         assert_eq!(background_output["backgroundedByUser"], true);
         assert_eq!(background_output["assistantAutoBackgrounded"], false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn powershell_timeout_terminates_descendants_holding_output_pipes() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = std::env::temp_dir().join(format!(
+            "clawd-pwsh-timeout-bin-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let script = dir.join("pwsh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+while [ "$1" != "-Command" ] && [ $# -gt 0 ]; do shift; done
+sleep 30 &
+wait
+"#,
+        )
+        .expect("write script");
+        std::process::Command::new("/bin/chmod")
+            .arg("+x")
+            .arg(&script)
+            .status()
+            .expect("chmod");
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{}", dir.display(), original_path));
+
+        let started = std::time::Instant::now();
+        let result = execute_tool("PowerShell", &json!({"command": "ignored", "timeout": 50}));
+        let elapsed = started.elapsed();
+
+        std::env::set_var("PATH", original_path);
+        let _ = std::fs::remove_dir_all(dir);
+
+        let result = result.expect("PowerShell timeout should return output");
+        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
+        assert_eq!(output["interrupted"], true);
+        assert_eq!(output["returnCodeInterpretation"], "timeout");
+        assert!(elapsed < std::time::Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn powershell_foreground_wrapper_does_not_wait_for_detached_child_output_handles() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = std::env::temp_dir().join(format!(
+            "clawd-pwsh-detached-bin-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let child_pid_path = dir.join("child.pid");
+        let script = dir.join("pwsh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nsleep 30 &\nprintf %s \"$!\" > '{}'\n",
+                child_pid_path.display()
+            ),
+        )
+        .expect("write script");
+        std::process::Command::new("/bin/chmod")
+            .arg("+x")
+            .arg(&script)
+            .status()
+            .expect("chmod");
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{}", dir.display(), original_path));
+
+        let started = std::time::Instant::now();
+        let result = execute_tool(
+            "PowerShell",
+            &json!({"command": "ignored", "timeout": 1_000}),
+        );
+        let elapsed = started.elapsed();
+
+        std::env::set_var("PATH", original_path);
+        let child_pid = std::fs::read_to_string(&child_pid_path).expect("child pid file");
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", child_pid.trim()])
+            .status();
+        let _ = std::fs::remove_dir_all(dir);
+
+        let result = result.expect("PowerShell wrapper should finish");
+        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
+        assert_eq!(output["interrupted"], false);
+        assert!(elapsed < std::time::Duration::from_secs(2));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_timeout_terminates_windows_process_tree() {
+        let command = concat!(
+            "$child=Start-Process powershell -NoNewWindow -PassThru ",
+            "-ArgumentList '-NoProfile','-NonInteractive','-Command',",
+            "'Start-Sleep -Seconds 30'; Wait-Process -Id $child.Id"
+        );
+        let started = std::time::Instant::now();
+        let result = execute_tool("PowerShell", &json!({"command": command, "timeout": 200}))
+            .expect("PowerShell timeout should return output");
+        let elapsed = started.elapsed();
+        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
+
+        assert_eq!(output["interrupted"], true);
+        assert_eq!(output["returnCodeInterpretation"], "timeout");
+        assert!(elapsed < std::time::Duration::from_secs(5));
     }
 
     #[test]
