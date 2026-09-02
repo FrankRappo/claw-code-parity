@@ -17,12 +17,13 @@ use std::io::{self, Read, Write};
 use std::net::TcpListener;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use api::{
     resolve_startup_auth_source, AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock,
     InputMessage, MessageRequest, MessageResponse, OutputContentBlock, PromptCache,
@@ -1845,7 +1846,10 @@ fn run_repl(
                     }
                 }
                 editor.push_history(input);
-                cli.run_turn(&trimmed)?;
+                if let Err(error) = cli.run_turn(&trimmed) {
+                    eprintln!("Request failed; the interactive session remains open: {error}");
+                    cli.persist_session()?;
+                }
             }
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Exit => {
@@ -1921,10 +1925,13 @@ impl BuiltRuntime {
     }
 
     fn with_hook_abort_signal(mut self, hook_abort_signal: runtime::HookAbortSignal) -> Self {
-        let runtime = self
+        let mut runtime = self
             .runtime
             .take()
             .expect("runtime should exist before installing hook abort signal");
+        runtime
+            .api_client_mut()
+            .set_abort_signal(hook_abort_signal.clone());
         self.runtime = Some(runtime.with_hook_abort_signal(hook_abort_signal));
         self
     }
@@ -2305,6 +2312,37 @@ fn mcp_annotation_flag(tool: &McpTool, key: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn terminate_turn_child_processes() {
+    #[cfg(windows)]
+    {
+        let parent_id = std::process::id();
+        let script = format!(
+            concat!(
+                "$parent={}; Get-CimInstance Win32_Process | ",
+                "Where-Object {{ $_.ParentProcessId -eq $parent -and $_.ProcessId -ne $PID }} | ",
+                "ForEach-Object {{ taskkill.exe /PID $_.ProcessId /T /F 2>$null | Out-Null }}"
+            ),
+            parent_id
+        );
+        let _ = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+
+    #[cfg(unix)]
+    {
+        let _ = Command::new("pkill")
+            .args(["-TERM", "-P", &std::process::id().to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
 struct HookAbortMonitor {
     stop_tx: Option<Sender<()>>,
     join_handle: Option<JoinHandle<()>>,
@@ -2313,27 +2351,25 @@ struct HookAbortMonitor {
 impl HookAbortMonitor {
     fn spawn(abort_signal: runtime::HookAbortSignal) -> Self {
         Self::spawn_with_waiter(abort_signal, move |stop_rx, abort_signal| {
-            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            else {
-                return;
-            };
-
-            runtime.block_on(async move {
-                let wait_for_stop = tokio::task::spawn_blocking(move || {
-                    let _ = stop_rx.recv();
-                });
-
-                tokio::select! {
-                    result = tokio::signal::ctrl_c() => {
-                        if result.is_ok() {
-                            abort_signal.abort();
+            loop {
+                match stop_rx.try_recv() {
+                    Ok(()) | Err(TryRecvError::Disconnected) => return,
+                    Err(TryRecvError::Empty) => {}
+                }
+                match event::poll(Duration::from_millis(50)) {
+                    Ok(true) => {
+                        if let Ok(Event::Key(key)) = event::read() {
+                            if key.code == KeyCode::Esc && key.kind == KeyEventKind::Press {
+                                abort_signal.abort();
+                                terminate_turn_child_processes();
+                                return;
+                            }
                         }
                     }
-                    _ = wait_for_stop => {}
+                    Ok(false) => {}
+                    Err(_) => thread::sleep(Duration::from_millis(50)),
                 }
-            });
+            }
         })
     }
 
@@ -2464,7 +2500,7 @@ impl LiveCli {
   \x1b[2mDirectory\x1b[0m        {}\n\
   \x1b[2mSession\x1b[0m          {}\n\
   \x1b[2mAuto-save\x1b[0m        {}\n\n\
-  Type \x1b[1m/help\x1b[0m for commands · \x1b[1m/status\x1b[0m for live context · \x1b[2m/resume latest\x1b[0m jumps back to the newest session · \x1b[1m/diff\x1b[0m then \x1b[1m/commit\x1b[0m to ship · \x1b[2mTab\x1b[0m for workflow completions · \x1b[2mShift+Enter\x1b[0m for newline",
+  Type \x1b[1m/help\x1b[0m for commands · \x1b[1m/status\x1b[0m for live context · \x1b[2m/resume latest\x1b[0m jumps back to the newest session · \x1b[1m/diff\x1b[0m then \x1b[1m/commit\x1b[0m to ship · \x1b[2mEsc\x1b[0m stops the active turn · \x1b[2mTab\x1b[0m for workflow completions · \x1b[2mShift+Enter\x1b[0m for newline",
             self.model,
             self.permission_mode.as_str(),
             git_branch,
@@ -2541,6 +2577,17 @@ impl LiveCli {
                         format_auto_compaction_notice(event.removed_message_count)
                     );
                 }
+                self.persist_session()?;
+                Ok(())
+            }
+            Err(error) if error.is_cancelled() => {
+                self.replace_runtime(runtime)?;
+                spinner.finish(
+                    "⏹ Turn stopped",
+                    TerminalRenderer::new().color_theme(),
+                    &mut stdout,
+                )?;
+                println!("\nEnter a correction or type `continue` to resume.");
                 self.persist_session()?;
                 Ok(())
             }
@@ -5123,6 +5170,7 @@ struct AnthropicRuntimeClient {
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
     progress_reporter: Option<InternalPromptProgressReporter>,
+    abort_signal: Option<runtime::HookAbortSignal>,
 }
 
 impl AnthropicRuntimeClient {
@@ -5161,7 +5209,12 @@ impl AnthropicRuntimeClient {
             allowed_tools,
             tool_registry,
             progress_reporter,
+            abort_signal: None,
         })
+    }
+
+    fn set_abort_signal(&mut self, abort_signal: runtime::HookAbortSignal) {
+        self.abort_signal = Some(abort_signal);
     }
 }
 
@@ -5173,6 +5226,12 @@ fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
         })?;
         Ok(config.oauth().cloned())
     })?)
+}
+
+async fn wait_for_turn_abort(abort_signal: runtime::HookAbortSignal) {
+    while !abort_signal.is_aborted() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 impl ApiClient for AnthropicRuntimeClient {
@@ -5192,13 +5251,22 @@ impl ApiClient for AnthropicRuntimeClient {
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
             stream: true,
         };
+        let abort_signal = self.abort_signal.clone();
 
         self.runtime.block_on(async {
-            let mut stream = self
-                .client
-                .stream_message(&message_request)
-                .await
-                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            let mut stream = if let Some(signal) = abort_signal.clone() {
+                tokio::select! {
+                    result = self.client.stream_message(&message_request) => {
+                        result.map_err(|error| RuntimeError::new(error.to_string()))?
+                    }
+                    () = wait_for_turn_abort(signal) => return Err(RuntimeError::cancelled()),
+                }
+            } else {
+                self.client
+                    .stream_message(&message_request)
+                    .await
+                    .map_err(|error| RuntimeError::new(error.to_string()))?
+            };
             let mut stdout = io::stdout();
             let mut sink = io::sink();
             let out: &mut dyn Write = if self.emit_output {
@@ -5212,11 +5280,23 @@ impl ApiClient for AnthropicRuntimeClient {
             let mut pending_tool: Option<(String, String, String)> = None;
             let mut saw_stop = false;
 
-            while let Some(event) = stream
-                .next_event()
-                .await
-                .map_err(|error| RuntimeError::new(error.to_string()))?
-            {
+            loop {
+                let next_event = if let Some(signal) = abort_signal.clone() {
+                    tokio::select! {
+                        result = stream.next_event() => {
+                            result.map_err(|error| RuntimeError::new(error.to_string()))?
+                        }
+                        () = wait_for_turn_abort(signal) => return Err(RuntimeError::cancelled()),
+                    }
+                } else {
+                    stream
+                        .next_event()
+                        .await
+                        .map_err(|error| RuntimeError::new(error.to_string()))?
+                };
+                let Some(event) = next_event else {
+                    break;
+                };
                 match event {
                     ApiStreamEvent::MessageStart(start) => {
                         for block in start.message.content {
@@ -5304,14 +5384,23 @@ impl ApiClient for AnthropicRuntimeClient {
                 return Ok(events);
             }
 
-            let response = self
-                .client
-                .send_message(&MessageRequest {
-                    stream: false,
-                    ..message_request.clone()
-                })
-                .await
-                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            let fallback_request = MessageRequest {
+                stream: false,
+                ..message_request.clone()
+            };
+            let response = if let Some(signal) = abort_signal {
+                tokio::select! {
+                    result = self.client.send_message(&fallback_request) => {
+                        result.map_err(|error| RuntimeError::new(error.to_string()))?
+                    }
+                    () = wait_for_turn_abort(signal) => return Err(RuntimeError::cancelled()),
+                }
+            } else {
+                self.client
+                    .send_message(&fallback_request)
+                    .await
+                    .map_err(|error| RuntimeError::new(error.to_string()))?
+            };
             let mut events = response_to_events(response, out)?;
             push_prompt_cache_record(&self.client, &mut events);
             Ok(events)

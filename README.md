@@ -36,7 +36,10 @@
 > [!NOTE]
 > This fork adds a recoverable non-interactive `resume + prompt` path, pre-turn
 > context compaction, a configurable Gemma output limit, and a persisted
-> Telegram project bridge. See
+> Telegram project bridge. Interactive request failures now return to the REPL,
+> and `Esc` cancels an active model/tool turn without assigning cancellation to
+> `Ctrl+C`. The Windows Kimi launcher also honors the gateway port stored in
+> `%LOCALAPPDATA%\KimiClawGateway\port.txt`. See
 > [`integrations/telegram/README.md`](./integrations/telegram/README.md).
 > The matching two-GPU Gemma runtime configuration and ordinary Gemma Telegram
 > bot live separately in

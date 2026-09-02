@@ -86,6 +86,7 @@ impl std::error::Error for ToolError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeError {
     message: String,
+    cancelled: bool,
 }
 
 impl RuntimeError {
@@ -93,7 +94,21 @@ impl RuntimeError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            cancelled: false,
         }
+    }
+
+    #[must_use]
+    pub fn cancelled() -> Self {
+        Self {
+            message: "turn cancelled by user".to_string(),
+            cancelled: true,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_cancelled(&self) -> bool {
+        self.cancelled
     }
 }
 
@@ -204,6 +219,10 @@ where
     pub fn with_hook_abort_signal(mut self, hook_abort_signal: HookAbortSignal) -> Self {
         self.hook_abort_signal = hook_abort_signal;
         self
+    }
+
+    pub fn api_client_mut(&mut self) -> &mut C {
+        &mut self.api_client
     }
 
     #[must_use]
@@ -317,6 +336,11 @@ where
 
         loop {
             iterations += 1;
+            if self.hook_abort_signal.is_aborted() {
+                let error = RuntimeError::cancelled();
+                self.record_turn_failed(iterations, &error);
+                return Err(error);
+            }
             if iterations > self.max_iterations {
                 let error = RuntimeError::new(
                     "conversation loop exceeded the maximum number of iterations",
@@ -374,11 +398,30 @@ where
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
             assistant_messages.push(assistant_message);
 
+            if self.hook_abort_signal.is_aborted() && pending_tool_uses.is_empty() {
+                let error = RuntimeError::cancelled();
+                self.record_turn_failed(iterations, &error);
+                return Err(error);
+            }
             if pending_tool_uses.is_empty() {
                 break;
             }
 
             for (tool_use_id, tool_name, input) in pending_tool_uses {
+                if self.hook_abort_signal.is_aborted() {
+                    let result_message = ConversationMessage::tool_result(
+                        tool_use_id,
+                        tool_name,
+                        "Cancelled by user",
+                        true,
+                    );
+                    self.session
+                        .push_message(result_message.clone())
+                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                    self.record_tool_finished(iterations, &result_message);
+                    tool_results.push(result_message);
+                    continue;
+                }
                 let pre_hook_result = self.run_pre_tool_use_hook(&tool_name, &input);
                 let effective_input = pre_hook_result
                     .updated_input()
@@ -861,6 +904,7 @@ mod tests {
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
+    use crate::hooks::HookAbortSignal;
     use crate::permissions::{
         PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
         PermissionRequest,
@@ -1838,6 +1882,39 @@ mod tests {
         assert!(error
             .to_string()
             .contains("conversation loop exceeded the maximum number of iterations"));
+    }
+
+    #[test]
+    fn aborted_turn_stops_before_calling_the_model() {
+        struct UnexpectedApi;
+
+        impl ApiClient for UnexpectedApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                panic!("cancelled turn must not call the model")
+            }
+        }
+
+        let abort_signal = HookAbortSignal::new();
+        abort_signal.abort();
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            UnexpectedApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_hook_abort_signal(abort_signal);
+
+        let error = runtime
+            .run_turn("cancel me", None)
+            .expect_err("aborted turn should return a cancellation error");
+
+        assert!(error.is_cancelled());
+        assert_eq!(error.to_string(), "turn cancelled by user");
+        assert_eq!(runtime.session().messages.len(), 1);
     }
 
     #[test]

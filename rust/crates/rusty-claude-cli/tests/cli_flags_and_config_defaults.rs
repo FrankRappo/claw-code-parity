@@ -1,13 +1,71 @@
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use runtime::Session;
 use serde_json::json;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[test]
+fn interactive_repl_stays_open_after_a_request_error() {
+    // given
+    let temp_dir = unique_temp_dir("repl-request-error");
+    let config_home = temp_dir.join("config-home");
+    let home = temp_dir.join("home");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&home).expect("home should exist");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("mock listener should bind");
+    let address = listener.local_addr().expect("mock address should resolve");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("request should arrive");
+        let mut request = [0_u8; 16_384];
+        let _ = stream.read(&mut request).expect("request should read");
+        let body = r#"{"error":{"message":"intentional test failure"}}"#;
+        write!(
+            stream,
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .expect("response should write");
+    });
+
+    // when
+    let mut child = Command::new(env!("CARGO_BIN_EXE_claw"))
+        .current_dir(&temp_dir)
+        .env("GROQ_API_KEY", "test-key")
+        .env("GROQ_BASE_URL", format!("http://{address}/v1"))
+        .env("CLAW_CONFIG_HOME", &config_home)
+        .env("HOME", &home)
+        .args(["--model", "kimi-repl-recovery"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("claw should launch");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin should be piped")
+        .write_all(b"hello\n/exit\n")
+        .expect("repl input should write");
+    let output = child
+        .wait_with_output()
+        .expect("claw should exit after /exit");
+    server.join().expect("mock server should finish");
+
+    // then
+    assert_success(&output);
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
+    assert!(stderr.contains("the interactive session remains open"));
+    fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+}
 
 #[test]
 fn status_command_applies_model_and_permission_mode_flags() {

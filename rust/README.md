@@ -148,6 +148,12 @@ For the current canonical help text, run `cargo run -p rusty-claude-cli -- --hel
 
 Tab completion expands slash commands, model aliases, permission modes, and recent session IDs.
 
+During an active model or tool turn, press `Esc` to cancel the turn, terminate
+its child processes, preserve the session, and return to the prompt. Enter a
+correction as the next user message or type `continue` to resume. `Ctrl+C` is
+not registered as the turn-cancellation key. A provider/request error is also
+recoverable inside the REPL instead of terminating the entire Claw process.
+
 | Command | Description |
 |---------|-------------|
 | `/help` | Show help |
