@@ -181,6 +181,36 @@ pub fn read_file(
 
     // Check file size before reading
     let metadata = fs::metadata(&absolute_path)?;
+    if metadata.is_dir() {
+        let mut entries = fs::read_dir(&absolute_path)?
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let metadata = entry.metadata().ok()?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                Some(if metadata.is_dir() {
+                    format!("DIR\t{name}")
+                } else {
+                    format!("FILE\t{}\t{name}", metadata.len())
+                })
+            })
+            .collect::<Vec<_>>();
+        entries.sort_unstable();
+        let total_lines = entries.len();
+        let start_index = offset.unwrap_or(0).min(total_lines);
+        let end_index = limit.map_or(total_lines, |limit| {
+            start_index.saturating_add(limit).min(total_lines)
+        });
+        return Ok(ReadFileOutput {
+            kind: String::from("directory"),
+            file: TextFilePayload {
+                file_path: absolute_path.to_string_lossy().into_owned(),
+                content: entries[start_index..end_index].join("\n"),
+                num_lines: end_index.saturating_sub(start_index),
+                start_line: start_index.saturating_add(1),
+                total_lines,
+            },
+        });
+    }
     if metadata.len() > MAX_READ_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -646,6 +676,21 @@ mod tests {
         let read_output = read_file(path.to_string_lossy().as_ref(), Some(1), Some(1))
             .expect("read should succeed");
         assert_eq!(read_output.file.content, "two");
+    }
+
+    #[test]
+    fn reading_a_directory_returns_a_sorted_listing() {
+        let root = temp_path("read-directory");
+        std::fs::create_dir_all(root.join("nested")).expect("create nested directory");
+        std::fs::write(root.join("README.md"), "hello").expect("write fixture");
+
+        let output = read_file(root.to_string_lossy().as_ref(), None, None)
+            .expect("directory listing should succeed");
+
+        assert_eq!(output.kind, "directory");
+        assert!(output.file.content.contains("DIR\tnested"));
+        assert!(output.file.content.contains("FILE\t5\tREADME.md"));
+        std::fs::remove_dir_all(root).expect("cleanup fixture");
     }
 
     #[test]

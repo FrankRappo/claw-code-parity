@@ -18,6 +18,7 @@ use std::net::TcpListener;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -66,6 +67,7 @@ const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
 const LEGACY_SESSION_EXTENSION: &str = "json";
 const LATEST_SESSION_REFERENCE: &str = "latest";
+static AGENT_MODE_ENABLED: AtomicBool = AtomicBool::new(false);
 const SESSION_REFERENCE_ALIASES: &[&str] = &[LATEST_SESSION_REFERENCE, "last", "recent"];
 const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--help",
@@ -1764,6 +1766,7 @@ fn run_resume_command(
         | SlashCommand::Resume { .. }
         | SlashCommand::Model { .. }
         | SlashCommand::Models
+        | SlashCommand::Agent { .. }
         | SlashCommand::Permissions { .. }
         | SlashCommand::Session { .. }
         | SlashCommand::Plugins { .. }
@@ -2709,6 +2712,10 @@ impl LiveCli {
                 println!("{}", format_models_list(&self.model));
                 false
             }
+            SlashCommand::Agent { mode } => {
+                Self::set_agent_mode(mode.as_deref());
+                false
+            }
             SlashCommand::Permissions { mode } => self.set_permissions(mode)?,
             SlashCommand::Clear { confirm } => self.clear_session(confirm)?,
             SlashCommand::Cost => {
@@ -2849,6 +2856,21 @@ impl LiveCli {
             "{}",
             format_sandbox_report(&resolve_sandbox_status(runtime_config.sandbox(), &cwd))
         );
+    }
+
+    fn set_agent_mode(mode: Option<&str>) {
+        match mode.unwrap_or("status") {
+            "on" => AGENT_MODE_ENABLED.store(true, Ordering::Relaxed),
+            "off" => AGENT_MODE_ENABLED.store(false, Ordering::Relaxed),
+            "status" => {}
+            _ => unreachable!("/agent mode is validated by the command parser"),
+        }
+        let status = if AGENT_MODE_ENABLED.load(Ordering::Relaxed) {
+            "on — require one real tool before allowing a text answer"
+        } else {
+            "off — Kimi chooses freely between discussion and tools"
+        };
+        println!("Agent mode: {status}");
     }
 
     fn set_model(&mut self, model: Option<String>) -> Result<bool, Box<dyn std::error::Error>> {
@@ -5240,6 +5262,8 @@ impl ApiClient for AnthropicRuntimeClient {
         if let Some(progress_reporter) = &self.progress_reporter {
             progress_reporter.mark_model_phase();
         }
+        let require_tool = AGENT_MODE_ENABLED.load(Ordering::Relaxed)
+            && should_require_tool_for_current_user(&request.messages);
         let message_request = MessageRequest {
             model: self.model.clone(),
             max_tokens: max_tokens_for_model(&self.model),
@@ -5248,7 +5272,11 @@ impl ApiClient for AnthropicRuntimeClient {
             tools: self
                 .enable_tools
                 .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
-            tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
+            tool_choice: self.enable_tools.then_some(if require_tool {
+                ToolChoice::Any
+            } else {
+                ToolChoice::Auto
+            }),
             stream: true,
         };
         let abort_signal = self.abort_signal.clone();
@@ -5406,6 +5434,21 @@ impl ApiClient for AnthropicRuntimeClient {
             Ok(events)
         })
     }
+}
+
+fn should_require_tool_for_current_user(messages: &[ConversationMessage]) -> bool {
+    let Some(latest_user_index) = messages
+        .iter()
+        .rposition(|message| message.role == MessageRole::User)
+    else {
+        return false;
+    };
+    !messages[latest_user_index + 1..].iter().any(|message| {
+        message
+            .blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+    })
 }
 
 fn final_assistant_text(summary: &runtime::TurnSummary) -> String {
@@ -6420,7 +6463,7 @@ mod tests {
         render_diff_report, render_diff_report_for, render_hook_list_report_for,
         render_memory_report, render_merged_runtime_config_json, render_repl_help,
         render_resume_usage, resolve_model_alias, resolve_session_reference, response_to_events,
-        resume_supported_slash_commands, run_resume_command,
+        resume_supported_slash_commands, run_resume_command, should_require_tool_for_current_user,
         slash_command_completion_candidates_with_sessions, status_context, validate_no_args,
         write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitBranchFreshness,
         GitCommitEntry, GitWorkspaceSummary, GitWorktreeEntry, InternalPromptProgressEvent,
@@ -8100,6 +8143,29 @@ UU conflicted.rs",
         assert_eq!(converted[1].role, "assistant");
         assert_eq!(converted[2].role, "user");
     }
+
+    #[test]
+    fn agent_mode_requires_one_tool_per_user_turn_then_allows_text() {
+        let mut messages = vec![ConversationMessage::user_text("inspect the project")];
+        assert!(should_require_tool_for_current_user(&messages));
+
+        messages.push(ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+            id: "tool-1".to_string(),
+            name: "PowerShell".to_string(),
+            input: "{\"command\":\"Get-ChildItem\"}".to_string(),
+        }]));
+        messages.push(ConversationMessage::tool_result(
+            "tool-1",
+            "PowerShell",
+            "ok",
+            false,
+        ));
+        assert!(!should_require_tool_for_current_user(&messages));
+
+        messages.push(ConversationMessage::user_text("perform another action"));
+        assert!(should_require_tool_for_current_user(&messages));
+    }
+
     #[test]
     fn repl_help_mentions_history_completion_and_multiline() {
         let help = render_repl_help();

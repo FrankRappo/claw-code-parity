@@ -16,4 +16,6 @@ for /f %%I in ('powershell.exe -NoProfile -Command "[guid]::NewGuid().ToString([
 set "HOME=%USERPROFILE%"
 set "GROQ_BASE_URL=http://127.0.0.1:%KIMI_GATEWAY_PORT%/v1"
 set "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS=16000"
+set "CLAW_BASH_BACKEND=wsl"
+set "CLAW_WSL_DISTRO=Ubuntu-24.04"
 "%~dp0rust\target\release\claw.exe" --model "kimi-k2d6-%KIMI_CLAW_SESSION%" --dangerously-skip-permissions %*

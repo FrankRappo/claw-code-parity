@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::{Mutex as StdMutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use api::{
     AnthropicClient, ApiClient, ApiError, AuthSource, ContentBlockDelta, ContentBlockDeltaEvent,
     ContentBlockStartEvent, InputContentBlock, InputMessage, MessageDeltaEvent, MessageRequest,
-    OutputContentBlock, PromptCache, PromptCacheConfig, ProviderClient, StreamEvent, ToolChoice,
-    ToolDefinition,
+    OpenAiCompatClient, OpenAiCompatConfig, OutputContentBlock, PromptCache, PromptCacheConfig,
+    ProviderClient, StreamEvent, ToolChoice, ToolDefinition,
 };
 use serde_json::json;
 use telemetry::{ClientIdentity, MemoryTelemetrySink, SessionTracer, TelemetryEvent};
@@ -385,6 +385,66 @@ async fn retries_retryable_failures_before_succeeding() {
 
     assert_eq!(response.total_tokens(), 5);
     assert_eq!(state.lock().await.len(), 2);
+}
+
+#[tokio::test]
+async fn openai_compat_honors_google_retry_info_delay() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let server = spawn_server(
+        state.clone(),
+        vec![
+            http_response(
+                "429 Too Many Requests",
+                "application/json",
+                concat!(
+                    "{\"error\":{",
+                    "\"code\":429,",
+                    "\"message\":\"quota exceeded\",",
+                    "\"status\":\"RESOURCE_EXHAUSTED\",",
+                    "\"details\":[{",
+                    "\"@type\":\"type.googleapis.com/google.rpc.RetryInfo\",",
+                    "\"retryDelay\":\"0.05s\"",
+                    "}]}}"
+                ),
+            ),
+            http_response(
+                "200 OK",
+                "application/json",
+                concat!(
+                    "{",
+                    "\"id\":\"chatcmpl_retry\",",
+                    "\"object\":\"chat.completion\",",
+                    "\"created\":1,",
+                    "\"model\":\"gemma-4-31b-it\",",
+                    "\"choices\":[{",
+                    "\"index\":0,",
+                    "\"message\":{\"role\":\"assistant\",\"content\":\"Recovered\"},",
+                    "\"finish_reason\":\"stop\"",
+                    "}],",
+                    "\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}",
+                    "}"
+                ),
+            ),
+        ],
+    )
+    .await;
+
+    let client = OpenAiCompatClient::new("test-key", OpenAiCompatConfig::google())
+        .with_base_url(server.base_url())
+        .with_retry_policy(1, Duration::from_millis(1), Duration::from_millis(2));
+    let started = Instant::now();
+
+    let response = client
+        .send_message(&sample_request(false))
+        .await
+        .expect("retry should honor Google cooldown and succeed");
+
+    assert_eq!(response.total_tokens(), 5);
+    assert_eq!(state.lock().await.len(), 2);
+    assert!(
+        started.elapsed() >= Duration::from_millis(40),
+        "server-directed retry delay should be honored"
+    );
 }
 
 #[tokio::test]

@@ -19,3 +19,5 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Prefer small, reviewable changes and keep generated bootstrap files aligned with actual repo workflows.
 - Keep shared defaults in `.claude.json`; reserve `.claude/settings.local.json` for machine-local overrides.
 - Do not overwrite existing `CLAUDE.md` content automatically; update it intentionally when repo workflows change.
+- On Windows, use PowerShell for `C:\...` and `\\wsl.localhost\...` paths. If the user supplies a local path and asks for inspection, use the available tools before answering; do not ask them to paste files that can be read locally.
+- Treat explicit read-only, no-click, no-submission, no-mutation, and no-process-start constraints as hard boundaries.

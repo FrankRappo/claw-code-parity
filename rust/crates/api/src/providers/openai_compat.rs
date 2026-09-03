@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
+use reqwest::header::RETRY_AFTER;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -197,13 +198,22 @@ impl OpenAiCompatClient {
 
         let last_error = loop {
             attempts += 1;
-            let retryable_error = match self.send_raw_request(request).await {
-                Ok(response) => match expect_success(response).await {
-                    Ok(response) => return Ok(response),
-                    Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => error,
-                    Err(error) => return Err(error),
-                },
-                Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => error,
+            let (retryable_error, server_retry_delay) = match self.send_raw_request(request).await {
+                Ok(response) => {
+                    let header_retry_delay = retry_delay_from_headers(response.headers());
+                    match expect_success(response).await {
+                        Ok(response) => return Ok(response),
+                        Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => {
+                            let retry_delay =
+                                header_retry_delay.max(retry_delay_from_api_error(&error));
+                            (error, retry_delay)
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => {
+                    (error, None)
+                }
                 Err(error) => return Err(error),
             };
 
@@ -211,7 +221,11 @@ impl OpenAiCompatClient {
                 break retryable_error;
             }
 
-            tokio::time::sleep(self.backoff_for_attempt(attempts)?).await;
+            let client_backoff = self.backoff_for_attempt(attempts)?;
+            let retry_delay = server_retry_delay.map_or(client_backoff, |server_delay| {
+                server_delay.max(client_backoff)
+            });
+            tokio::time::sleep(retry_delay).await;
         };
 
         Err(ApiError::RetriesExhausted {
@@ -1093,6 +1107,33 @@ fn request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Strin
         .map(ToOwned::to_owned)
 }
 
+fn retry_delay_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    headers
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+}
+
+fn retry_delay_from_api_error(error: &ApiError) -> Option<Duration> {
+    let ApiError::Api { body, .. } = error else {
+        return None;
+    };
+    let payload = serde_json::from_str::<Value>(body).ok()?;
+    payload
+        .pointer("/error/details")?
+        .as_array()?
+        .iter()
+        .filter_map(|detail| detail.get("retryDelay").and_then(Value::as_str))
+        .filter_map(parse_protobuf_duration)
+        .max()
+}
+
+fn parse_protobuf_duration(value: &str) -> Option<Duration> {
+    let seconds = value.trim().strip_suffix('s')?.parse::<f64>().ok()?;
+    Duration::try_from_secs_f64(seconds).ok()
+}
+
 async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response, ApiError> {
     let status = response.status();
     if status.is_success() {
@@ -1147,8 +1188,9 @@ impl StringExt for String {
 mod tests {
     use super::{
         build_chat_completion_request, chat_completions_endpoint, normalize_finish_reason,
-        openai_tool_choice, parse_tool_arguments, strip_thought_blocks, OpenAiCompatClient,
-        OpenAiCompatConfig, ThoughtStripper,
+        openai_tool_choice, parse_protobuf_duration, parse_tool_arguments,
+        retry_delay_from_api_error, retry_delay_from_headers, strip_thought_blocks,
+        OpenAiCompatClient, OpenAiCompatConfig, ThoughtStripper,
     };
     use crate::error::ApiError;
     use crate::types::{
@@ -1157,6 +1199,7 @@ mod tests {
     };
     use serde_json::json;
     use std::sync::{Mutex, OnceLock};
+    use std::time::Duration;
 
     #[test]
     fn request_translation_uses_openai_compatible_shape() {
@@ -1316,6 +1359,40 @@ mod tests {
         assert_eq!(
             chat_completions_endpoint("https://api.x.ai/v1/chat/completions"),
             "https://api.x.ai/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn parses_server_directed_retry_delays() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "17".parse().unwrap());
+        assert_eq!(
+            retry_delay_from_headers(&headers),
+            Some(Duration::from_secs(17))
+        );
+        assert_eq!(
+            parse_protobuf_duration("30.5s"),
+            Some(Duration::from_millis(30_500))
+        );
+
+        let error = ApiError::Api {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            error_type: None,
+            message: Some("quota exceeded".to_string()),
+            body: json!({
+                "error": {
+                    "details": [{
+                        "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                        "retryDelay": "30s"
+                    }]
+                }
+            })
+            .to_string(),
+            retryable: true,
+        };
+        assert_eq!(
+            retry_delay_from_api_error(&error),
+            Some(Duration::from_secs(30))
         );
     }
 

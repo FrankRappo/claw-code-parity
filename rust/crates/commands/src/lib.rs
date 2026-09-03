@@ -1000,9 +1000,9 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "agent",
         aliases: &[],
-        summary: "Manage sub-agents and spawned sessions",
-        argument_hint: Some("[list|spawn|kill]"),
-        resume_supported: true,
+        summary: "Toggle required-tool agent mode",
+        argument_hint: Some("[on|off|status]"),
+        resume_supported: false,
     },
     SlashCommandSpec {
         name: "subagent",
@@ -1066,6 +1066,9 @@ pub enum SlashCommand {
     DebugToolCall,
     Model {
         model: Option<String>,
+    },
+    Agent {
+        mode: Option<String>,
     },
     Permissions {
         mode: Option<String>,
@@ -1271,6 +1274,9 @@ pub fn validate_slash_command_input(
             validate_no_args(command, &args)?;
             SlashCommand::Models
         }
+        "agent" => SlashCommand::Agent {
+            mode: parse_agent_mode(&args)?,
+        },
         "permissions" => SlashCommand::Permissions {
             mode: parse_permissions_mode(&args)?,
         },
@@ -1476,6 +1482,21 @@ fn parse_permissions_mode(args: &[&str]) -> Result<Option<String>, SlashCommandP
         ));
     }
 
+    Ok(None)
+}
+
+fn parse_agent_mode(args: &[&str]) -> Result<Option<String>, SlashCommandParseError> {
+    let mode = optional_single_arg("agent", args, "[on|off|status]")?;
+    if let Some(mode) = mode {
+        if matches!(mode.as_str(), "on" | "off" | "status") {
+            return Ok(Some(mode));
+        }
+        return Err(command_error(
+            &format!("Unsupported /agent mode '{mode}'. Use on, off, or status."),
+            "agent",
+            "/agent [on|off|status]",
+        ));
+    }
     Ok(None)
 }
 
@@ -1790,7 +1811,7 @@ pub fn resume_supported_slash_commands() -> Vec<&'static SlashCommandSpec> {
 
 fn slash_command_category(name: &str) -> &'static str {
     match name {
-        "help" | "status" | "sandbox" | "model" | "permissions" | "cost" | "resume" | "session"
+        "help" | "status" | "sandbox" | "model" | "agent" | "permissions" | "cost" | "resume" | "session"
         | "version" | "login" | "logout" | "usage" | "stats" | "rename" | "privacy-settings" => {
             "Session & visibility"
         }
@@ -3205,6 +3226,7 @@ pub fn handle_slash_command(
         | SlashCommand::Sandbox
         | SlashCommand::Model { .. }
         | SlashCommand::Models
+        | SlashCommand::Agent { .. }
         | SlashCommand::Permissions { .. }
         | SlashCommand::Clear { .. }
         | SlashCommand::Cost
@@ -3447,6 +3469,16 @@ mod tests {
             Ok(Some(SlashCommand::Model { model: None }))
         );
         assert_eq!(
+            SlashCommand::parse("/agent on"),
+            Ok(Some(SlashCommand::Agent {
+                mode: Some("on".to_string()),
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/agent"),
+            Ok(Some(SlashCommand::Agent { mode: None }))
+        );
+        assert_eq!(
             SlashCommand::parse("/permissions read-only"),
             Ok(Some(SlashCommand::Permissions {
                 mode: Some("read-only".to_string()),
@@ -3572,6 +3604,13 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_agent_mode() {
+        let error = parse_error_message("/agent maybe");
+        assert!(error.contains("Unsupported /agent mode 'maybe'. Use on, off, or status."));
+        assert!(error.contains("  Usage            /agent [on|off|status]"));
+    }
+
+    #[test]
     fn rejects_invalid_argument_values() {
         // given
         let input = "/permissions admin";
@@ -3658,6 +3697,7 @@ mod tests {
         assert!(help.contains("[resume]          also works with --resume SESSION.jsonl"));
         assert!(help.contains("Session & visibility"));
         assert!(help.contains("Workspace & git"));
+        assert!(help.contains("/agent [on|off|status]"));
         assert!(help.contains("Discovery & debugging"));
         assert!(help.contains("Analysis & automation"));
         assert!(help.contains("/help"));

@@ -41,6 +41,9 @@
 > `Ctrl+C`. The Windows Kimi launcher also honors the gateway port stored in
 > `%LOCALAPPDATA%\KimiClawGateway\port.txt`. See
 > [`integrations/telegram/README.md`](./integrations/telegram/README.md).
+> Windows Gemma/Kimi operation, retry, agent-mode, and WSL-routing details are
+> documented in
+> [`docs/WINDOWS_GEMMA_KIMI_OPERATIONS.md`](./docs/WINDOWS_GEMMA_KIMI_OPERATIONS.md).
 > The matching two-GPU Gemma runtime configuration and ordinary Gemma Telegram
 > bot live separately in
 > [`FrankRappo/gemma4-amd-vulkan-ops`](https://github.com/FrankRappo/gemma4-amd-vulkan-ops).

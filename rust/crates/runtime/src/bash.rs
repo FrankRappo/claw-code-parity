@@ -246,8 +246,7 @@ fn prepare_command(
         return prepared;
     }
 
-    let mut prepared = Command::new("sh");
-    prepared.arg("-lc").arg(command).current_dir(cwd);
+    let mut prepared = prepare_shell_command(command, cwd);
     if sandbox_status.filesystem_active {
         prepared.env("HOME", cwd.join(".sandbox-home"));
         prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
@@ -273,13 +272,54 @@ fn prepare_tokio_command(
         return prepared;
     }
 
-    let mut prepared = TokioCommand::new("sh");
-    prepared.arg("-lc").arg(command).current_dir(cwd);
+    let mut prepared = TokioCommand::from(prepare_shell_command(command, cwd));
     if sandbox_status.filesystem_active {
         prepared.env("HOME", cwd.join(".sandbox-home"));
         prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
     }
     prepared
+}
+
+fn prepare_shell_command(command: &str, cwd: &std::path::Path) -> Command {
+    #[cfg(windows)]
+    if env::var("CLAW_BASH_BACKEND").is_ok_and(|value| value.eq_ignore_ascii_case("wsl")) {
+        let distro = env::var("CLAW_WSL_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string());
+        let mut prepared = Command::new("wsl.exe");
+        prepared.args(["--distribution", &distro]);
+        if let Some(wsl_cwd) = windows_path_to_wsl(cwd) {
+            prepared.args(["--cd", &wsl_cwd]);
+        }
+        prepared
+            .args(["--exec", "bash", "-lc", command])
+            .current_dir(cwd);
+        return prepared;
+    }
+
+    let mut prepared = Command::new("sh");
+    prepared.arg("-lc").arg(command).current_dir(cwd);
+    prepared
+}
+
+#[cfg(windows)]
+fn windows_path_to_wsl(path: &std::path::Path) -> Option<String> {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    for prefix in ["//wsl.localhost/", "//wsl$/"] {
+        if let Some(remainder) = normalized.strip_prefix(prefix) {
+            let (_, linux_path) = remainder.split_once('/')?;
+            return Some(format!("/{}", linux_path.trim_start_matches('/')));
+        }
+    }
+    let bytes = normalized.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        let drive = char::from(bytes[0]).to_ascii_lowercase();
+        let remainder = normalized[2..].trim_start_matches('/');
+        return Some(if remainder.is_empty() {
+            format!("/mnt/{drive}")
+        } else {
+            format!("/mnt/{drive}/{remainder}")
+        });
+    }
+    None
 }
 
 #[cfg(unix)]
@@ -320,7 +360,24 @@ fn prepare_sandbox_dirs(cwd: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::{execute_bash, BashCommandInput};
+    #[cfg(windows)]
+    use super::windows_path_to_wsl;
     use crate::sandbox::FilesystemIsolationMode;
+
+    #[cfg(windows)]
+    #[test]
+    fn maps_windows_and_wsl_unc_working_directories_for_wsl_backend() {
+        assert_eq!(
+            windows_path_to_wsl(std::path::Path::new(r"C:\claw cod")),
+            Some("/mnt/c/claw cod".to_string())
+        );
+        assert_eq!(
+            windows_path_to_wsl(std::path::Path::new(
+                r"\\wsl.localhost\Ubuntu-24.04\work\project"
+            )),
+            Some("/work/project".to_string())
+        );
+    }
 
     #[test]
     fn executes_simple_command() {
