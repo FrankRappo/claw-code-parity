@@ -634,6 +634,7 @@ TOOL_RESULT_MARKER = "[TOOL_RESULT"
 FUNCTION_CALLS_PATTERN = re.compile(
     r"<function_calls>(?P<body>.*?)</function_calls>", re.IGNORECASE | re.DOTALL
 )
+FUNCTION_CALLS_OPEN_PATTERN = re.compile(r"<function_calls>", re.IGNORECASE)
 INVOKE_PATTERN = re.compile(
     r"<invoke\s+name=[\"'](?P<name>[A-Za-z_][A-Za-z0-9_.-]*)[\"']\s*>"
     r"(?P<body>.*?)</invoke>",
@@ -679,30 +680,7 @@ def _parse_tool_arguments(raw: str) -> dict[str, Any]:
     raise ValueError("Kimi returned invalid JSON tool arguments")
 
 
-def _parse_openai_style_tool_calls(raw: str) -> tuple[list[ParsedToolCall], str] | None:
-    marker_at = raw.find(OPENAI_TOOL_CALLS_MARKER)
-    if marker_at < 0:
-        return None
-    candidate = raw[marker_at + len(OPENAI_TOOL_CALLS_MARKER) :].lstrip()
-    try:
-        value, consumed = json.JSONDecoder().raw_decode(candidate)
-    except json.JSONDecodeError:
-        repaired_candidate = re.sub(
-            r"}\s*,\s*{\"function\"\s*:",
-            r'}},{"function":',
-            candidate,
-        )
-        stripped = repaired_candidate.rstrip()
-        if stripped.endswith("}]") and not stripped.endswith("}}]"):
-            repaired_candidate = stripped[:-1] + "}]"
-        try:
-            value, consumed = json.JSONDecoder().raw_decode(repaired_candidate)
-            candidate = repaired_candidate
-        except json.JSONDecodeError:
-            return None
-    if not isinstance(value, list):
-        return None
-
+def _parse_openai_tool_call_items(value: list[Any]) -> list[ParsedToolCall]:
     calls: list[ParsedToolCall] = []
     for item in value:
         if not isinstance(item, dict) or not isinstance(item.get("function"), dict):
@@ -727,6 +705,55 @@ def _parse_openai_style_tool_calls(raw: str) -> tuple[list[ParsedToolCall], str]
                 arguments=arguments,
             )
         )
+    return calls
+
+
+def _repair_unescaped_openai_function_array(raw: str) -> list[ParsedToolCall]:
+    """Repair Kimi's observed JSON wrapper while keeping inner arguments strict."""
+    match = re.fullmatch(
+        r'\s*\[\s*\{\s*"function"\s*:\s*\{\s*'
+        r'"arguments"\s*:\s*"(?P<arguments>\{.*\})"\s*,\s*'
+        r'"name"\s*:\s*"(?P<name>[A-Za-z_][A-Za-z0-9_.-]*)"\s*'
+        r'\}\s*\}?\s*\]\s*',
+        raw,
+        re.DOTALL,
+    )
+    if not match:
+        return []
+    return [
+        ParsedToolCall(
+            id=f"call_{uuid.uuid4().hex}",
+            name=match.group("name"),
+            arguments=_parse_tool_arguments(match.group("arguments")),
+        )
+    ]
+
+
+def _parse_openai_style_tool_calls(raw: str) -> tuple[list[ParsedToolCall], str] | None:
+    marker_at = raw.find(OPENAI_TOOL_CALLS_MARKER)
+    if marker_at < 0:
+        return None
+    candidate = raw[marker_at + len(OPENAI_TOOL_CALLS_MARKER) :].lstrip()
+    try:
+        value, consumed = json.JSONDecoder().raw_decode(candidate)
+    except json.JSONDecodeError:
+        repaired_candidate = re.sub(
+            r"}\s*,\s*{\"function\"\s*:",
+            r'}},{"function":',
+            candidate,
+        )
+        stripped = repaired_candidate.rstrip()
+        if stripped.endswith("}]") and not stripped.endswith("}}]"):
+            repaired_candidate = stripped[:-1] + "}]"
+        try:
+            value, consumed = json.JSONDecoder().raw_decode(repaired_candidate)
+            candidate = repaired_candidate
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(value, list):
+        return None
+
+    calls = _parse_openai_tool_call_items(value)
 
     prefix = raw[:marker_at].rstrip()
     tail = candidate[consumed:].strip()
@@ -761,9 +788,21 @@ def _parse_native_device_tool_calls(
     raw: str,
 ) -> tuple[list[ParsedToolCall], str] | None:
     function_section = FUNCTION_CALLS_PATTERN.search(raw)
+    open_function_section = None
     if function_section:
+        section_start = function_section.start()
+        section_body = function_section.group("body")
+    else:
+        open_function_section = FUNCTION_CALLS_OPEN_PATTERN.search(raw)
+        if open_function_section:
+            section_start = open_function_section.start()
+            section_body = raw[open_function_section.end() :]
+        else:
+            section_start = -1
+            section_body = ""
+    if section_start >= 0:
         calls: list[ParsedToolCall] = []
-        for invoke in INVOKE_PATTERN.finditer(function_section.group("body")):
+        for invoke in INVOKE_PATTERN.finditer(section_body):
             arguments = {
                 parameter.group("name"): _parse_native_parameter(
                     parameter.group("value")
@@ -777,8 +816,17 @@ def _parse_native_device_tool_calls(
                     arguments=arguments,
                 )
             )
+        if not calls:
+            try:
+                json_value, _ = json.JSONDecoder().raw_decode(section_body.lstrip())
+            except json.JSONDecodeError:
+                json_value = None
+            if isinstance(json_value, list):
+                calls = _parse_openai_tool_call_items(json_value)
+            else:
+                calls = _repair_unescaped_openai_function_array(section_body)
         if calls:
-            prefix = ANT_THINKING_PATTERN.sub("", raw[: function_section.start()]).strip()
+            prefix = ANT_THINKING_PATTERN.sub("", raw[:section_start]).strip()
             return calls, prefix
 
     generic = GENERIC_DEVICE_TOOL_PATTERN.search(raw)

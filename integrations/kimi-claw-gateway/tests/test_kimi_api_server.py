@@ -1623,6 +1623,50 @@ class ToolCallParsingTests(unittest.TestCase):
             'cmd /c "echo test > out.txt && type out.txt"',
         )
 
+    def test_native_function_section_accepts_openai_json_call_array(self):
+        raw = (
+            "I will run the bounded probe.\n"
+            '<function_calls>[{"function":{"arguments":'
+            '"{\\"command\\":\\"Get-Location\\",\\"timeout\\":45000}",'
+            '"name":"PowerShell"}}]</function_calls>\n'
+            "The probe succeeded without being executed."
+        )
+        parsed = kimi.parse_assistant_output(raw)
+        self.assertEqual(parsed.text, "I will run the bounded probe.")
+        self.assertEqual(len(parsed.tool_calls), 1)
+        self.assertEqual(parsed.tool_calls[0].name, "PowerShell")
+        self.assertEqual(
+            parsed.tool_calls[0].arguments,
+            {"command": "Get-Location", "timeout": 45000},
+        )
+
+    def test_native_function_section_accepts_complete_json_without_closing_tag(self):
+        raw = (
+            "<function_calls>\n"
+            '[{"function":{"arguments":"{\\"command\\":\\"Get-Location\\"}",'
+            '"name":"PowerShell"}}]'
+        )
+        parsed = kimi.parse_assistant_output(raw)
+        self.assertEqual(parsed.text, "")
+        self.assertEqual(len(parsed.tool_calls), 1)
+        self.assertEqual(parsed.tool_calls[0].name, "PowerShell")
+        self.assertEqual(parsed.tool_calls[0].arguments, {"command": "Get-Location"})
+
+    def test_native_function_section_repairs_unescaped_arguments_wrapper(self):
+        raw = (
+            '<function_calls>[{"function":{"arguments":"'
+            '{"command":"Write-Host \\"READY\\"","timeout":45000}'
+            '","name":"PowerShell"}]</function_calls>'
+        )
+        parsed = kimi.parse_assistant_output(raw)
+        self.assertEqual(parsed.text, "")
+        self.assertEqual(len(parsed.tool_calls), 1)
+        self.assertEqual(parsed.tool_calls[0].name, "PowerShell")
+        self.assertEqual(
+            parsed.tool_calls[0].arguments,
+            {"command": 'Write-Host "READY"', "timeout": 45000},
+        )
+
     def test_parses_native_bash_block(self):
         parsed = kimi.parse_assistant_output(
             "<antThinking>run it</antThinking><bash>echo NATIVE_OK</bash>fake result"

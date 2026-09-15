@@ -218,6 +218,16 @@ results returned by Claw are rendered into the next Kimi request so multi-turn
 tool loops can continue. Invalid JSON, invalid tool names, and simulated textual
 tool calls are not treated as successful execution.
 
+The native parser accepts both observed `function_calls` bodies: XML-style
+`<invoke name="Tool">` elements and an OpenAI-compatible JSON call array wrapped
+by `<function_calls>...</function_calls>`. A complete JSON array after the opening
+tag is also accepted when Kimi omits the final closing tag. In either complete
+form, trailing text is discarded as an untrusted simulated result; the live
+Claw registry and argument schema are still validated before execution.
+The narrowly observed variant where Kimi leaves the inner `arguments` object
+unescaped inside that wrapper is repaired only when the complete single-call
+shape and a syntactically valid inner JSON object are present.
+
 Explicit tool choices from the client remain hard protocol requirements. For
 normal `tool_choice=auto` turns, Kimi alone decides whether to answer or call a
 tool. The gateway performs no semantic task classification, completion decision,
