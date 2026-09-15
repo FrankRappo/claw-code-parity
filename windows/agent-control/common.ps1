@@ -18,7 +18,7 @@ function Get-ClawControlStateDir {
 function Initialize-ClawControlState {
     param([Parameter(Mandatory)][string]$StateDir)
 
-    foreach ($relative in @('queue', 'processing', 'delivered', 'failed', 'messages', 'acks')) {
+    foreach ($relative in @('queue', 'processing', 'delivered', 'failed', 'messages', 'acks', 'completion')) {
         New-Item -ItemType Directory -Force -Path (Join-Path $StateDir $relative) | Out-Null
     }
 }
@@ -76,30 +76,38 @@ function New-ClawControlRequest {
     $id = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssfffZ') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
     $messageRelativePath = $null
     $messagePath = $null
+    $completionMarkerPath = $null
+    $effectiveMessage = $Message
 
     if ($Kind -eq 'instruction') {
         if ([string]::IsNullOrWhiteSpace($Message)) { throw 'Instruction message cannot be empty.' }
+        $controlConfig = Read-ClawJson -Path (Join-Path $StateDir 'config.json')
+        if ($controlConfig -and $controlConfig.auto_continue -eq $true) {
+            $completionMarkerPath = [System.IO.Path]::GetFullPath((Join-Path $StateDir "completion\$id.txt"))
+            $effectiveMessage = @"
+$Message
+
+AUTO-CONTINUE COMPLETION CONTRACT: do not claim completion merely because one tool ran. Continue tool work across turns. Only after every requested change is implemented and verification has actually passed, use a file-writing tool to write exactly COMPLETE $id to $completionMarkerPath. If an external blocker makes further safe progress impossible, write BLOCKED $id followed by the precise reason instead. Do not create this marker early.
+"@
+        }
         $messageRelativePath = ".claw\control\$((Split-Path $StateDir -Leaf))\messages\$id.md"
         $messagePath = [System.IO.Path]::GetFullPath((Join-Path $StateDir "messages\$id.md"))
-        $ackPath = [System.IO.Path]::GetFullPath((Join-Path $StateDir "acks\$id.txt"))
         $body = @"
 # ClawCod live correction
 
 - Message ID: $id
 - Received UTC: $((Get-Date).ToUniversalTime().ToString('o'))
-- ACK path: $ackPath
-
-Before continuing, use an available file-writing tool to create the ACK file above with the text ACK $id.
 
 Persistent orchestration rules:
 1. You have all ClawCod tools available; agent mode is ON and permissions were granted at launch. Use the tools needed to inspect, edit, run, and verify instead of claiming they are unavailable.
 2. This is a correction to the CURRENT task in the CURRENT ClawCod session. Do not restart the task, open a new chat/session, or repeat completed investigation.
 3. Treat newer control messages as authoritative for the affected branch of work, while preserving earlier non-conflicting requirements.
 4. Finish the requested work and verify it with tests or concrete runtime evidence before reporting completion.
+5. The controller records delivery automatically. Do not create ACK/receipt files and do not spend a tool call acknowledging this message; begin the operator correction itself immediately.
 
 ## Operator correction
 
-$Message
+$effectiveMessage
 "@
         Write-ClawAtomicText -Path $messagePath -Content $body
     }
@@ -109,9 +117,17 @@ $Message
         id = $id
         kind = $Kind
         mode = $Mode
-        message = if ($Kind -eq 'raw') { $Message } else { $null }
+        # Keep the instruction inline in the durable queue record as well as in
+        # messages/. The dispatcher injects this text directly into the console;
+        # making the model call read_file merely to discover its task lets that
+        # administrative read satisfy `/agent on` without doing project work.
+        message = if ($Kind -eq 'instruction') { $effectiveMessage } elseif ($Kind -eq 'raw') { $Message } else { $null }
         message_relative_path = $messageRelativePath
         message_path = $messagePath
+        completion_marker_path = $completionMarkerPath
+        delivery_receipt_path = if ($Kind -eq 'instruction') {
+            [System.IO.Path]::GetFullPath((Join-Path $StateDir "acks\$id.txt"))
+        } else { $null }
         created_at = (Get-Date).ToUniversalTime().ToString('o')
         status = 'queued'
         attempts = 0

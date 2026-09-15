@@ -12,6 +12,7 @@ $heartbeatPath = Join-Path $StateDir 'heartbeat.json'
 $screenPath = Join-Path $StateDir 'screen.txt'
 $snapshotPath = Join-Path $StateDir 'screen.json'
 $turnStatePath = Join-Path $StateDir 'turn-state.json'
+$activeTaskPath = Join-Path $StateDir 'active-task.json'
 $interruptSignalPath = Join-Path $StateDir 'interrupt.signal'
 $stopPath = Join-Path $StateDir 'dispatcher.stop'
 $config = Get-ClawControlConfig -StateDir $StateDir
@@ -112,6 +113,63 @@ function Request-ClawTurnInterrupt {
     Write-ClawAtomicText -Path $interruptSignalPath -Content ((Get-Date).ToUniversalTime().ToString('o'))
 }
 
+function Start-AutoContinueTask {
+    param($Request)
+    if ($config.auto_continue -ne $true) { return }
+    $markerPath = if ($Request.PSObject.Properties.Name -contains 'completion_marker_path') {
+        [string]$Request.completion_marker_path
+    } else { '' }
+    if ([string]::IsNullOrWhiteSpace($markerPath)) {
+        throw 'Auto-continue instruction has no completion marker path.'
+    }
+    Write-ClawAtomicJson -Path $activeTaskPath -Value ([ordered]@{
+        state = 'active'
+        request_id = [string]$Request.id
+        completion_marker_path = $markerPath
+        continuations = 0
+        last_submitted_at = (Get-Date).ToUniversalTime().ToString('o')
+    })
+}
+
+function Invoke-AutoContinue {
+    param($Snapshot)
+    if ($config.auto_continue -ne $true) { return }
+    $task = Read-ClawJson -Path $activeTaskPath
+    if (-not $task -or $task.state -ne 'active') { return }
+
+    $markerPath = [string]$task.completion_marker_path
+    if (Test-Path -LiteralPath $markerPath) {
+        $marker = (Get-Content -LiteralPath $markerPath -Raw -Encoding utf8).Trim()
+        if ($marker -match '^COMPLETE\s+' -or $marker -match '^BLOCKED\s+') {
+            $task.state = if ($marker -match '^COMPLETE\s+') { 'completed' } else { 'blocked' }
+            $task | Add-Member -NotePropertyName marker -NotePropertyValue $marker -Force
+            $task | Add-Member -NotePropertyName finished_at -NotePropertyValue ((Get-Date).ToUniversalTime().ToString('o')) -Force
+            Write-ClawAtomicJson -Path $activeTaskPath -Value $task
+        }
+        return
+    }
+    if (-not (Test-ClawIdle -Snapshot $Snapshot)) { return }
+
+    $lastSubmitted = [datetime]::Parse([string]$task.last_submitted_at).ToUniversalTime()
+    if (((Get-Date).ToUniversalTime() - $lastSubmitted).TotalSeconds -lt [int]$config.auto_continue_delay_seconds) { return }
+    if ([int]$task.continuations -ge [int]$config.auto_continue_max_turns) {
+        $task.state = 'exhausted'
+        $task | Add-Member -NotePropertyName finished_at -NotePropertyValue ((Get-Date).ToUniversalTime().ToString('o')) -Force
+        Write-ClawAtomicJson -Path $activeTaskPath -Value $task
+        return
+    }
+
+    $typed = ConvertTo-ClawSingleLine -Text (
+        "Продолжай текущую задачу с места остановки. Один инструмент не означает завершение. " +
+        "Не повторяй чтение и планирование; выполни следующий полезный инструмент. " +
+        "Не пиши финальный ответ и не создавай completion marker, пока все изменения и проверки не закончены."
+    )
+    [ClawAgentControl.NativeConsole]::SendText($hostProcessId, $typed, $true)
+    $task.continuations = [int]$task.continuations + 1
+    $task.last_submitted_at = (Get-Date).ToUniversalTime().ToString('o')
+    Write-ClawAtomicJson -Path $activeTaskPath -Value $task
+}
+
 function Wait-ClawIdle {
     param([int]$TimeoutSeconds)
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
@@ -161,17 +219,20 @@ function Submit-Request {
         $typed = $null
         switch ($request.kind) {
             'instruction' {
-                $messagePath = $null
-                if ($request.PSObject.Properties.Name -contains 'message_path') {
-                    $messagePath = [string]$request.message_path
+                $operatorMessage = if (
+                    $request.PSObject.Properties.Name -contains 'message' -and
+                    -not [string]::IsNullOrWhiteSpace([string]$request.message)
+                ) {
+                    [string]$request.message
+                } else {
+                    throw 'Instruction queue record does not contain inline message text.'
                 }
-                if ([string]::IsNullOrWhiteSpace($messagePath)) {
-                    $relativePath = [string]$request.message_relative_path
-                    $messagePath = [System.IO.Path]::GetFullPath(
-                        (Join-Path ([string]$config.workspace_path) $relativePath)
-                    )
-                }
-                $typed = "Прочитай и выполни поправку из $messagePath; это текущая задача и текущая сессия, не начинай заново."
+                $typed = ConvertTo-ClawSingleLine -Text (
+                    'Это текущая задача и текущая сессия; не начинай заново. ' +
+                    'У тебя есть все инструменты и agent mode включён. ' +
+                    'Не отвечай обещанием или планом: сначала выполни полезное действие над задачей инструментом. ' +
+                    $operatorMessage
+                )
             }
             'raw' { $typed = ConvertTo-ClawSingleLine -Text ([string]$request.message) }
             'interrupt' { $typed = $null }
@@ -188,6 +249,21 @@ function Submit-Request {
         } elseif (-not [string]::IsNullOrWhiteSpace($typed)) {
             if ($request.kind -eq 'instruction') { Start-ControlledTurn -RequestId ([string]$request.id) }
             [ClawAgentControl.NativeConsole]::SendText($hostProcessId, $typed, $true)
+            if ($request.kind -eq 'instruction') {
+                $receiptPath = if (
+                    $request.PSObject.Properties.Name -contains 'delivery_receipt_path' -and
+                    -not [string]::IsNullOrWhiteSpace([string]$request.delivery_receipt_path)
+                ) {
+                    [string]$request.delivery_receipt_path
+                } else {
+                    Join-Path $StateDir "acks\$($request.id).txt"
+                }
+                # This is a controller-side delivery receipt, not model work.
+                # Requiring the model to write an ACK as its first tool call made
+                # one-tool agents treat that administrative action as task completion.
+                Write-ClawAtomicText -Path $receiptPath -Content "DISPATCHED $($request.id)"
+                Start-AutoContinueTask -Request $request
+            }
         }
 
         $request.status = 'submitted_to_console'
@@ -216,6 +292,7 @@ try {
             $snapshot = Get-Snapshot
             $selection = Select-NextRequest -IsIdle (Test-ControlledIdle -Snapshot $snapshot)
             if ($selection) { Submit-Request -Selection $selection -InitialSnapshot $snapshot }
+            else { Invoke-AutoContinue -Snapshot $snapshot }
             Write-ClawAtomicJson -Path $heartbeatPath -Value ([ordered]@{
                 pid = $PID
                 host_pid = $hostProcessId

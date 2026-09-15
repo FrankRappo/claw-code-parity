@@ -7,6 +7,9 @@
     [ValidateSet('on', 'off', 'keep')][string]$AgentMode = 'on',
     [string]$InitialMessage,
     [string]$IdlePromptRegex = '^\s*>\s*$',
+    [switch]$AutoContinue,
+    [ValidateRange(1, 300)][int]$AutoContinueDelaySeconds = 5,
+    [ValidateRange(1, 1000)][int]$AutoContinueMaxTurns = 50,
     [switch]$Watchdog,
     [ValidateRange(1, 300)][int]$WatchdogRestartDelaySeconds = 3,
     [ValidateRange(0, 1000)][int]$WatchdogMaxRestarts = 5
@@ -116,6 +119,9 @@ $config = [ordered]@{
     idle_cursor_x = 2
     idle_timeout_seconds = 86400
     interrupt_timeout_seconds = 60
+    auto_continue = [bool]$AutoContinue
+    auto_continue_delay_seconds = $AutoContinueDelaySeconds
+    auto_continue_max_turns = $AutoContinueMaxTurns
     started_at = (Get-Date).ToUniversalTime().ToString('o')
 }
 Write-ClawAtomicJson -Path (Join-Path $stateDir 'config.json') -Value $config
@@ -187,5 +193,6 @@ if ($Watchdog) {
     model = if ([string]::IsNullOrWhiteSpace($Model)) { $null } else { $Model }
     model_source = $modelSource
     agent_mode = $AgentMode
+    auto_continue = [bool]$AutoContinue
     watchdog_pid = if ($watchdogState) { [int]$watchdogState.watchdog_pid } else { $null }
 } | ConvertTo-Json -Depth 4

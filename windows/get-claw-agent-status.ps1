@@ -15,6 +15,7 @@ $heartbeat = Read-ClawJson -Path (Join-Path $stateDir 'heartbeat.json')
 $watchdogState = Read-ClawJson -Path (Join-Path $stateDir 'watchdog.json')
 $snapshot = Read-ClawJson -Path (Join-Path $stateDir 'screen.json')
 $turnState = Read-ClawJson -Path (Join-Path $stateDir 'turn-state.json')
+$activeTask = Read-ClawJson -Path (Join-Path $stateDir 'active-task.json')
 $tail = ''
 $screenPath = Join-Path $stateDir 'screen.txt'
 if (Test-Path -LiteralPath $screenPath) {
@@ -44,6 +45,7 @@ $acks = @(Get-ChildItem -LiteralPath (Join-Path $stateDir 'acks') -Filter '*.txt
     heartbeat = $heartbeat
     current_line = if ($snapshot) { $snapshot.current_line } else { $null }
     turn = $turnState
+    auto_continue_task = $activeTask
     queue_count = $queued.Count
     processing_count = $processing.Count
     submitted_count = $delivered.Count
