@@ -4,13 +4,48 @@
 
 Механизм повторяет безопасную схему OMX:
 
-1. Полный текст сообщения **сначала** атомарно сохраняется в `.claw/control/<name>/messages/`.
+1. Полный текст сообщения **сначала** атомарно сохраняется в `.claw/control/<name>/messages/`; в окно передаётся абсолютный путь, поэтому агент может менять рабочую папку.
 2. Запрос помещается в долговечную очередь `.claw/control/<name>/queue/`.
 3. Фоновый диспетчер проверяет состояние того же окна ClawCod.
 4. Для срочной поправки он атомарно создаёт `interrupt.signal`. Родной `HookAbortSignal` ClawCod останавливает ход, диспетчер дожидается сохранения файла той же сессии и только затем вводит короткую однострочную ссылку на сообщение.
 5. После ввода запрос переносится в `delivered/`. Агент создаёт файл в `acks/`, когда прочитал полное сообщение.
 
 Так поправка не теряется, если модель в момент отправки выполняет ход, и не создаётся новая сессия/новый чат.
+
+## Автовосстановление (watchdog)
+
+Для длительной автономной задачи добавьте `-Watchdog` при запуске:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\windows\start-claw-agent.ps1 `
+  -Name kimi `
+  -LauncherPath .\claw-kimi.cmd `
+  -WorkspacePath 'C:\claw cod' `
+  -Resume latest `
+  -AgentMode on `
+  -Watchdog
+```
+
+Watchdog не запускает новый процесс при обычной compaction: она выполняется
+внутри текущей Claw-сессии. Он срабатывает только при неожиданном завершении
+процесса, запускает Claw с `-Resume latest` и отправляет короткое указание
+продолжить незавершённую задачу. `stop-claw-agent.ps1` сначала ставит маркер
+штатной остановки, поэтому намеренный stop не вызывает перезапуск.
+
+К уже работающему агенту watchdog подключается отдельно:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\windows\start-claw-agent-watchdog.ps1 `
+  -Name kimi -WorkspacePath 'C:\claw cod'
+```
+
+По умолчанию допускается пять восстановлений с паузой три секунды. Параметры:
+`-WatchdogRestartDelaySeconds` и `-WatchdogMaxRestarts` (`0` — без ограничения).
+Интеграционная проверка:
+
+```powershell
+.\windows\agent-control\tests\test-agent-watchdog.ps1
+```
 
 ## Запуск Kimi в управляемом окне
 

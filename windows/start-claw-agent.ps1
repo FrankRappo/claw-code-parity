@@ -6,7 +6,10 @@
     [string]$Model,
     [ValidateSet('on', 'off', 'keep')][string]$AgentMode = 'on',
     [string]$InitialMessage,
-    [string]$IdlePromptRegex = '^\s*>\s*$'
+    [string]$IdlePromptRegex = '^\s*>\s*$',
+    [switch]$Watchdog,
+    [ValidateRange(1, 300)][int]$WatchdogRestartDelaySeconds = 3,
+    [ValidateRange(0, 1000)][int]$WatchdogMaxRestarts = 5
 )
 
 Set-StrictMode -Version Latest
@@ -108,6 +111,7 @@ $config = [ordered]@{
     resume_session_path = $resumeSessionPath
     model = if ([string]::IsNullOrWhiteSpace($Model)) { $null } else { $Model }
     model_source = $modelSource
+    agent_mode = $AgentMode
     idle_prompt_regex = $IdlePromptRegex
     idle_cursor_x = 2
     idle_timeout_seconds = 86400
@@ -163,6 +167,15 @@ if (-not [string]::IsNullOrWhiteSpace($InitialMessage)) {
     New-ClawControlRequest -StateDir $stateDir -Kind instruction -Message $InitialMessage -Mode next | Out-Null
 }
 
+$watchdogState = $null
+if ($Watchdog) {
+    $watchdogState = & (Join-Path $PSScriptRoot 'start-claw-agent-watchdog.ps1') `
+        -Name $Name `
+        -WorkspacePath $workspace `
+        -RestartDelaySeconds $WatchdogRestartDelaySeconds `
+        -MaxRestarts $WatchdogMaxRestarts | ConvertFrom-Json
+}
+
 [pscustomobject]@{
     name = $Name
     state = 'running'
@@ -174,4 +187,5 @@ if (-not [string]::IsNullOrWhiteSpace($InitialMessage)) {
     model = if ([string]::IsNullOrWhiteSpace($Model)) { $null } else { $Model }
     model_source = $modelSource
     agent_mode = $AgentMode
+    watchdog_pid = if ($watchdogState) { [int]$watchdogState.watchdog_pid } else { $null }
 } | ConvertTo-Json -Depth 4

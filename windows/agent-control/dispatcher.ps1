@@ -161,7 +161,17 @@ function Submit-Request {
         $typed = $null
         switch ($request.kind) {
             'instruction' {
-                $typed = "Прочитай и выполни поправку из $($request.message_relative_path); это текущая задача и текущая сессия, не начинай заново."
+                $messagePath = $null
+                if ($request.PSObject.Properties.Name -contains 'message_path') {
+                    $messagePath = [string]$request.message_path
+                }
+                if ([string]::IsNullOrWhiteSpace($messagePath)) {
+                    $relativePath = [string]$request.message_relative_path
+                    $messagePath = [System.IO.Path]::GetFullPath(
+                        (Join-Path ([string]$config.workspace_path) $relativePath)
+                    )
+                }
+                $typed = "Прочитай и выполни поправку из $messagePath; это текущая задача и текущая сессия, не начинай заново."
             }
             'raw' { $typed = ConvertTo-ClawSingleLine -Text ([string]$request.message) }
             'interrupt' { $typed = $null }

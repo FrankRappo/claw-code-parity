@@ -52,11 +52,14 @@ try {
     }
     if ($lines[2] -match "`r|`n") { throw 'The console trigger must be exactly one physical line.' }
     $messageFile = Join-Path $workspace ".claw\control\$name\messages\$($sent.id).md"
+    if ($lines[2] -notmatch [regex]::Escape($messageFile)) {
+        throw 'The console trigger did not use the absolute inbox path.'
+    }
     $stored = Get-Content -LiteralPath $messageFile -Raw -Encoding utf8
     if ($stored -notmatch 'Use the existing session\.' -or $stored -notmatch 'Do not restart the task\.') {
         throw 'The full multi-line instruction was not preserved in the inbox file.'
     }
-    $expectedAck = ".claw\control\$name\acks\$($sent.id).txt"
+    $expectedAck = Join-Path $workspace ".claw\control\$name\acks\$($sent.id).txt"
     if ($stored -notmatch [regex]::Escape($expectedAck) -or $stored -match '\$id|\$ackRelativePath') {
         throw 'The inbox file did not contain the expanded per-request ACK path.'
     }
@@ -69,7 +72,7 @@ try {
             'saved session model route was restored before launch',
             'agent mode was enabled in the same process',
             'full correction was stored durably before dispatch',
-            'per-request ACK path was expanded in the inbox file',
+            'absolute inbox and ACK paths survive agent working-directory changes',
             'only a one-line trigger was typed into the console',
             'graceful /exit stopped the controlled session'
         )

@@ -75,18 +75,19 @@ function New-ClawControlRequest {
     Initialize-ClawControlState -StateDir $StateDir
     $id = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssfffZ') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
     $messageRelativePath = $null
+    $messagePath = $null
 
     if ($Kind -eq 'instruction') {
         if ([string]::IsNullOrWhiteSpace($Message)) { throw 'Instruction message cannot be empty.' }
         $messageRelativePath = ".claw\control\$((Split-Path $StateDir -Leaf))\messages\$id.md"
-        $messagePath = Join-Path $StateDir "messages\$id.md"
-        $ackRelativePath = ".claw\control\$((Split-Path $StateDir -Leaf))\acks\$id.txt"
+        $messagePath = [System.IO.Path]::GetFullPath((Join-Path $StateDir "messages\$id.md"))
+        $ackPath = [System.IO.Path]::GetFullPath((Join-Path $StateDir "acks\$id.txt"))
         $body = @"
 # ClawCod live correction
 
 - Message ID: $id
 - Received UTC: $((Get-Date).ToUniversalTime().ToString('o'))
-- ACK path: $ackRelativePath
+- ACK path: $ackPath
 
 Before continuing, use an available file-writing tool to create the ACK file above with the text ACK $id.
 
@@ -110,6 +111,7 @@ $Message
         mode = $Mode
         message = if ($Kind -eq 'raw') { $Message } else { $null }
         message_relative_path = $messageRelativePath
+        message_path = $messagePath
         created_at = (Get-Date).ToUniversalTime().ToString('o')
         status = 'queued'
         attempts = 0
