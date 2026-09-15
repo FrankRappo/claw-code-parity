@@ -2035,6 +2035,94 @@ class ToolRetryTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(parsed.tool_calls[0].name, "Bash")
 
+    async def test_exhausted_required_any_tool_uses_safe_powershell_probe(self):
+        original = kimi.kimi
+        original_model = kimi.KIMI_UPSTREAM_MODEL
+        fake = TextOnlyFakeKimiClient("I will inspect the workspace next.")
+        kimi.kimi = fake
+        kimi.KIMI_UPSTREAM_MODEL = "k2d6-chat"
+        request = kimi.ChatCompletionRequest(
+            model="kimi-web",
+            messages=[kimi.Message(role="user", content="Continue the current task")],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "PowerShell",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"command": {"type": "string"}},
+                            "required": ["command"],
+                        },
+                    },
+                }
+            ],
+            tool_choice="required",
+            stream=True,
+        )
+        prompt = kimi.messages_to_prompt(
+            request.messages,
+            tools=request.tools,
+            tool_choice=request.tool_choice,
+        )
+        try:
+            parsed = await kimi._collect_tool_output_with_retry(
+                request,
+                prompt,
+                "broken-chat",
+            )
+        finally:
+            kimi.kimi = original
+            kimi.KIMI_UPSTREAM_MODEL = original_model
+        self.assertEqual(fake.calls, kimi.FORMAT_REPAIR_ATTEMPTS)
+        self.assertEqual(parsed.text, "")
+        self.assertEqual(len(parsed.tool_calls), 1)
+        self.assertEqual(parsed.tool_calls[0].name, "PowerShell")
+        self.assertEqual(parsed.tool_calls[0].arguments, {"command": "Get-Location"})
+
+    async def test_exhausted_explicit_tool_requirement_is_not_synthesized(self):
+        original = kimi.kimi
+        fake = TextOnlyFakeKimiClient("I cannot produce that call.")
+        kimi.kimi = fake
+        request = kimi.ChatCompletionRequest(
+            model="kimi-web",
+            messages=[kimi.Message(role="user", content="Read a specific file")],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "PowerShell",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"command": {"type": "string"}},
+                            "required": ["command"],
+                        },
+                    },
+                }
+            ],
+            tool_choice={
+                "type": "function",
+                "function": {"name": "PowerShell"},
+            },
+        )
+        prompt = kimi.messages_to_prompt(
+            request.messages,
+            tools=request.tools,
+            tool_choice=request.tool_choice,
+        )
+        try:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "explicitly required tool call",
+            ):
+                await kimi._collect_tool_output_with_retry(
+                    request,
+                    prompt,
+                    "broken-chat",
+                )
+        finally:
+            kimi.kimi = original
+
     async def test_unknown_generated_tool_is_corrected_in_the_same_chat(self):
         original = kimi.kimi
         original_model = kimi.KIMI_UPSTREAM_MODEL

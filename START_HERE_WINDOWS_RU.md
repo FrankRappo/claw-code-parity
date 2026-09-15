@@ -62,6 +62,7 @@ Set-Location $repo
 - `/agent on` требует хотя бы один реальный tool call в каждом пользовательском ходе.
 - `/agent off` снимает это требование, но не отключает доступные инструменты.
 - При `/resume` восстанавливаются JSONL-сессия и сохранённое точное имя модели, поэтому persistent Kimi-чат не меняется случайно.
+- Если Kimi после всех повторов отвечает только текстом при общем требовании `/agent on`, gateway подставляет только безопасную реальную проверку `PowerShell Get-Location` (или `Bash pwd`) из активного реестра. Это продолжает цикл агента; конкретно принудительный инструмент и команды записи gateway никогда не выдумывает.
 
 ## 4. Автономный агент, которым управляет оркестратор
 
@@ -157,6 +158,7 @@ Gateway:
 ```powershell
 Invoke-RestMethod 'http://127.0.0.1:18082/health'
 Get-Content "$env:LOCALAPPDATA\KimiClawGateway\gateway.18082.stderr.log" -Tail 80
+Invoke-RestMethod 'http://127.0.0.1:18082/metrics' | Select-Object required_any_tool_fallbacks_total
 ```
 
 Unit-тесты gateway:

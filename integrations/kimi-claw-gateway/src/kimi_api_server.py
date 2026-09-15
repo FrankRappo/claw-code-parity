@@ -1955,6 +1955,56 @@ def _tool_output_satisfies_requirement(
     return any(call.name.lower() in required for call in parsed.tool_calls)
 
 
+def _safe_required_any_tool_fallback(
+    request: ChatCompletionRequest,
+    required_tools: list[str],
+) -> Optional[ParsedToolCall]:
+    """Return a harmless shell probe only for an exhausted any-tool requirement."""
+    if request.tool_choice != "required" or required_tools != ["<any-available-tool>"]:
+        return None
+
+    safe_commands = {
+        "powershell": "Get-Location",
+        "bash": "pwd",
+    }
+    functions_by_lower: dict[str, tuple[str, dict[str, Any]]] = {}
+    for tool in request.tools or []:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function", {})
+        if not isinstance(function, dict):
+            continue
+        name = str(function.get("name", ""))
+        if name:
+            functions_by_lower[name.lower()] = (name, function)
+
+    for preferred_name in ("powershell", "bash"):
+        available = functions_by_lower.get(preferred_name)
+        if not available:
+            continue
+        canonical_name, function = available
+        parameters = function.get("parameters") or {}
+        if not isinstance(parameters, dict):
+            continue
+        properties = parameters.get("properties") or {}
+        required = parameters.get("required") or []
+        if not isinstance(properties, dict) or not isinstance(required, list):
+            continue
+        command_schema = properties.get("command")
+        if not isinstance(command_schema, dict):
+            continue
+        if command_schema.get("type") not in (None, "string"):
+            continue
+        if any(str(parameter) != "command" for parameter in required):
+            continue
+        return ParsedToolCall(
+            id=f"call_{uuid.uuid4().hex}",
+            name=canonical_name,
+            arguments={"command": safe_commands[preferred_name]},
+        )
+    return None
+
+
 async def _collect_tool_output_with_retry(
     request: ChatCompletionRequest,
     prompt: str,
@@ -2096,6 +2146,18 @@ async def _collect_tool_output_with_retry(
             )
         current_prompt = f"[BRIDGE_CORRECTION]\n{correction}"
     if required_tools:
+        fallback = _safe_required_any_tool_fallback(request, required_tools)
+        if fallback:
+            metrics.increment("required_any_tool_fallbacks_total")
+            logger.warning(
+                "Kimi exhausted required-tool retries; returning safe recovery probe tool=%s",
+                fallback.name,
+            )
+            return ParsedAssistantOutput(
+                text="",
+                tool_calls=[fallback],
+                upstream_chat_id=getattr(kimi, "last_chat_id", None) or chat_id,
+            )
         raise RuntimeError("Kimi did not return the explicitly required tool call")
     raise RuntimeError("Kimi did not return a usable response")
 

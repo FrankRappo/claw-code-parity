@@ -231,6 +231,15 @@ and continues the bounded repair loop. This also prevents a strict `/agent on`
 turn from ending as `assistant stream produced no content` merely because one
 upstream chat stopped following the native tool protocol.
 
+If every bounded retry still returns only text for the generic
+`tool_choice=required` contract, the gateway returns one real, harmless
+workspace-location probe (`PowerShell: Get-Location`, or `Bash: pwd`) when that
+exact shell and its one-command schema are present in the client's live tool
+registry. Claw executes the probe and the normal tool-result loop continues.
+The gateway never synthesizes a client-forced specific tool and never selects a
+write or destructive tool as recovery. The event is counted as
+`required_any_tool_fallbacks_total` by `/metrics`.
+
 Do not treat a tool list written by the model as authoritative: repeated live
 queries produced different self-reported names. The verified Windows runtime
 request exposes 49 tools; only that actual per-request registry is used for
@@ -239,8 +248,9 @@ validation and routing.
 Streaming requests send the initial OpenAI SSE role chunk immediately and then
 run Kimi tool preflight inside the stream. This prevents Claw from retrying a
 slow model turn and opening duplicate Kimi chats. Corrective retries reuse the
-same upstream chat. If all attempts fail, the stream contains a typed
-`upstream_error` event and terminates with `[DONE]`.
+same upstream chat. If all attempts fail and the safe generic shell fallback is
+not applicable (for example, a specifically forced tool was refused), the stream
+contains a typed `upstream_error` event and terminates with `[DONE]`.
 
 The web transport does not report tokenizer usage, so the gateway emits a
 conservative UTF-8 byte estimate in OpenAI `usage` fields for streaming and
