@@ -1729,6 +1729,91 @@ class ToolCallParsingTests(unittest.TestCase):
         )
 
 
+class BusyConnectRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_busy_connect_chat_rotates_before_retrying(self):
+        def frame(value, flags=0):
+            raw = json.dumps(value).encode("utf-8")
+            return bytes([flags]) + len(raw).to_bytes(4, "big") + raw
+
+        class Store:
+            @staticmethod
+            def load():
+                return {"headers": {}}
+
+        class Response:
+            status_code = 200
+
+            def __init__(self, chunks):
+                self.chunks = chunks
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def aiter_bytes(self):
+                for chunk in self.chunks:
+                    yield chunk
+
+        submitted_payloads = []
+        responses = [
+            Response(
+                [
+                    frame(
+                        {
+                            "error": {
+                                "code": "resource_exhausted",
+                                "message": "Chat session in progress. Please try again later.",
+                            }
+                        }
+                    )
+                ]
+            ),
+            Response([frame({}, flags=0x02)]),
+        ]
+
+        class HttpClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            def stream(self, _method, _url, **kwargs):
+                content = kwargs["content"]
+                submitted_payloads.append(json.loads(content[5:]))
+                return responses.pop(0)
+
+        client = kimi.KimiWebClient(Store())
+        client.access_token = mock.AsyncMock(return_value="test-token")
+        client.create_chat = mock.AsyncMock(return_value="chat-fresh")
+        client._client = lambda: HttpClient()
+
+        with mock.patch.object(kimi, "UPSTREAM_MAX_ATTEMPTS", 2), mock.patch.object(
+            kimi, "_retry_delay", mock.AsyncMock()
+        ):
+            output = [
+                part
+                async for part in client._iter_connect_completion(
+                    "chat-busy",
+                    "keep the full prompt",
+                )
+            ]
+
+        self.assertEqual(output, [])
+        client.create_chat.assert_awaited_once_with()
+        self.assertEqual(
+            [payload["chatId"] for payload in submitted_payloads],
+            ["chat-busy", "chat-fresh"],
+        )
+        self.assertEqual(
+            [payload["message"]["blocks"][0]["text"]["content"] for payload in submitted_payloads],
+            ["keep the full prompt", "keep the full prompt"],
+        )
+        self.assertEqual(client.last_chat_id, "chat-fresh")
+
+
 class FakeKimiClient:
     async def create_chat(self):
         return "chat_test"

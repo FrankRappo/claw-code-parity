@@ -117,6 +117,8 @@ Set-Content -LiteralPath (Join-Path $state 'direct-api-key.txt') `
 
 Если при общем `tool_choice=required` модель исчерпала исправляющие повторы и всё равно вернула только текст, gateway может вернуть только безопасный зарегистрированный probe: `PowerShell` с `Get-Location` либо `Bash` с `pwd`. Claw действительно выполняет его и отправляет результат обратно, поэтому ход не зависает. Это применяется только к требованию «любой инструмент»; конкретно принудительный инструмент, запись или разрушительное действие gateway не синтезирует. Счётчик: `GET /metrics` → `required_any_tool_fallbacks_total`.
 
+Если поправка прерывает уже начатый upstream-turn, Kimi иногда временно отвечает `resource_exhausted: Chat session in progress`. Gateway теперь не повторяет запрос в заведомо занятый `chat_id`: он автоматически создаёт новый upstream-чат, повторяет в нём тот же подготовленный prompt и переносит persistent mapping на новый `chat_id`. Локальная Claw-сессия, её summary и сохранённый хвост при этом не меняются. В журнале это видно по строке `Kimi busy chat rotated before retry`.
+
 ---
 
 ## 7. Лимиты и compaction
@@ -150,7 +152,7 @@ Select-String -Path $log -Pattern `
 ```powershell
 # Пример grep по логам (если включено логирование в файл)
 Select-String -Path "$env:LOCALAPPDATA\KimiClawGateway\gateway.18082.stderr.log" `
-  -Pattern 'Persistent session=|continued across Claw compaction|rotating generation='
+  -Pattern 'Persistent session=|continued across Claw compaction|rotating generation=|busy chat rotated'
 ```
 
 ---

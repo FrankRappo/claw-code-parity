@@ -224,8 +224,10 @@ single non-interactive continuation can instead use:
 
 - Kimi web can be slow; the Windows gateway intentionally permits one upstream
   operation at a time and paces starts at six-second intervals.
-- A Kimi web chat may report `Chat session in progress`; the broken persistent
-  mapping is cleared and the next request creates a fresh chat.
+- A locally interrupted turn can leave a Kimi web chat reporting
+  `Chat session in progress`. The gateway rotates that busy upstream chat
+  immediately, replays the unchanged prepared prompt, and advances the
+  persistent mapping without discarding the local Claw session.
 - `k2d6-chat` does not reliably call tools in `auto`; use `/agent on` only for
   turns where a real local action is required.
 - `/agent` is process-local and returns to `off` on a new Claw process.

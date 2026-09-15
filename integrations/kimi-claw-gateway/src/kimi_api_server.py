@@ -1588,14 +1588,18 @@ class KimiWebClient:
     ) -> AsyncIterator[str]:
         self.last_chat_id = chat_id or None
         token = await self.access_token()
-        envelope = _encode_connect_json(
-            build_kimi_connect_payload(
-                chat_id,
-                prompt,
-                system_prompt=system_prompt,
-                native_tool_names=native_tool_names,
+
+        def request_envelope(current_chat_id: str) -> bytes:
+            return _encode_connect_json(
+                build_kimi_connect_payload(
+                    current_chat_id,
+                    prompt,
+                    system_prompt=system_prompt,
+                    native_tool_names=native_tool_names,
+                )
             )
-        )
+
+        envelope = request_envelope(chat_id)
         auth_refreshed = False
         emitted_text = False
         for attempt in range(UPSTREAM_MAX_ATTEMPTS):
@@ -1676,7 +1680,26 @@ class KimiWebClient:
                         if buffer:
                             raise RuntimeError("Kimi Connect stream ended with a partial frame")
                         return
-            except (httpx.TransportError, KimiRetryableConnectError):
+            except KimiRetryableConnectError:
+                metrics.increment("upstream_transport_errors_total")
+                if emitted_text or attempt + 1 >= UPSTREAM_MAX_ATTEMPTS:
+                    raise
+                # An interrupted local turn can leave the web chat busy even
+                # after its HTTP stream is closed. Retrying that same chat only
+                # repeats resource_exhausted until the whole request fails.
+                # Rotate once per retry while replaying the unchanged prompt so
+                # Claw keeps its context and the persistent mapping can advance
+                # to the recovered chat id.
+                chat_id = await self.create_chat()
+                self.last_chat_id = chat_id
+                envelope = request_envelope(chat_id)
+                logger.warning(
+                    "Kimi busy chat rotated before retry attempt=%d",
+                    attempt + 1,
+                )
+                metrics.increment("upstream_retries_total")
+                await _retry_delay(attempt)
+            except httpx.TransportError:
                 metrics.increment("upstream_transport_errors_total")
                 if emitted_text or attempt + 1 >= UPSTREAM_MAX_ATTEMPTS:
                     raise
