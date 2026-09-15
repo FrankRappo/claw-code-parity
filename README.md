@@ -32,6 +32,8 @@
 
 > [!IMPORTANT]
 > The active Rust workspace now lives in [`rust/`](./rust). Start with [`USAGE.md`](./USAGE.md) for build, auth, CLI, session, and parity-harness workflows, then use [`rust/README.md`](./rust/README.md) for crate-level details.
+> For the local Windows Kimi setup, use the concise Russian owner runbook:
+> [`START_HERE_WINDOWS_RU.md`](./START_HERE_WINDOWS_RU.md).
 
 > [!NOTE]
 > This fork adds a recoverable non-interactive `resume + prompt` path, pre-turn
