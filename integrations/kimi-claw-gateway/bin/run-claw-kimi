@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export GOOGLE_API_KEY="${GOOGLE_API_KEY:-local-kimi}"
+export GOOGLE_BASE_URL="${GOOGLE_BASE_URL:-http://127.0.0.1:18081/v1}"
+export CLAW_MAX_TOKENS="${CLAW_MAX_TOKENS:-32000}"
+export CLAW_CONTEXT_TOKENS="${CLAW_CONTEXT_TOKENS:-128000}"
+exec "${CLAW_RUNNER:-/usr/local/bin/run-claw-gemma2}" "$@"

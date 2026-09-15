@@ -2351,13 +2351,45 @@ struct HookAbortMonitor {
     join_handle: Option<JoinHandle<()>>,
 }
 
+const AGENT_CONTROL_INTERRUPT_FILE: &str = "interrupt.signal";
+
+fn configured_agent_control_interrupt_path() -> Option<PathBuf> {
+    env::var_os("CLAW_AGENT_CONTROL_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(|directory| directory.join(AGENT_CONTROL_INTERRUPT_FILE))
+}
+
+fn consume_agent_control_interrupt(path: &Path) -> bool {
+    match fs::remove_file(path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => {
+            eprintln!(
+                "warning: could not consume Claw agent-control interrupt {}: {error}",
+                path.display()
+            );
+            false
+        }
+    }
+}
+
 impl HookAbortMonitor {
     fn spawn(abort_signal: runtime::HookAbortSignal) -> Self {
         Self::spawn_with_waiter(abort_signal, move |stop_rx, abort_signal| {
+            let control_interrupt_path = configured_agent_control_interrupt_path();
             loop {
                 match stop_rx.try_recv() {
                     Ok(()) | Err(TryRecvError::Disconnected) => return,
                     Err(TryRecvError::Empty) => {}
+                }
+                if control_interrupt_path
+                    .as_deref()
+                    .is_some_and(consume_agent_control_interrupt)
+                {
+                    abort_signal.abort();
+                    terminate_turn_child_processes();
+                    return;
                 }
                 match event::poll(Duration::from_millis(50)) {
                     Ok(true) => {
@@ -2407,7 +2439,7 @@ impl LiveCli {
         permission_mode: PermissionMode,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt()?;
-        let session_state = Session::new();
+        let session_state = Session::new().with_model(model.clone());
         let session = create_managed_session_handle(&session_state.session_id)?;
         let runtime = build_runtime(
             session_state.with_persistence_path(session.path.clone()),
@@ -2444,7 +2476,9 @@ impl LiveCli {
             resolve_session_reference(&session_path.display().to_string())?.path
         };
         let system_prompt = build_system_prompt()?;
-        let session_state = Session::load_from_path(&resolved_path)?;
+        let mut session_state = Session::load_from_path(&resolved_path)?;
+        let model = session_state.model.clone().unwrap_or(model);
+        session_state.set_model(model.clone());
         let session = SessionHandle {
             id: session_state.session_id.clone(),
             path: resolved_path,
@@ -2901,7 +2935,8 @@ impl LiveCli {
         }
 
         let previous = self.model.clone();
-        let session = self.runtime.session().clone();
+        let mut session = self.runtime.session().clone();
+        session.set_model(model.clone());
         let message_count = session.messages.len();
         let runtime = build_runtime(
             session,
@@ -2977,7 +3012,7 @@ impl LiveCli {
         }
 
         let previous_session = self.session.clone();
-        let session_state = Session::new();
+        let session_state = Session::new().with_model(self.model.clone());
         self.session = create_managed_session_handle(&session_state.session_id)?;
         let runtime = build_runtime(
             session_state.with_persistence_path(self.session.path.clone()),
@@ -3018,13 +3053,15 @@ impl LiveCli {
         };
 
         let handle = resolve_session_reference(&session_ref)?;
-        let session = Session::load_from_path(&handle.path)?;
+        let mut session = Session::load_from_path(&handle.path)?;
+        let resumed_model = session.model.clone().unwrap_or_else(|| self.model.clone());
+        session.set_model(resumed_model.clone());
         let message_count = session.messages.len();
         let session_id = session.session_id.clone();
         let runtime = build_runtime(
             session,
             &handle.id,
-            self.model.clone(),
+            resumed_model.clone(),
             self.system_prompt.clone(),
             true,
             true,
@@ -3033,6 +3070,7 @@ impl LiveCli {
             None,
         )?;
         self.replace_runtime(runtime)?;
+        self.model = resumed_model;
         self.session = SessionHandle {
             id: session_id,
             path: handle.path,
@@ -8534,23 +8572,22 @@ UU conflicted.rs",
         fs::create_dir_all(&workspace).expect("workspace");
         let script_path = workspace.join("fixture-mcp.py");
         write_mcp_server_fixture(&script_path);
+        let python_command = if cfg!(windows) { "python" } else { "python3" };
+        let settings = serde_json::json!({
+            "mcpServers": {
+                "alpha": {
+                    "command": python_command,
+                    "args": [script_path.to_string_lossy()]
+                },
+                "broken": {
+                    "command": python_command,
+                    "args": ["-c", "import sys; sys.exit(0)"]
+                }
+            }
+        });
         fs::write(
             config_home.join("settings.json"),
-            format!(
-                r#"{{
-                  "mcpServers": {{
-                    "alpha": {{
-                      "command": "python3",
-                      "args": ["{}"]
-                    }},
-                    "broken": {{
-                      "command": "python3",
-                      "args": ["-c", "import sys; sys.exit(0)"]
-                    }}
-                  }}
-                }}"#,
-                script_path.to_string_lossy()
-            ),
+            serde_json::to_vec_pretty(&settings).expect("serialize mcp settings"),
         )
         .expect("write mcp settings");
 
@@ -8854,10 +8891,14 @@ fn write_mcp_server_fixture(script_path: &Path) {
 
 #[cfg(test)]
 mod sandbox_report_tests {
-    use super::{format_sandbox_report, HookAbortMonitor};
+    use super::{
+        consume_agent_control_interrupt, format_sandbox_report, HookAbortMonitor,
+        AGENT_CONTROL_INTERRUPT_FILE,
+    };
     use runtime::HookAbortSignal;
+    use std::fs;
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn sandbox_report_renders_expected_fields() {
@@ -8905,5 +8946,23 @@ mod sandbox_report_tests {
         monitor.stop();
 
         assert!(abort_signal.is_aborted());
+    }
+
+    #[test]
+    fn agent_control_interrupt_is_consumed_exactly_once() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("claw-agent-control-{unique}"));
+        fs::create_dir_all(&root).expect("control directory");
+        let interrupt = root.join(AGENT_CONTROL_INTERRUPT_FILE);
+        fs::write(&interrupt, "interrupt").expect("interrupt signal");
+
+        assert!(consume_agent_control_interrupt(&interrupt));
+        assert!(!interrupt.exists());
+        assert!(!consume_agent_control_interrupt(&interrupt));
+
+        fs::remove_dir_all(root).expect("remove control directory");
     }
 }

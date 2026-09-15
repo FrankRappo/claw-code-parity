@@ -1,9 +1,13 @@
 use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
+use std::collections::BTreeSet;
 
 const COMPACT_CONTINUATION_PREAMBLE: &str =
     "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n";
 const COMPACT_RECENT_MESSAGES_NOTE: &str = "Recent messages are preserved verbatim.";
 const COMPACT_DIRECT_RESUME_INSTRUCTION: &str = "Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary, do not recap what was happening, and do not preface with continuation text.";
+const COMPACT_CURRENT_TOOLS_INSTRUCTION: &str = "The active tool registry is the source of truth for current capabilities. Do not infer tool availability from this archived summary or earlier assistant messages.";
+const MAX_PREVIOUS_HIGHLIGHT_LINES: usize = 12;
+const MAX_NEW_TIMELINE_LINES: usize = 8;
 
 /// Thresholds controlling when and how a session is compacted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +91,9 @@ pub fn get_compact_continuation_message(
         base.push('\n');
         base.push_str(COMPACT_DIRECT_RESUME_INSTRUCTION);
     }
+
+    base.push('\n');
+    base.push_str(COMPACT_CURRENT_TOOLS_INSTRUCTION);
 
     base
 }
@@ -240,10 +247,11 @@ fn merge_compact_summaries(existing_summary: Option<&str>, new_summary: &str) ->
         return new_summary.to_string();
     };
 
-    let previous_highlights = extract_summary_highlights(existing_summary);
+    let previous_highlights = rolling_previous_highlights(existing_summary);
     let new_formatted_summary = format_compact_summary(new_summary);
     let new_highlights = extract_summary_highlights(&new_formatted_summary);
     let new_timeline = extract_summary_timeline(&new_formatted_summary);
+    let new_timeline = newest_lines(new_timeline, MAX_NEW_TIMELINE_LINES);
 
     let mut lines = vec!["<summary>".to_string(), "Conversation summary:".to_string()];
 
@@ -485,6 +493,31 @@ fn extract_summary_highlights(summary: &str) -> Vec<String> {
     lines
 }
 
+fn rolling_previous_highlights(summary: &str) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut newest = extract_summary_highlights(summary)
+        .into_iter()
+        .rev()
+        .map(|line| line.trim().to_string())
+        .filter(|line| {
+            !line.is_empty()
+                && line != "- Previously compacted context:"
+                && line != "- Newly compacted context:"
+        })
+        .filter(|line| seen.insert(line.to_ascii_lowercase()))
+        .take(MAX_PREVIOUS_HIGHLIGHT_LINES)
+        .collect::<Vec<_>>();
+    newest.reverse();
+    newest
+}
+
+fn newest_lines(mut lines: Vec<String>, limit: usize) -> Vec<String> {
+    if lines.len() > limit {
+        lines.drain(..lines.len() - limit);
+    }
+    lines
+}
+
 fn extract_summary_timeline(summary: &str) -> Vec<String> {
     let mut lines = Vec::new();
     let mut in_timeline = false;
@@ -635,6 +668,56 @@ mod tests {
             &second.compacted_session.messages[1].blocks[0],
             ContentBlock::Text { text } if text.contains("Please add regression tests for compaction.")
         ));
+    }
+
+    #[test]
+    fn repeated_compaction_keeps_a_bounded_flat_rolling_summary() {
+        let config = CompactionConfig {
+            preserve_recent_messages: 2,
+            max_estimated_tokens: 1,
+        };
+        let mut session = Session::new();
+        session.messages = vec![
+            ConversationMessage::user_text("FIRST-OBSOLETE-REQUEST"),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "FIRST-OBSOLETE-ANSWER".to_string(),
+            }]),
+            ConversationMessage::user_text("rolling request 0"),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "rolling answer 0".to_string(),
+            }]),
+        ];
+
+        let mut result = compact_session(&session, config);
+        for round in 1..=12 {
+            let mut messages = result.compacted_session.messages.clone();
+            messages.extend([
+                ConversationMessage::user_text(format!("rolling request {round}")),
+                ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: format!("rolling answer {round}"),
+                }]),
+            ]);
+            session.messages = messages;
+            result = compact_session(&session, config);
+        }
+
+        assert_eq!(
+            result
+                .formatted_summary
+                .matches("Previously compacted context:")
+                .count(),
+            1
+        );
+        assert_eq!(
+            result
+                .formatted_summary
+                .matches("Newly compacted context:")
+                .count(),
+            1
+        );
+        assert!(!result.formatted_summary.contains("FIRST-OBSOLETE-REQUEST"));
+        assert!(result.formatted_summary.contains("rolling request 11"));
+        assert!(result.formatted_summary.chars().count() <= 4_000);
     }
 
     #[test]

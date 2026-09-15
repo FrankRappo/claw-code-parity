@@ -1,0 +1,30 @@
+[Unit]
+Description=OpenAI-compatible Kimi web gateway for Claw Code
+Requires=kimi-egress-socks.service
+After=network-online.target kimi-egress-socks.service
+
+[Service]
+Type=simple
+User=kimi-gateway
+Group=kimi-gateway
+WorkingDirectory=/opt/kimi-claw-gateway
+Environment=PYTHONUNBUFFERED=1
+Environment=KIMI_SESSION_FILE=/var/lib/kimi-claw-gateway/session.json
+Environment=KIMI_PROXY=socks5://127.0.0.1:1081
+Environment=KIMI_BIND_HOST=127.0.0.1
+Environment=KIMI_PORT=18081
+Environment=KIMI_UPSTREAM_MODEL=k2
+ExecStart=/usr/bin/env /opt/kimi-claw-gateway/.venv/bin/python /opt/kimi-claw-gateway/src/kimi_api_server.py
+Restart=always
+RestartSec=5s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/kimi-claw-gateway
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

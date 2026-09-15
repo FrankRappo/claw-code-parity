@@ -75,6 +75,9 @@ struct SessionPersistence {
 pub struct Session {
     pub version: u32,
     pub session_id: String,
+    /// Provider/model route used by this conversation. Restoring it prevents
+    /// gateway-backed sessions from silently switching upstream chats.
+    pub model: Option<String>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     pub messages: Vec<ConversationMessage>,
@@ -87,6 +90,7 @@ impl PartialEq for Session {
     fn eq(&self, other: &Self) -> bool {
         self.version == other.version
             && self.session_id == other.session_id
+            && self.model == other.model
             && self.created_at_ms == other.created_at_ms
             && self.updated_at_ms == other.updated_at_ms
             && self.messages == other.messages
@@ -136,6 +140,7 @@ impl Session {
         Self {
             version: SESSION_VERSION,
             session_id: generate_session_id(),
+            model: None,
             created_at_ms: now,
             updated_at_ms: now,
             messages: Vec::new(),
@@ -149,6 +154,16 @@ impl Session {
     pub fn with_persistence_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.persistence = Some(SessionPersistence { path: path.into() });
         self
+    }
+
+    #[must_use]
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = normalize_optional_string(Some(model.into()));
+        self
+    }
+
+    pub fn set_model(&mut self, model: impl Into<String>) {
+        self.model = normalize_optional_string(Some(model.into()));
     }
 
     #[must_use]
@@ -217,6 +232,7 @@ impl Session {
         Self {
             version: self.version,
             session_id: generate_session_id(),
+            model: self.model.clone(),
             created_at_ms: now,
             updated_at_ms: now,
             messages: self.messages.clone(),
@@ -239,6 +255,9 @@ impl Session {
             "session_id".to_string(),
             JsonValue::String(self.session_id.clone()),
         );
+        if let Some(model) = &self.model {
+            object.insert("model".to_string(), JsonValue::String(model.clone()));
+        }
         object.insert(
             "created_at_ms".to_string(),
             JsonValue::Number(i64_from_u64(self.created_at_ms, "created_at_ms")?),
@@ -287,6 +306,12 @@ impl Session {
             .get("session_id")
             .and_then(JsonValue::as_str)
             .map_or_else(generate_session_id, ToOwned::to_owned);
+        let model = normalize_optional_string(
+            object
+                .get("model")
+                .and_then(JsonValue::as_str)
+                .map(ToOwned::to_owned),
+        );
         let created_at_ms = object
             .get("created_at_ms")
             .map(|value| required_u64_from_value(value, "created_at_ms"))
@@ -305,6 +330,7 @@ impl Session {
         Ok(Self {
             version,
             session_id,
+            model,
             created_at_ms,
             updated_at_ms,
             messages,
@@ -317,6 +343,7 @@ impl Session {
     fn from_jsonl(contents: &str) -> Result<Self, SessionError> {
         let mut version = SESSION_VERSION;
         let mut session_id = None;
+        let mut model = None;
         let mut created_at_ms = None;
         let mut updated_at_ms = None;
         let mut messages = Vec::new();
@@ -353,6 +380,12 @@ impl Session {
                 "session_meta" => {
                     version = required_u32(object, "version")?;
                     session_id = Some(required_string(object, "session_id")?);
+                    model = normalize_optional_string(
+                        object
+                            .get("model")
+                            .and_then(JsonValue::as_str)
+                            .map(ToOwned::to_owned),
+                    );
                     created_at_ms = Some(required_u64(object, "created_at_ms")?);
                     updated_at_ms = Some(required_u64(object, "updated_at_ms")?);
                     fork = object.get("fork").map(SessionFork::from_json).transpose()?;
@@ -384,6 +417,7 @@ impl Session {
         Ok(Self {
             version,
             session_id: session_id.unwrap_or_else(generate_session_id),
+            model,
             created_at_ms: created_at_ms.unwrap_or(now),
             updated_at_ms: updated_at_ms.unwrap_or(created_at_ms.unwrap_or(now)),
             messages,
@@ -438,6 +472,9 @@ impl Session {
             "session_id".to_string(),
             JsonValue::String(self.session_id.clone()),
         );
+        if let Some(model) = &self.model {
+            object.insert("model".to_string(), JsonValue::String(model.clone()));
+        }
         object.insert(
             "created_at_ms".to_string(),
             JsonValue::Number(i64_from_u64(self.created_at_ms, "created_at_ms")?),
@@ -953,7 +990,7 @@ mod tests {
 
     #[test]
     fn persists_and_restores_session_jsonl() {
-        let mut session = Session::new();
+        let mut session = Session::new().with_model("kimi-k2d6-session-route");
         session
             .push_user_text("hello")
             .expect("user message should append");
@@ -995,6 +1032,7 @@ mod tests {
             17
         );
         assert_eq!(restored.session_id, session.session_id);
+        assert_eq!(restored.model.as_deref(), Some("kimi-k2d6-session-route"));
     }
 
     #[test]
@@ -1022,6 +1060,7 @@ mod tests {
             ConversationMessage::user_text("legacy")
         );
         assert!(!restored.session_id.is_empty());
+        assert_eq!(restored.model, None);
     }
 
     #[test]

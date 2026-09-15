@@ -1,0 +1,22 @@
+@echo off
+rem Copy this file to claw-kimi.local.cmd. The copied file is gitignored.
+rem Do not put API keys, browser cookies, or session.dpapi in Git.
+
+rem Default: use the local web-session gateway.
+set "KIMI_PROVIDER_MODE=gateway"
+rem set "KIMI_GATEWAY_ROOT=C:\path\to\claw-code-parity\integrations\kimi-claw-gateway"
+rem set "KIMI_GATEWAY_PORT=18082"
+rem set "KIMI_API_KEY_FILE=%LOCALAPPDATA%\KimiClawGateway\api-key.txt"
+rem set "KIMI_CLAW_SESSION=my-stable-lane"
+rem set "KIMI_CLAW_AUTO_COMPACT_TOKENS=200000"
+rem set "KIMI_MAX_PERSISTENT_MESSAGES=1000"
+rem set "KIMI_MAX_PERSISTENT_CONTEXT_TOKENS=200000"
+
+rem Alternative: official Kimi Coding API without the local gateway.
+rem Save the real key as one line in:
+rem   %LOCALAPPDATA%\KimiClawGateway\direct-api-key.txt
+rem Then uncomment these settings. No application rebuild is needed.
+rem set "KIMI_PROVIDER_MODE=direct"
+rem set "KIMI_DIRECT_BASE_URL=https://api.kimi.com/coding/v1"
+rem set "KIMI_DIRECT_MODEL=kimi-for-coding"
+rem set "KIMI_DIRECT_API_KEY_FILE=%LOCALAPPDATA%\KimiClawGateway\direct-api-key.txt"

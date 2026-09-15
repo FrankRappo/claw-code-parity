@@ -1,0 +1,21 @@
+[Unit]
+Description=SOCKS5 egress tunnel for the Kimi gateway
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=kimi-gateway
+Group=kimi-gateway
+EnvironmentFile=/etc/kimi-egress-socks.env
+ExecStart=/usr/bin/ssh -N -D 127.0.0.1:1081 -p ${VPS_PORT} -i ${SSH_KEY} -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${KNOWN_HOSTS} -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes ${VPS_USER}@${VPS_HOST}
+Restart=always
+RestartSec=5s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadOnlyPaths=/var/lib/kimi-claw-gateway/ssh
+
+[Install]
+WantedBy=multi-user.target

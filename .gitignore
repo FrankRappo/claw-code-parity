@@ -8,6 +8,7 @@ archive/
 # Environment / secrets
 .env
 .env.local
+claw-kimi.local.cmd
 # claw session data (personal, not for repo)
 rust/.claw/sessions/
 rust/.claw/plugins/

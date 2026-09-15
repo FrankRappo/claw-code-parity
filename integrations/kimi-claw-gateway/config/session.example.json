@@ -1,0 +1,18 @@
+{
+  "access_token": "REPLACE_WITH_CURRENT_ACCESS_TOKEN",
+  "refresh_token": "REPLACE_WITH_CURRENT_REFRESH_TOKEN",
+  "headers": {
+    "authorization": "Bearer REPLACE_WITH_CURRENT_ACCESS_TOKEN",
+    "connect-protocol-version": "1",
+    "content-type": "application/json",
+    "r-timezone": "UTC+1",
+    "user-agent": "Mozilla/5.0",
+    "x-language": "en-US",
+    "x-msh-device-id": "REPLACE_WITH_BROWSER_DEVICE_ID",
+    "x-msh-platform": "web",
+    "x-msh-session-id": "REPLACE_WITH_BROWSER_SESSION_ID",
+    "x-msh-version": "REPLACE_WITH_CURRENT_WEB_VERSION",
+    "x-traffic-id": "REPLACE_WITH_BROWSER_TRAFFIC_ID"
+  },
+  "cookies": []
+}
