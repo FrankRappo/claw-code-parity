@@ -150,3 +150,50 @@ function ConvertTo-ClawSingleLine {
 
     return ([regex]::Replace($Text, '\s+', ' ')).Trim()
 }
+
+function Get-ClawAutoContinueBlockReason {
+    param([AllowEmptyString()][string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+
+    # Only inspect the recent console suffix. This keeps stale failures from an
+    # earlier task from poisoning a later task while still covering Claw's
+    # final provider/tool result immediately above the idle prompt.
+    $lines = @($Text -split "`r?`n")
+    $recent = ($lines | Select-Object -Last 24) -join "`n"
+    $rules = @(
+        [pscustomobject]@{
+            Pattern = '(?i)assistant stream produced no content'
+            Reason = 'assistant stream produced no content; possible CAPTCHA/WAF or transport block'
+        },
+        [pscustomobject]@{
+            Pattern = '(?i)Request failed;\s*the interactive session remains open:'
+            Reason = 'provider request failed; automatic retry suppressed'
+        },
+        [pscustomobject]@{
+            Pattern = '(?i)No response,\s*Please try again later'
+            Reason = 'upstream returned no response; automatic retry suppressed'
+        },
+        [pscustomobject]@{
+            Pattern = '(?i)Unexpected token[^\r\n]*(?:!doctype|<html)[^\r\n]*not valid JSON'
+            Reason = 'upstream returned HTML instead of JSON; possible CAPTCHA/WAF'
+        },
+        [pscustomobject]@{
+            Pattern = '(?i)(?:captcha|hcaptcha|recaptcha|turnstile)[^\r\n]{0,80}(?:required|detected|blocked|challenge|appeared)'
+            Reason = 'CAPTCHA challenge detected; automatic retry suppressed'
+        },
+        [pscustomobject]@{
+            Pattern = '(?i)(?:waf)[^\r\n]{0,80}(?:blocked|challenge|detected|appeared)'
+            Reason = 'WAF challenge detected; automatic retry suppressed'
+        },
+        [pscustomobject]@{
+            Pattern = '(?i)(?:HTTP|status(?:\s+code)?)\s*[:=]?\s*(?:403|429)\b'
+            Reason = 'upstream returned HTTP 403/429; automatic retry suppressed'
+        }
+    )
+
+    foreach ($rule in $rules) {
+        if ($recent -match $rule.Pattern) { return [string]$rule.Reason }
+    }
+    return $null
+}

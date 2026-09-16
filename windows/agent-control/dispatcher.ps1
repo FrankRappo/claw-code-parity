@@ -150,6 +150,15 @@ function Invoke-AutoContinue {
     }
     if (-not (Test-ClawIdle -Snapshot $Snapshot)) { return }
 
+    $blockReason = Get-ClawAutoContinueBlockReason -Text ([string]$Snapshot.Tail)
+    if (-not [string]::IsNullOrWhiteSpace($blockReason)) {
+        $task.state = 'blocked'
+        $task | Add-Member -NotePropertyName block_reason -NotePropertyValue $blockReason -Force
+        $task | Add-Member -NotePropertyName finished_at -NotePropertyValue ((Get-Date).ToUniversalTime().ToString('o')) -Force
+        Write-ClawAtomicJson -Path $activeTaskPath -Value $task
+        return
+    }
+
     $lastSubmitted = [datetime]::Parse([string]$task.last_submitted_at).ToUniversalTime()
     if (((Get-Date).ToUniversalTime() - $lastSubmitted).TotalSeconds -lt [int]$config.auto_continue_delay_seconds) { return }
     if ([int]$task.continuations -ge [int]$config.auto_continue_max_turns) {

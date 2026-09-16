@@ -66,6 +66,15 @@ powershell -ExecutionPolicy Bypass -File .\windows\start-claw-agent.ps1 `
 Для медленного upstream выставляйте задержку не меньше его rate-limit. Состояние
 цикла видно в `auto_continue_task` команды `get-claw-agent-status.ps1`.
 
+Автопродолжение работает только для преждевременного обычного завершения хода.
+Оно намеренно **останавливается без повторной отправки**, если в последних строках
+консоли обнаружены CAPTCHA/WAF, HTTP 403/429, HTML вместо JSON, `No response` или
+`assistant stream produced no content`. В этом случае `auto_continue_task.state`
+становится `blocked`, а причина записывается в `block_reason`. Это fail-closed
+защита: после ручного устранения CAPTCHA или обновления сессии оператор явно
+отправляет новое сообщение либо перезапускает управляемую сессию; watchdog не
+должен бесконечно повторять заблокированный запрос.
+
 ## Запуск Kimi в управляемом окне
 
 Из корня репозитория:
@@ -161,9 +170,15 @@ powershell -ExecutionPolicy Bypass -File .\windows\stop-claw-agent.ps1 -Name kim
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\windows\agent-control\tests\test-agent-control.ps1
+powershell -ExecutionPolicy Bypass -File .\windows\agent-control\tests\test-agent-watchdog.ps1
+powershell -ExecutionPolicy Bypass -File .\windows\agent-control\tests\test-agent-auto-continue-safety.ps1
 ```
 
-Тест запускает фальшивый line-oriented Claw в отдельной Windows-консоли и проверяет Unicode-ввод, восстановление сохранённой модели, `/agent on`, атомарный inbox, однострочный trigger и штатный `/exit`. API Kimi/GLM при этом не вызывается.
+Тесты запускают фальшивый line-oriented Claw в отдельной Windows-консоли и
+проверяют Unicode-ввод, восстановление сохранённой модели, `/agent on`, атомарный
+inbox, однострочный trigger, watchdog и штатный `/exit`. Safety-тест отдельно
+подтверждает, что CAPTCHA/WAF и транспортные ошибки переводят задачу в `blocked`
+и не вызывают автоматический повтор. API Kimi/GLM при этом не вызывается.
 
 ## Ограничения
 
