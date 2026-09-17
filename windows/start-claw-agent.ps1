@@ -12,7 +12,12 @@
     [ValidateRange(1, 1000)][int]$AutoContinueMaxTurns = 50,
     [switch]$Watchdog,
     [ValidateRange(1, 300)][int]$WatchdogRestartDelaySeconds = 3,
-    [ValidateRange(0, 1000)][int]$WatchdogMaxRestarts = 5
+    [ValidateRange(0, 1000)][int]$WatchdogMaxRestarts = 5,
+    [string]$WatchdogHealthUrl,
+    [ValidateRange(1, 300)][int]$WatchdogHealthProbeIntervalSeconds = 5,
+    [ValidateRange(1, 100)][int]$WatchdogHealthFailureThreshold = 3,
+    [ValidateRange(1, 60)][int]$WatchdogHealthTimeoutSeconds = 3,
+    [ValidateRange(0, 600)][int]$WatchdogHealthStartupGraceSeconds = 45
 )
 
 Set-StrictMode -Version Latest
@@ -122,6 +127,11 @@ $config = [ordered]@{
     auto_continue = [bool]$AutoContinue
     auto_continue_delay_seconds = $AutoContinueDelaySeconds
     auto_continue_max_turns = $AutoContinueMaxTurns
+    watchdog_health_url = if ([string]::IsNullOrWhiteSpace($WatchdogHealthUrl)) { $null } else { $WatchdogHealthUrl }
+    watchdog_health_probe_interval_seconds = $WatchdogHealthProbeIntervalSeconds
+    watchdog_health_failure_threshold = $WatchdogHealthFailureThreshold
+    watchdog_health_timeout_seconds = $WatchdogHealthTimeoutSeconds
+    watchdog_health_startup_grace_seconds = $WatchdogHealthStartupGraceSeconds
     started_at = (Get-Date).ToUniversalTime().ToString('o')
 }
 Write-ClawAtomicJson -Path (Join-Path $stateDir 'config.json') -Value $config
@@ -179,7 +189,12 @@ if ($Watchdog) {
         -Name $Name `
         -WorkspacePath $workspace `
         -RestartDelaySeconds $WatchdogRestartDelaySeconds `
-        -MaxRestarts $WatchdogMaxRestarts | ConvertFrom-Json
+        -MaxRestarts $WatchdogMaxRestarts `
+        -HealthUrl $WatchdogHealthUrl `
+        -HealthProbeIntervalSeconds $WatchdogHealthProbeIntervalSeconds `
+        -HealthFailureThreshold $WatchdogHealthFailureThreshold `
+        -HealthTimeoutSeconds $WatchdogHealthTimeoutSeconds `
+        -HealthStartupGraceSeconds $WatchdogHealthStartupGraceSeconds | ConvertFrom-Json
 }
 
 [pscustomobject]@{

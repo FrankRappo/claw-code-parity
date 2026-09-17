@@ -54,7 +54,14 @@ function Read-ClawJson {
     param([Parameter(Mandatory)][string]$Path)
 
     if (-not (Test-Path -LiteralPath $Path)) { return $null }
-    return Get-Content -LiteralPath $Path -Raw -Encoding utf8 | ConvertFrom-Json
+    try {
+        return Get-Content -LiteralPath $Path -Raw -Encoding utf8 | ConvertFrom-Json
+    }
+    catch [System.Management.Automation.ItemNotFoundException] {
+        # Atomic writers briefly replace the destination. Treat that race like
+        # a missing snapshot; the next control-loop iteration will read it.
+        return $null
+    }
 }
 
 function Test-ClawProcess {

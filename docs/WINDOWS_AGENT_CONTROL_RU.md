@@ -27,10 +27,33 @@ powershell -ExecutionPolicy Bypass -File .\windows\start-claw-agent.ps1 `
 ```
 
 Watchdog не запускает новый процесс при обычной compaction: она выполняется
-внутри текущей Claw-сессии. Он срабатывает только при неожиданном завершении
-процесса, запускает Claw с `-Resume latest` и отправляет короткое указание
-продолжить незавершённую задачу. `stop-claw-agent.ps1` сначала ставит маркер
-штатной остановки, поэтому намеренный stop не вызывает перезапуск.
+внутри текущей Claw-сессии. По умолчанию он срабатывает при неожиданном
+завершении процесса, запускает Claw с `-Resume latest` и отправляет короткое
+указание продолжить незавершённую задачу. `stop-claw-agent.ps1` сначала ставит
+маркер штатной остановки, поэтому намеренный stop не вызывает перезапуск.
+
+Для провайдера с отдельным локальным gateway можно дополнительно контролировать
+readiness живого процесса. Например, DeepSeek может оставаться запущенным, но
+перестать продвигать запрос. Три последовательных сбоя `/ready` перезапустят
+Claw; его launcher затем заменит зависший gateway:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\windows\start-claw-agent.ps1 `
+  -Name deepseek -LauncherPath 'C:\claw cod DeepSeek\claw-deepseek.cmd' `
+  -WorkspacePath 'C:\work' -Resume latest -AgentMode on `
+  -Watchdog -WatchdogMaxRestarts 1000 `
+  -WatchdogHealthUrl 'http://127.0.0.1:18130/ready' `
+  -WatchdogHealthProbeIntervalSeconds 5 `
+  -WatchdogHealthFailureThreshold 3
+```
+
+Health URL ограничен loopback HTTP(S), таймаут задаёт
+`-WatchdogHealthTimeoutSeconds`; начальная пауза перед первой проверкой —
+`-WatchdogHealthStartupGraceSeconds` (45 секунд). Watchdog перезапускает только
+восстановимые состояния (`stalled=true`, недоступный transport/endpoint).
+`auth=false` и некорректная схема readiness записываются как `health_blocked`
+без бесполезного цикла перезапусков. Счётчик последовательных ошибок и
+последний результат видны в `watchdog.json` и `get-claw-agent-status.ps1`.
 
 К уже работающему агенту watchdog подключается отдельно:
 

@@ -2,7 +2,12 @@ param(
     [string]$Name = 'kimi',
     [string]$WorkspacePath = (Get-Location).Path,
     [ValidateRange(1, 300)][int]$RestartDelaySeconds = 3,
-    [ValidateRange(0, 1000)][int]$MaxRestarts = 5
+    [ValidateRange(0, 1000)][int]$MaxRestarts = 5,
+    [string]$HealthUrl,
+    [ValidateRange(1, 300)][int]$HealthProbeIntervalSeconds = 5,
+    [ValidateRange(1, 100)][int]$HealthFailureThreshold = 3,
+    [ValidateRange(1, 60)][int]$HealthTimeoutSeconds = 3,
+    [ValidateRange(0, 600)][int]$HealthStartupGraceSeconds = 45
 )
 
 Set-StrictMode -Version Latest
@@ -13,6 +18,15 @@ $internal = Join-Path $PSScriptRoot 'agent-control'
 $workspace = (Resolve-Path -LiteralPath $WorkspacePath).Path
 $stateDir = Get-ClawControlStateDir -WorkspacePath $workspace -Name $Name
 $config = Get-ClawControlConfig -StateDir $stateDir
+if ([string]::IsNullOrWhiteSpace($HealthUrl) -and
+        $config.PSObject.Properties.Name -contains 'watchdog_health_url' -and
+        $config.watchdog_health_url) {
+    $HealthUrl = [string]$config.watchdog_health_url
+    $HealthProbeIntervalSeconds = [int]$config.watchdog_health_probe_interval_seconds
+    $HealthFailureThreshold = [int]$config.watchdog_health_failure_threshold
+    $HealthTimeoutSeconds = [int]$config.watchdog_health_timeout_seconds
+    $HealthStartupGraceSeconds = [int]$config.watchdog_health_startup_grace_seconds
+}
 $hostState = Read-ClawJson -Path (Join-Path $stateDir 'host.json')
 if (-not $hostState -or -not (Test-ClawProcess -ProcessId $hostState.pid)) {
     throw "Controlled Claw session '$Name' must be running before its watchdog can be attached."
@@ -46,8 +60,15 @@ $arguments = @(
     '-StateDir', "`"$stateDir`"",
     '-StartScript', "`"$startScript`"",
     '-RestartDelaySeconds', $RestartDelaySeconds,
-    '-MaxRestarts', $MaxRestarts
+    '-MaxRestarts', $MaxRestarts,
+    '-HealthProbeIntervalSeconds', $HealthProbeIntervalSeconds,
+    '-HealthFailureThreshold', $HealthFailureThreshold,
+    '-HealthTimeoutSeconds', $HealthTimeoutSeconds,
+    '-HealthStartupGraceSeconds', $HealthStartupGraceSeconds
 ) -join ' '
+if (-not [string]::IsNullOrWhiteSpace($HealthUrl)) {
+    $arguments += " -HealthUrl `"$HealthUrl`""
+}
 $process = Start-Process $powerShell -ArgumentList $arguments -WindowStyle Hidden `
     -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog -PassThru
 
@@ -73,4 +94,9 @@ if (-not $watchdogState -or $watchdogState.state -ne 'running' -or [int]$watchdo
     state_dir = $stateDir
     restart_delay_seconds = $RestartDelaySeconds
     max_restarts = $MaxRestarts
+    health_url = if ([string]::IsNullOrWhiteSpace($HealthUrl)) { $null } else { $HealthUrl }
+    health_probe_interval_seconds = $HealthProbeIntervalSeconds
+    health_failure_threshold = $HealthFailureThreshold
+    health_timeout_seconds = $HealthTimeoutSeconds
+    health_startup_grace_seconds = $HealthStartupGraceSeconds
 } | ConvertTo-Json
