@@ -369,6 +369,16 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
 #[must_use]
 pub fn max_tokens_for_model(model: &str) -> u32 {
     let canonical = resolve_model_alias(model);
+    // Local Qwen 3.5 deployments support longer completions than Groq's
+    // conservative default. Keep the override within the model's configured
+    // output budget so a typo cannot request an unbounded completion.
+    if canonical.to_ascii_lowercase().starts_with("qwen3.5") {
+        return std::env::var("CLAW_QWEN_MAX_OUTPUT_TOKENS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .filter(|value| (1..=32_000).contains(value))
+            .unwrap_or(32_000);
+    }
     // Groq models: keep well below free-tier context limits
     if let Some(meta) = metadata_for_model(model) {
         if meta.provider == ProviderKind::Groq {
@@ -394,7 +404,35 @@ pub fn max_tokens_for_model(model: &str) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+
     use super::{detect_provider_kind, max_tokens_for_model, resolve_model_alias, ProviderKind};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn unset(key: &'static str) -> Self {
+            let original = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(value) = self.original.take() {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     #[test]
     fn resolves_grok_aliases() {
@@ -416,5 +454,22 @@ mod tests {
     fn keeps_existing_max_token_heuristic() {
         assert_eq!(max_tokens_for_model("opus"), 32_000);
         assert_eq!(max_tokens_for_model("grok-3"), 64_000);
+    }
+
+    #[test]
+    fn qwen35_uses_bounded_local_max_output_override() {
+        let _lock = ENV_LOCK.lock().expect("environment lock must be available");
+        let _env = EnvGuard::unset("CLAW_QWEN_MAX_OUTPUT_TOKENS");
+
+        assert_eq!(max_tokens_for_model("qwen-2.5-72b"), 8_000);
+        assert_eq!(max_tokens_for_model("qwen3.5-27b-uncensored"), 32_000);
+
+        std::env::set_var("CLAW_QWEN_MAX_OUTPUT_TOKENS", "12000");
+        assert_eq!(max_tokens_for_model("qwen3.5-27b-uncensored"), 12_000);
+
+        for invalid in ["", "not-a-number", "0", "32001"] {
+            std::env::set_var("CLAW_QWEN_MAX_OUTPUT_TOKENS", invalid);
+            assert_eq!(max_tokens_for_model("qwen3.5-27b-uncensored"), 32_000);
+        }
     }
 }

@@ -156,6 +156,17 @@ mode-0600 handoff, clears only the model-session reference, and retries once in
 a fresh model session. The workspace, plan, project memory, control queue, and
 audit history remain in the same project.
 
+Telegram cannot deliver text that its client refuses for exceeding the
+single-message limit. For a longer incoming question, run `/long`, send the
+question in several ordinary messages, then run `/send`. The bot stores the
+parts by Telegram `message_id`, joins them with newlines in the original order,
+and submits one request to the currently selected Gemma or Claw mode.
+`/long FIRST_PART` can include the first part directly; `/cancellong` (or
+`/cancel` while collection is active) deletes the draft. Drafts survive a bot
+restart in the private mode-0600 `LONG_QUESTION_STATE_FILE`. The combined input
+defaults to at most 120000 characters and is configurable through
+`MAX_LONG_QUESTION_CHARS`.
+
 The bridge uses a 32000-token completion ceiling, matching the current Claw Code
 default Opus budget. It is not a target length: normal responses stop naturally.
 The 64000 automatic-compaction point leaves provider-level headroom. Telegram
@@ -225,6 +236,64 @@ systemd-analyze verify integrations/telegram/systemd/claw-telegram-bridge.servic
 systemctl show claw-telegram-bridge.service -p ActiveState -p NRestarts
 curl --fail --silent http://127.0.0.1:19090/health
 ```
+
+## Telegram SOCKS egress
+
+Since 2026-09-22 the bot remains on `<bot-vps>`, but Telegram API and
+file downloads use `socks5h://127.0.0.1:11080` there. The enabled
+`telegram-socks-forward.service` forwards that loopback port over SSH to the
+existing Dante SOCKS5 listener at `127.0.0.1:1080` on `<socks-jump-host>`
+(SSH port `56777`). The key is dedicated and restricted to that destination;
+no SSH password or bot token belongs in these tracked files. Gemma
+(`127.0.0.1:18080`) and Claw (`127.0.0.1:19090`) stay on direct localhost
+paths, not the SOCKS proxy.
+
+On the Telegram host install Ubuntu's `python3-socks`, deploy
+`systemd/telegram-socks-forward.service`, and add
+`systemd/tg-gemma-bot-socks.conf` as a drop-in for `tg-gemma-bot.service`.
+The bot's `TELEGRAM_SOCKS_URL` is optional; unset it only after direct Telegram
+egress has been verified again. Check without printing secrets:
+
+```bash
+systemctl is-active telegram-socks-forward.service tg-gemma-bot.service
+curl --socks5-hostname 127.0.0.1:11080 -sS -m 10 -o /dev/null \
+  -w 'Telegram via SOCKS: HTTP %{http_code}\n' https://api.telegram.org
+curl -fsS http://127.0.0.1:18080/health
+```
+
+The dated incident, exact route, security restrictions, verification, and
+rollback caveat are in
+[`TELEGRAM-SOCKS-EGRESS-20260922.md`](docs/TELEGRAM-SOCKS-EGRESS-20260922.md).
+
+## Per-account Claw agent policy
+
+`BOT_ALLOWED_USER_IDS` / `BOT_ALLOWED_USERNAMES` admit accounts to the
+bot at all. A second, optional allowlist gates the Claw agent: every
+Claw command (`/claw`, `/newclaw`, `/project`, `/projects`,
+`/closeclaw`, `/progress`, `/pause`, `/continue`, `/next`, `/queue`,
+`/stop`, `/permissions`) and any ordinary message sent while the chat
+is switched to Claw mode.
+
+```ini
+CLAW_ALLOWED_USER_IDS=123456789
+CLAW_ALLOWED_USERNAMES=someone
+```
+
+When either variable is set, only those Telegram IDs/usernames may use
+the agent; every other allowed account keeps ordinary Gemma chat and
+receives a short "agent disabled for this account" notice. Matching is
+by exact numeric ID or case-insensitive username, identical to
+`BOT_ALLOWED_*`. Leave both variables unset to restore agent access for
+all allowed accounts. Real production values live only in the external
+environment file (`/opt/tg-gemma-bot/tg-gemma-bot.env` on the bot host);
+never commit real accounts or tokens. The policy is read at process
+start, so apply changes with `systemctl restart tg-gemma-bot.service`.
+
+The 2026-10 production recovery walkthroughs for the SOCKS egress and
+the Claw reverse tunnel live in
+[`docs/TELEGRAM-SOCKS-EGRESS-20260922.md`](docs/TELEGRAM-SOCKS-EGRESS-20260922.md)
+and
+[`docs/TELEGRAM-CLAW-RECOVERY-20261012.md`](docs/TELEGRAM-CLAW-RECOVERY-20261012.md).
 
 ## Test
 

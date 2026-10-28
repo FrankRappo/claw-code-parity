@@ -1,4 +1,5 @@
 import io
+import importlib.util
 import json
 import tempfile
 import unittest
@@ -27,6 +28,40 @@ class FakeResponse:
 
     def __exit__(self, exc_type, exc, traceback):
         return False
+
+
+class TelegramTransportTests(unittest.TestCase):
+    def test_local_http_uses_direct_opener(self):
+        with mock.patch.object(
+            bot.DIRECT_OPENER, "open", return_value=FakeResponse(b'{"status":"ok"}')
+        ) as opened:
+            result = bot.http_json("http://127.0.0.1:18080/health")
+        self.assertEqual(result, {"status": "ok"})
+        opened.assert_called_once()
+
+    def test_telegram_uses_explicit_opener(self):
+        with mock.patch.object(bot, "http_json", return_value={"ok": True}) as request:
+            bot.tg("getMe")
+        self.assertIs(request.call_args.kwargs["opener"], bot.TELEGRAM_OPENER)
+
+    def test_invalid_socks_url_fails_closed(self):
+        for url in ("socks5://127.0.0.1:11080", "socks5h://example.com:11080"):
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                bot.build_telegram_opener(url)
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("socks") and importlib.util.find_spec("sockshandler"),
+        "PySocks is not installed",
+    )
+    def test_socks_opener_uses_remote_dns(self):
+        import socks
+        from sockshandler import SocksiPyHandler
+
+        opener = bot.build_telegram_opener("socks5h://127.0.0.1:11080")
+        handler = next(h for h in opener.handlers if isinstance(h, SocksiPyHandler))
+        self.assertIsNot(opener, bot.DIRECT_OPENER)
+        self.assertEqual(handler.args, (socks.SOCKS5, "127.0.0.1", 11080))
+        self.assertTrue(handler.kw["rdns"])
 
 
 class ImageSelectionTests(unittest.TestCase):
@@ -67,8 +102,8 @@ class ImageDownloadTests(unittest.TestCase):
     def test_content_length_limit_is_enforced_before_read(self):
         response = FakeResponse(b"", content_length=5)
         with mock.patch.object(
-            bot.urllib.request,
-            "urlopen",
+            bot.TELEGRAM_OPENER,
+            "open",
             return_value=response,
         ):
             with self.assertRaisesRegex(bot.ImageInputError, "слишком большое"):
@@ -76,8 +111,8 @@ class ImageDownloadTests(unittest.TestCase):
 
     def test_stream_limit_applies_without_content_length(self):
         with mock.patch.object(
-            bot.urllib.request,
-            "urlopen",
+            bot.TELEGRAM_OPENER,
+            "open",
             return_value=FakeResponse(b"12345"),
         ):
             with self.assertRaisesRegex(bot.ImageInputError, "слишком большое"):
@@ -317,6 +352,7 @@ class ExistingBotBehaviorTests(unittest.TestCase):
         bot.HISTORY.clear()
         bot.TOKEN_LIMITS.clear()
         bot.CHAT_MODES.clear()
+        bot.LONG_QUESTIONS.clear()
         bot.CLAW_OPERATION_EPOCHS.clear()
         bot.ACTIVE_CLAW_OPERATIONS.clear()
         bot.ACTIVE_VISION_PROCESSES.clear()
@@ -379,6 +415,126 @@ class ExistingBotBehaviorTests(unittest.TestCase):
             all("reply_markup" not in payload for payload in payloads[:-1])
         )
         self.assertIn("reply_markup", payloads[-1])
+
+    def test_long_question_parts_are_compiled_in_message_order_for_claw(self):
+        bot.CHAT_MODES[10] = bot.MODE_CLAW
+
+        def message(message_id, text):
+            return {
+                "chat": {"id": 10},
+                "from": {"id": 20},
+                "message_id": message_id,
+                "text": text,
+            }
+
+        with mock.patch.object(bot, "ALLOWED", set()), mock.patch.object(
+            bot, "ALLOWED_USERNAMES", set()
+        ), mock.patch.object(bot, "_persist_long_questions"):
+            started = bot.prepare_long_question_message(
+                message(100, "/long /status должен быть частью вопроса")
+            )
+            later_part = bot.prepare_long_question_message(
+                message(102, "Третья часть")
+            )
+            earlier_part = bot.prepare_long_question_message(
+                message(101, "Вторая часть")
+            )
+            compiled = bot.prepare_long_question_message(message(103, "/send"))
+
+        self.assertEqual(started["_long_question_action"], "started")
+        self.assertEqual(later_part["_long_question_action"], "part_added")
+        self.assertEqual(earlier_part["_long_question_action"], "part_added")
+        self.assertTrue(compiled["_long_question_compiled"])
+        self.assertEqual(
+            compiled["text"],
+            "/status должен быть частью вопроса\nВторая часть\nТретья часть",
+        )
+        self.assertNotIn(10, bot.LONG_QUESTIONS)
+
+        with mock.patch.object(bot, "ALLOWED", set()), mock.patch.object(
+            bot, "ALLOWED_USERNAMES", set()
+        ), mock.patch.object(bot, "send_typing"), mock.patch.object(
+            bot, "claw_answer", return_value="Готово"
+        ) as answer, mock.patch.object(bot, "send_message") as send:
+            bot.handle_message(compiled)
+
+        answer.assert_called_once()
+        self.assertEqual(answer.call_args.args[:3], (10, 20, compiled["text"]))
+        self.assertEqual(send.call_args.args[1], "Готово")
+
+    def test_long_question_rejects_only_the_part_over_total_limit(self):
+        def message(message_id, text):
+            return {
+                "chat": {"id": 10},
+                "from": {"id": 20},
+                "message_id": message_id,
+                "text": text,
+            }
+
+        with mock.patch.object(bot, "ALLOWED", set()), mock.patch.object(
+            bot, "ALLOWED_USERNAMES", set()
+        ), mock.patch.object(bot, "MAX_LONG_QUESTION_CHARS", 12), mock.patch.object(
+            bot, "_persist_long_questions"
+        ):
+            bot.prepare_long_question_message(message(100, "/long 123456"))
+            rejected = bot.prepare_long_question_message(message(101, "789012"))
+            compiled = bot.prepare_long_question_message(message(102, "/send"))
+
+        self.assertEqual(rejected["_long_question_action"], "too_large")
+        self.assertEqual(compiled["text"], "123456")
+
+    def test_long_question_can_be_cancelled_without_model_request(self):
+        message = {
+            "chat": {"id": 10},
+            "from": {"id": 20},
+            "message_id": 100,
+            "text": "/long первая часть",
+        }
+        with mock.patch.object(bot, "ALLOWED", set()), mock.patch.object(
+            bot, "ALLOWED_USERNAMES", set()
+        ), mock.patch.object(bot, "_persist_long_questions"):
+            bot.prepare_long_question_message(message)
+            cancelled = bot.prepare_long_question_message(
+                {**message, "message_id": 101, "text": "/cancellong"}
+            )
+
+        self.assertEqual(cancelled["_long_question_action"], "cancelled")
+        self.assertNotIn(10, bot.LONG_QUESTIONS)
+
+    def test_long_question_does_not_capture_bot_commands_or_keyboard_actions(self):
+        def message(message_id, text):
+            return {
+                "chat": {"id": 10},
+                "from": {"id": 20},
+                "message_id": message_id,
+                "text": text,
+            }
+
+        with mock.patch.object(bot, "ALLOWED", set()), mock.patch.object(
+            bot, "ALLOWED_USERNAMES", set()
+        ), mock.patch.object(bot, "_persist_long_questions"):
+            bot.prepare_long_question_message(message(100, "/long первая часть"))
+            status = bot.prepare_long_question_message(message(101, "/status"))
+            stop = bot.prepare_long_question_message(message(102, "⛔ Остановить Claw"))
+            compiled = bot.prepare_long_question_message(message(103, "/send"))
+
+        self.assertNotIn("_long_question_action", status)
+        self.assertNotIn("_long_question_action", stop)
+        self.assertEqual(compiled["text"], "первая часть")
+
+    def test_long_question_draft_is_loaded_from_private_state_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "long-questions.json"
+            with mock.patch.object(bot, "LONG_QUESTION_STATE_FILE", state_file):
+                bot.LONG_QUESTIONS[10] = {
+                    "user_id": 20,
+                    "parts": {102: "вторая", 101: "первая"},
+                }
+                bot._persist_long_questions()
+                loaded = bot._load_long_questions()
+
+            self.assertEqual(loaded, bot.LONG_QUESTIONS)
+            self.assertEqual(state_file.stat().st_mode & 0o777, 0o600)
 
     def test_send_message_retries_transient_transport_failure(self):
         with mock.patch.object(

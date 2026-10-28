@@ -1,4 +1,4 @@
-# Production validation — 2026-07-20 through 2026-07-21
+# Production validation — 2026-07-20 through 2026-09-22
 
 This record is intentionally sanitized: it contains no tokens, usernames,
 public addresses, private paths, model weights, or Telegram chat identifiers.
@@ -20,6 +20,9 @@ public addresses, private paths, model weights, or Telegram chat identifiers.
   chat through `/tokens`.
 - Both modes preserve every returned character by sending ordered Telegram
   chunks of at most 3900 characters.
+- Incoming questions above Telegram's single-message limit can be collected
+  through `/long`, several ordered parts, and `/send`. The private draft is
+  restart-safe and bounded to 120000 characters by default.
 - Claw commands are automatically approved only inside the disposable VM.
   `/permissions` reports this policy; `/stop` remains available at any time.
 - A top-level Claw turn may launch one Gemma-backed background `Agent`. Every
@@ -66,6 +69,7 @@ public addresses, private paths, model weights, or Telegram chat identifiers.
 | Post-migration automatic OCR | A PNG attachment passed through the reverse-forwarded bridge, local OCR extracted the test number, and the agent returned that exact number. |
 | Network access | Public HTTPS, explicit HTTP, and routed private-network access are required in unrestricted mode. |
 | Long Telegram output | Unit fixtures reconstructed a multi-chunk response character-for-character, verified every chunk stayed below 3900 characters, and kept the keyboard only on the final message. The same sender is used by Gemma and Claw. |
+| Long Telegram input | Unit fixtures collected parts by Telegram `message_id`, preserved their order, kept bot commands out of the draft, restored a mode-0600 draft, rejected only an over-limit part, and submitted the compiled text as one Claw prompt. The deployed-file smoke compiled two 3900-character parts into one ordered 7801-character prompt. |
 | Sub-agent policy | The `Agent` tool uses the deployment's `gemma4` default, exposes the complete built-in tool set to every child role, and retains one cross-process active-child lock. |
 | Deployed long-output smoke | The installed bot reconstructed a five-message fixture without character loss; the largest chunk was exactly 3900 characters, only the first replied to the source message, and only the last carried the keyboard. |
 | Deployed sub-agent E2E | A parent Claw turn launched one `Explore` Agent without specifying a model, waited for it, read its marker, and returned the expected parent marker in 80.907 s. The persisted child manifest reported `model=gemma4`, `status=completed`, and no error. |
@@ -170,6 +174,24 @@ VM restarts; an interrupted in-flight turn may need to be submitted again.
 
 See the matching server measurements in
 [`FrankRappo/gemma4-amd-vulkan-ops`](https://github.com/FrankRappo/gemma4-amd-vulkan-ops/blob/main/docs/context-parallel-capacity.md).
+
+## Telegram egress repair — 2026-09-22
+
+The Telegram bot was active but could not poll the Telegram API. Its model
+endpoint stayed healthy. Direct HTTPS attempts from the Telegram host timed
+out; packet capture showed outgoing TCP SYN packets without replies. A
+separate existing SOCKS host reached the same API, so the bot now routes only
+Telegram API and file traffic through a loopback SSH-to-SOCKS forward. Gemma
+and Claw keep their direct localhost routes. No bot token or SSH password was
+added to source or a service unit; the forward uses a dedicated restricted key.
+
+Validation: the local Telegram integration suite passed 86 tests; the staged
+deployed-code `getMe` call returned `ok=true`; the bot reported connected;
+both the bot and SOCKS-forward services remained active with zero restarts;
+the model health returned HTTP 200; and no new poll errors appeared during
+follow-up monitoring. A fresh user-message delivery was not exercised by this
+deployment check. The exact route and safe operational checks are recorded in
+the dated SOCKS egress runbook linked from the Telegram README.
 
 ## Regression commands
 

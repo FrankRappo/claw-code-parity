@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Dependency-free Telegram bot for Gemma Vision and persisted Claw projects.
+"""Telegram bot for Gemma Vision and persisted Claw projects.
 
-The active bot runs on the jump host because it can reach Telegram. Its LLM
-and Claw bridge endpoints are localhost-only SSH tunnels. Never add bot or
-bridge tokens or deployment environment files to this repository.
+The bot runs on the jump host; its LLM and Claw bridge endpoints are localhost-only
+SSH tunnels. An optional local SOCKS forward carries only Telegram traffic.
+Never add bot or bridge tokens or deployment environment files to this repository.
 """
 
 import base64
@@ -34,6 +34,21 @@ ALLOWED_USERNAMES = {
     for value in os.environ.get("BOT_ALLOWED_USERNAMES", "").replace(",", " ").split()
     if value.strip()
 }
+
+CLAW_ALLOWED = {
+    int(value)
+    for value in os.environ.get("CLAW_ALLOWED_USER_IDS", "").replace(",", " ").split()
+    if value.strip().lstrip("-").isdigit()
+}
+CLAW_ALLOWED_USERNAMES = {
+    value.strip().lstrip("@").lower()
+    for value in os.environ.get("CLAW_ALLOWED_USERNAMES", "").replace(",", " ").split()
+    if value.strip()
+}
+CLAW_COMMANDS = frozenset({
+    "claw", "newclaw", "projects", "project", "closeclaw", "progress",
+    "pause", "continue", "next", "queue", "stop", "permissions",
+})
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "4096"))
 MAX_RESPONSE_TOKENS = max(
     64,
@@ -96,6 +111,16 @@ CLAW_OBSERVER_REQUEST_TIMEOUT = max(
 CHAT_MODE_STATE_FILE = Path(
     os.environ.get("CHAT_MODE_STATE_FILE", "/var/lib/tg-gemma-bot/chat-modes.json")
 )
+LONG_QUESTION_STATE_FILE = Path(
+    os.environ.get(
+        "LONG_QUESTION_STATE_FILE",
+        "/var/lib/tg-gemma-bot/long-questions.json",
+    )
+)
+MAX_LONG_QUESTION_CHARS = max(
+    4096,
+    int(os.environ.get("MAX_LONG_QUESTION_CHARS", "120000")),
+)
 SYSTEM_PROMPT_FILE = os.environ.get("SYSTEM_PROMPT_FILE", "").strip()
 SYSTEM_PROMPT = os.environ.get("SYSTEM_PROMPT", "").strip()
 BUNDLED_SYSTEM_PROMPT_FILE = (
@@ -110,12 +135,46 @@ DEFAULT_SYSTEM_PROMPT = (
     "user's language. State only concrete capability or access limits."
 )
 
+DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def build_telegram_opener(proxy_url):
+    """Use a local SOCKS5 forward for Telegram, or direct HTTPS when unset."""
+
+    if not proxy_url:
+        return DIRECT_OPENER
+    proxy = urllib.parse.urlsplit(proxy_url)
+    if (
+        proxy.scheme != "socks5h"
+        or proxy.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or proxy.port is None
+        or proxy.username
+        or proxy.password
+        or proxy.path
+        or proxy.query
+        or proxy.fragment
+    ):
+        raise ValueError("TELEGRAM_SOCKS_URL must be socks5h://127.0.0.1:PORT")
+    try:
+        import socks
+        from sockshandler import SocksiPyHandler
+    except ImportError as error:
+        raise RuntimeError("TELEGRAM_SOCKS_URL requires python3-socks") from error
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        SocksiPyHandler(socks.SOCKS5, proxy.hostname, proxy.port, rdns=True),
+    )
+
+
+TELEGRAM_OPENER = build_telegram_opener(os.environ.get("TELEGRAM_SOCKS_URL", "").strip())
+
 API = f"https://api.telegram.org/bot{TOKEN}"
 FILE_API = f"https://api.telegram.org/file/bot{TOKEN}"
 HISTORY = {}
 TOKEN_LIMITS = {}
 CHAT_LOCKS = {}
 CHAT_MODES = {}
+LONG_QUESTIONS = {}
 STATE_LOCK = threading.Lock()
 CLAW_OPERATION_LOCK = threading.Lock()
 CLAW_OPERATION_EPOCHS = {}
@@ -162,6 +221,10 @@ CONTROL_TEXTS = {
     "/next",
     "/closeclaw",
     "/newclaw",
+    "/long",
+    "/send",
+    "/cancellong",
+    "/cancel",
     "📊 Ход работы",
     "⛔ Остановить Claw",
     "⏸ Пауза Claw",
@@ -181,6 +244,9 @@ COMMANDS = [
     {"command": "queue", "description": "Показать очередь и паузу Claw"},
     {"command": "bench", "description": "Бенчмарк генерации, например /bench 128"},
     {"command": "tokens", "description": "Лимит ответа, например /tokens 4096"},
+    {"command": "long", "description": "Начать составной длинный вопрос"},
+    {"command": "send", "description": "Отправить собранный длинный вопрос"},
+    {"command": "cancellong", "description": "Отменить составной вопрос"},
     {"command": "permissions", "description": "Права команд Claw в sandbox VM"},
     {"command": "whoami", "description": "Показать chat_id, user_id и username"},
     {"command": "gemma", "description": "Переключиться на обычный чат Gemma"},
@@ -285,7 +351,7 @@ def main_keyboard():
     }
 
 
-def http_json(url, payload=None, timeout=REQUEST_TIMEOUT, extra_headers=None):
+def http_json(url, payload=None, timeout=REQUEST_TIMEOUT, extra_headers=None, opener=None):
     data = None
     headers = {"Content-Type": "application/json"}
     headers.update(extra_headers or {})
@@ -293,7 +359,7 @@ def http_json(url, payload=None, timeout=REQUEST_TIMEOUT, extra_headers=None):
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(url, data=data, headers=headers)
     effective_timeout = None if timeout is not None and timeout <= 0 else timeout
-    with urllib.request.urlopen(request, timeout=effective_timeout) as response:
+    with (opener or DIRECT_OPENER).open(request, timeout=effective_timeout) as response:
         return json.loads(response.read().decode("utf-8", "replace"))
 
 
@@ -359,7 +425,9 @@ def load_system_prompt():
 
 
 def tg(method, payload=None, timeout=REQUEST_TIMEOUT):
-    return http_json(f"{API}/{method}", payload or {}, timeout=timeout)
+    return http_json(
+        f"{API}/{method}", payload or {}, timeout=timeout, opener=TELEGRAM_OPENER
+    )
 
 
 def split_telegram_text(text, limit=3900):
@@ -465,6 +533,15 @@ def allowed_user(user):
     return user_id in ALLOWED or bool(username and username in ALLOWED_USERNAMES)
 
 
+def claw_allowed_user(user):
+    if not CLAW_ALLOWED and not CLAW_ALLOWED_USERNAMES:
+        return True
+    user_id = int(user.get("id") or 0)
+    username = normalize_username(user)
+    return user_id in CLAW_ALLOWED or bool(username and username in CLAW_ALLOWED_USERNAMES)
+
+
+
 def is_new_claw_name_reply(message):
     replied = message.get("reply_to_message") or {}
     replied_from = replied.get("from") or {}
@@ -534,6 +611,131 @@ def set_chat_mode(chat_id, mode):
 
 
 CHAT_MODES.update(_load_chat_modes())
+
+
+def _load_long_questions():
+    try:
+        value = json.loads(LONG_QUESTION_STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(value, dict):
+        return {}
+
+    questions = {}
+    for raw_chat_id, question in value.items():
+        if not str(raw_chat_id).lstrip("-").isdigit() or not isinstance(question, dict):
+            continue
+        raw_user_id = question.get("user_id")
+        raw_parts = question.get("parts")
+        if not isinstance(raw_user_id, int) or not isinstance(raw_parts, dict):
+            continue
+        parts = {
+            int(message_id): text
+            for message_id, text in raw_parts.items()
+            if str(message_id).isdigit() and isinstance(text, str) and text
+        }
+        total_chars = sum(len(part) for part in parts.values()) + max(0, len(parts) - 1)
+        if total_chars <= MAX_LONG_QUESTION_CHARS:
+            questions[int(raw_chat_id)] = {"user_id": raw_user_id, "parts": parts}
+    return questions
+
+
+def _persist_long_questions():
+    try:
+        LONG_QUESTION_STATE_FILE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        temporary = LONG_QUESTION_STATE_FILE.with_suffix(
+            LONG_QUESTION_STATE_FILE.suffix + ".tmp"
+        )
+        temporary.write_text(
+            json.dumps(LONG_QUESTIONS, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, LONG_QUESTION_STATE_FILE)
+    except OSError as error:
+        print("long question persistence warning:", repr(error), flush=True)
+
+
+def _long_question_stats(parts):
+    total_chars = sum(len(part) for part in parts.values()) + max(0, len(parts) - 1)
+    return len(parts), total_chars
+
+
+def prepare_long_question_message(message):
+    """Collect Telegram-sized parts or compile them into one model request."""
+
+    chat_id = (message.get("chat") or {}).get("id")
+    user = message.get("from") or {}
+    user_id = user.get("id")
+    raw_text = message.get("text")
+    if chat_id is None or user_id is None or raw_text is None or not allowed_user(user):
+        return message
+
+    text = str(raw_text)
+    command = text.strip()
+    starts_collection = command == "/long" or command.startswith("/long ")
+    with STATE_LOCK:
+        question = LONG_QUESTIONS.get(chat_id)
+        if starts_collection:
+            first_part = command.partition(" ")[2].strip()
+            parts = {int(message["message_id"]): first_part} if first_part else {}
+            LONG_QUESTIONS[chat_id] = {"user_id": int(user_id), "parts": parts}
+            _persist_long_questions()
+            prepared = dict(message)
+            prepared["_long_question_action"] = "started"
+            prepared["_long_question_stats"] = _long_question_stats(parts)
+            return prepared
+
+        if question is None or question.get("user_id") != int(user_id):
+            return message
+
+        parts = question["parts"]
+        if command == "/send":
+            if not parts:
+                prepared = dict(message)
+                prepared["_long_question_action"] = "empty"
+                return prepared
+            ordered_parts = [parts[message_id] for message_id in sorted(parts)]
+            LONG_QUESTIONS.pop(chat_id, None)
+            _persist_long_questions()
+            prepared = dict(message)
+            prepared["text"] = "\n".join(ordered_parts)
+            prepared["_long_question_compiled"] = True
+            prepared["_long_question_stats"] = _long_question_stats(parts)
+            return prepared
+
+        if command in {"/cancellong", "/cancel"}:
+            LONG_QUESTIONS.pop(chat_id, None)
+            _persist_long_questions()
+            prepared = dict(message)
+            prepared["_long_question_action"] = "cancelled"
+            return prepared
+
+        if (
+            command.startswith("/")
+            or command in CONTROL_TEXTS
+            or command in RESET_TEXTS
+            or command in {"💬 Gemma", "🛠 Claw Cod", "📁 Проекты"}
+        ):
+            return message
+
+        message_id = message.get("message_id")
+        if not isinstance(message_id, int) or not command:
+            return message
+        updated_parts = {**parts, message_id: text}
+        part_count, total_chars = _long_question_stats(updated_parts)
+        prepared = dict(message)
+        prepared["_long_question_stats"] = (part_count, total_chars)
+        if total_chars > MAX_LONG_QUESTION_CHARS:
+            prepared["_long_question_action"] = "too_large"
+            return prepared
+        parts[message_id] = text
+        _persist_long_questions()
+        prepared["_long_question_action"] = "part_added"
+        return prepared
+
+
+LONG_QUESTIONS.update(_load_long_questions())
 
 
 def chat_token_limit(chat_id):
@@ -643,7 +845,7 @@ def _download_limited(
     """Download at most max_bytes, including without Content-Length."""
 
     request = urllib.request.Request(url, headers={"Accept": accept})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with TELEGRAM_OPENER.open(request, timeout=timeout) as response:
         content_length = response.headers.get("Content-Length")
         if content_length:
             try:
@@ -1357,15 +1559,52 @@ def handle_message(message):
             reply_to=message_id,
         )
         return
-    if is_new_claw_name_reply(message):
-        if text.lower() == "/cancel":
+    if not claw_allowed_user(user):
+        parts = text.split()
+        command = parts[0].lstrip("/").split("@")[0].lower() if parts else ""
+        if command in CLAW_COMMANDS or chat_mode(chat_id) == MODE_CLAW:
+            send_message(
+                chat_id,
+                "Claw-агент отключён для этого аккаунта. Доступен обычный чат: /gemma",
+                reply_to=message_id,
+            )
+            return
+    long_question_action = message.get("_long_question_action")
+    if long_question_action:
+        part_count, total_chars = message.get("_long_question_stats", (0, 0))
+        if long_question_action == "started":
+            response = (
+                "Режим составного вопроса включён. Отправляй части отдельными "
+                "сообщениями, затем выполни /send. Отмена: /cancellong."
+            )
+            if part_count:
+                response += f" Уже сохранено частей: {part_count}, символов: {total_chars}."
+        elif long_question_action == "part_added":
+            response = f"Часть {part_count} сохранена; всего символов: {total_chars}."
+        elif long_question_action == "cancelled":
+            response = "Составной вопрос отменён и удалён."
+        elif long_question_action == "empty":
+            response = "Пока нет частей. Отправь текст отдельными сообщениями, затем /send."
+        else:
+            response = (
+                f"Эта часть превысит лимит составного вопроса "
+                f"{MAX_LONG_QUESTION_CHARS} символов и не сохранена. "
+                "Отправь уже собранное через /send или отмени через /cancellong."
+            )
+        send_message(chat_id, response, reply_to=message_id)
+        return
+
+    compiled_long_question = bool(message.get("_long_question_compiled"))
+    routing_text = "" if compiled_long_question else text
+    if not compiled_long_question and is_new_claw_name_reply(message):
+        if routing_text.lower() == "/cancel":
             send_message(
                 chat_id,
                 "Создание новой Claw-сессии отменено. Текущий проект не изменён.",
                 reply_to=message_id,
             )
             return
-        name = requested_claw_name(text)
+        name = requested_claw_name(routing_text)
         try:
             response = claw_request(
                 "/v1/projects/new",
@@ -1383,7 +1622,18 @@ def handle_message(message):
         except ClawBridgeError as error:
             send_message(chat_id, f"Не удалось создать сессию: {error}", reply_to=message_id)
         return
-    if text == "/" or text.startswith("/start") or text.startswith("/help"):
+    if routing_text in {"/send", "/cancellong"}:
+        send_message(
+            chat_id,
+            "Составной вопрос не начат. Выполни /long, отправь части, затем /send.",
+            reply_to=message_id,
+        )
+        return
+    if (
+        routing_text == "/"
+        or routing_text.startswith("/start")
+        or routing_text.startswith("/help")
+    ):
         send_message(
             chat_id,
             "Два режима:\n"
@@ -1394,18 +1644,20 @@ def handle_message(message):
             "поддерживается PDF; OCR запускается агентом автоматически при необходимости, "
             "отдельного OCR-меню нет. Длинные ответы Gemma и Claw автоматически "
             "приходят несколькими сообщениями без обрезания. Claw может запустить "
-            "одного фонового агента внутри текущего задания.\n\n" + commands_text(),
+            "одного фонового агента внутри текущего задания. Если вопрос длиннее "
+            "лимита Telegram: /long, части отдельными сообщениями, затем /send.\n\n"
+            + commands_text(),
             reply_to=message_id,
         )
         return
-    if text.startswith("/whoami"):
+    if routing_text.startswith("/whoami"):
         send_message(
             chat_id,
             f"chat_id={chat_id}\nuser_id={user_id}\nusername=@{username or '-'}",
             reply_to=message_id,
         )
         return
-    if text in {"💬 Gemma", "/gemma"} or text.startswith("/gemma "):
+    if routing_text in {"💬 Gemma", "/gemma"} or routing_text.startswith("/gemma "):
         set_chat_mode(chat_id, MODE_GEMMA)
         send_message(
             chat_id,
@@ -1413,7 +1665,7 @@ def handle_message(message):
             reply_to=message_id,
         )
         return
-    if text in {"🛠 Claw Cod", "/claw"} or text.startswith("/claw "):
+    if routing_text in {"🛠 Claw Cod", "/claw"} or routing_text.startswith("/claw "):
         try:
             status = claw_status_text(chat_id)
             set_chat_mode(chat_id, MODE_CLAW)
@@ -1425,7 +1677,7 @@ def handle_message(message):
         except ClawBridgeError as error:
             send_message(chat_id, f"Claw недоступен: {error}", reply_to=message_id)
         return
-    if text == "🆕 Новый проект":
+    if routing_text == "🆕 Новый проект":
         send_message(
             chat_id,
             NEW_CLAW_NAME_PROMPT,
@@ -1438,8 +1690,8 @@ def handle_message(message):
             },
         )
         return
-    if text.startswith("/newclaw"):
-        name = requested_claw_name(text)
+    if routing_text.startswith("/newclaw"):
+        name = requested_claw_name(routing_text)
         try:
             response = claw_request(
                 "/v1/projects/new",
@@ -1457,14 +1709,14 @@ def handle_message(message):
         except ClawBridgeError as error:
             send_message(chat_id, f"Не удалось создать проект: {error}", reply_to=message_id)
         return
-    if text in {"📁 Проекты", "/projects"} or text.startswith("/projects "):
+    if routing_text in {"📁 Проекты", "/projects"} or routing_text.startswith("/projects "):
         try:
             send_message(chat_id, claw_projects_text(chat_id), reply_to=message_id)
         except ClawBridgeError as error:
             send_message(chat_id, f"Не удалось получить проекты: {error}", reply_to=message_id)
         return
-    if text.startswith("/project"):
-        project_id = text.partition(" ")[2].strip()
+    if routing_text.startswith("/project"):
+        project_id = routing_text.partition(" ")[2].strip()
         if not project_id:
             send_message(chat_id, "Использование: /project ID", reply_to=message_id)
             return
@@ -1485,7 +1737,7 @@ def handle_message(message):
         except ClawBridgeError as error:
             send_message(chat_id, f"Не удалось открыть проект: {error}", reply_to=message_id)
         return
-    if text in {"⛔ Остановить Claw", "/stop"} or text.startswith("/stop "):
+    if routing_text in {"⛔ Остановить Claw", "/stop"} or routing_text.startswith("/stop "):
         operation_ids, vision_stopped = cancel_claw_operation(chat_id)
         local_stopped = bool(operation_ids) or vision_stopped
         try:
@@ -1511,7 +1763,7 @@ def handle_message(message):
             else:
                 send_message(chat_id, f"Не удалось остановить Claw: {error}", reply_to=message_id)
         return
-    if text in {"⏸ Пауза Claw", "/pause"} or text.startswith("/pause "):
+    if routing_text in {"⏸ Пауза Claw", "/pause"} or routing_text.startswith("/pause "):
         try:
             response = claw_request("/v1/pause", {"chat_id": chat_id}, timeout=15)
             send_message(
@@ -1525,7 +1777,10 @@ def handle_message(message):
         except ClawBridgeError as error:
             send_message(chat_id, f"Не удалось поставить Claw на паузу: {error}", reply_to=message_id)
         return
-    if text in {"▶️ Продолжить Claw", "/continue"} or text.startswith("/continue "):
+    if routing_text in {
+        "▶️ Продолжить Claw",
+        "/continue",
+    } or routing_text.startswith("/continue "):
         try:
             response = claw_request("/v1/continue", {"chat_id": chat_id}, timeout=15)
             restart_prompt = str(response.get("restart_prompt") or "").strip()
@@ -1563,8 +1818,8 @@ def handle_message(message):
         except ClawBridgeError as error:
             send_message(chat_id, f"Не удалось продолжить Claw: {error}", reply_to=message_id)
         return
-    if text.startswith("/next"):
-        next_text = text.partition(" ")[2].strip()
+    if routing_text.startswith("/next"):
+        next_text = routing_text.partition(" ")[2].strip()
         if not next_text:
             send_message(chat_id, "Использование: /next следующая задача", reply_to=message_id)
             return
@@ -1582,13 +1837,16 @@ def handle_message(message):
         except ClawBridgeError as error:
             send_message(chat_id, f"Не удалось добавить задачу: {error}", reply_to=message_id)
         return
-    if text.startswith("/queue"):
+    if routing_text.startswith("/queue"):
         try:
             send_message(chat_id, claw_queue_text(chat_id), reply_to=message_id)
         except ClawBridgeError as error:
             send_message(chat_id, f"Не удалось получить очередь: {error}", reply_to=message_id)
         return
-    if text in {"❌ Закрыть проект", "/closeclaw"} or text.startswith("/closeclaw "):
+    if routing_text in {
+        "❌ Закрыть проект",
+        "/closeclaw",
+    } or routing_text.startswith("/closeclaw "):
         try:
             response = claw_request(
                 "/v1/projects/close", {"chat_id": chat_id}, timeout=15
@@ -1603,7 +1861,7 @@ def handle_message(message):
         except ClawBridgeError as error:
             send_message(chat_id, f"Не удалось закрыть проект: {error}", reply_to=message_id)
         return
-    if text in RESET_TEXTS or text.startswith("/reset"):
+    if routing_text in RESET_TEXTS or routing_text.startswith("/reset"):
         reset_chat(chat_id)
         send_message(
             chat_id,
@@ -1611,8 +1869,8 @@ def handle_message(message):
             reply_to=message_id,
         )
         return
-    if text.startswith("/tokens"):
-        limit = max(64, min(parse_int_arg(text, MAX_TOKENS), MAX_RESPONSE_TOKENS))
+    if routing_text.startswith("/tokens"):
+        limit = max(64, min(parse_int_arg(routing_text, MAX_TOKENS), MAX_RESPONSE_TOKENS))
         with STATE_LOCK:
             TOKEN_LIMITS[chat_id] = limit
         send_message(
@@ -1621,7 +1879,7 @@ def handle_message(message):
             reply_to=message_id,
         )
         return
-    if text.startswith("/permissions"):
+    if routing_text.startswith("/permissions"):
         send_message(
             chat_id,
             "Claw работает внутри отдельной одноразовой VM в режиме "
@@ -1634,7 +1892,7 @@ def handle_message(message):
             reply_to=message_id,
         )
         return
-    if text == "📊 Ход работы" or text.startswith("/progress"):
+    if routing_text == "📊 Ход работы" or routing_text.startswith("/progress"):
         try:
             send_message(chat_id, claw_progress_text(chat_id), reply_to=message_id)
         except ClawBridgeError as error:
@@ -1644,15 +1902,15 @@ def handle_message(message):
                 reply_to=message_id,
             )
         return
-    if text.startswith("/status"):
+    if routing_text.startswith("/status"):
         send_message(chat_id, status_text(chat_id), reply_to=message_id)
         return
-    if text.startswith("/bench"):
+    if routing_text.startswith("/bench"):
         send_typing(chat_id)
         try:
             send_message(
                 chat_id,
-                bench_text(parse_int_arg(text, 128)),
+                bench_text(parse_int_arg(routing_text, 128)),
                 reply_to=message_id,
             )
         except Exception as error:
@@ -1685,7 +1943,7 @@ def handle_message(message):
         except ClawBridgeError:
             pass
 
-    if current_mode == MODE_CLAW and is_claw_progress_question(text):
+    if current_mode == MODE_CLAW and is_claw_progress_question(routing_text):
         try:
             progress = claw_request("/v1/progress", {"chat_id": chat_id}, timeout=15)
             send_typing(chat_id)
@@ -1815,8 +2073,14 @@ def is_control_message(message):
 
 
 def submit_message(message):
-    executor = CONTROL_EXECUTOR if is_control_message(message) else EXECUTOR
-    future = executor.submit(handle_message, message)
+    prepared = prepare_long_question_message(message)
+    if prepared.get("_long_question_compiled"):
+        executor = EXECUTOR
+    elif prepared.get("_long_question_action") or is_control_message(prepared):
+        executor = CONTROL_EXECUTOR
+    else:
+        executor = EXECUTOR
+    future = executor.submit(handle_message, prepared)
 
     def done(completed):
         try:

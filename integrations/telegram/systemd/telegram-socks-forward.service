@@ -1,0 +1,18 @@
+[Unit]
+Description=Loopback SOCKS5 forward for Telegram via jump194
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ssh -NT -F /dev/null -i /root/.ssh/tg-socks-jump194 -p 56777 -o BatchMode=yes -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ConnectTimeout=10 -o ServerAliveInterval=20 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=yes -o UpdateHostKeys=no -L 127.0.0.1:11080:127.0.0.1:1080 root@<socks-jump-host>
+Restart=always
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

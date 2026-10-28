@@ -17,6 +17,11 @@ long history, compaction, resume, tool results, and built-in Agent delegation.
 It also forbids invented policy refusals while preserving factual reporting of
 real access, tool, credential, and capability limits.
 
+The deployment uses role-specific prompts with a consistent direct tone. This
+file documents the Claw coding/tool prompt; the ordinary Gemma chat prompt is
+maintained separately in the Gemma repository so chat does not receive Claw's
+tool, durable-plan, or child-Agent instructions.
+
 ## Runtime configuration
 
 Prefer a file:
@@ -56,11 +61,12 @@ Conversation messages follow normally. Keeping one combined system message is
 compatible with llama.cpp's OpenAI endpoint and ensures that Claw's normal tool
 instructions remain active.
 
-The Telegram bridge passes only the two explicit prompt variables into the
-sanitized Claw child environment. It still excludes the Telegram bridge token
-and unrelated secrets. Because the built-in Agent executes inside the same
-Claw process environment and uses the same provider, both the parent and child
-receive the deployment prompt. No separate child-Agent patch is required.
+`ClawRunner._agent_environment()` inherits the full service environment in the
+dedicated operator-controlled VM, then adds the Claw runtime values. Because
+the built-in Agent executes inside that same Claw process environment and uses
+the same provider, both the parent and child receive the deployment prompt. No
+separate child-Agent patch is required. Documentation and diagnostics must show
+only variable names, paths, and presence; they must never print secret values.
 
 ## Patch implementation
 
@@ -75,9 +81,8 @@ To recreate the patch on another compatible Claw revision:
 4. Prepend the deployment prompt to the existing Claw prompt with one blank
    line between them.
 5. Add tests proving precedence, prepending, fallback, and file hot reload.
-6. In `integrations/telegram/claw_project_bridge.py`, explicitly allow the two
-   prompt variables through `_agent_environment()` without broad environment
-   inheritance.
+6. In `integrations/telegram/claw_project_bridge.py`, keep full service
+   environment inheritance in `_agent_environment()` for the dedicated VM.
 7. Rebuild and verify:
 
 ```bash
@@ -95,10 +100,20 @@ branch restores that mechanism on top of the newer resume, compaction,
 Telegram, and Agent changes rather than switching back to the historical
 branch.
 
-## Telegram Gemma path
+## Ordinary Telegram Gemma path
 
-The combined Telegram bot uses `SYSTEM_PROMPT_FILE` for ordinary Gemma and the
-Vision preprocessing call. Its loader uses this precedence:
+The ordinary chat bot uses its own role-specific prompt tracked in the Gemma
+repository at:
+
+```text
+../gemma4-amd-vulkan-ops/llm_ops/telegram_bot/prompts/gemma4-abliterated-system-prompt.txt
+```
+
+That ordinary Gemma chat prompt is separate from this Claw tool prompt. They
+should retain a consistent direct, non-paternalistic tone, but the chat prompt
+must not inherit Claw-only tool, autonomous-plan, durable-memory, or child-Agent
+claims. The chat bot uses `SYSTEM_PROMPT_FILE` for ordinary Gemma and the Vision
+preprocessing call. Its loader uses this precedence:
 
 1. `SYSTEM_PROMPT_FILE` (read on every request);
 2. legacy `SYSTEM_PROMPT` environment value;
@@ -111,9 +126,10 @@ Example:
 SYSTEM_PROMPT_FILE=/opt/tg-gemma-bot/gemma4-abliterated-system-prompt.txt
 ```
 
-Use the same tracked prompt contents for Telegram and Claw. Keeping a single
-text and matching SHA-256 avoids different personas between chat mode, coding
-mode, Vision preprocessing, and child Agents.
+Point `SYSTEM_PROMPT_FILE` at the deployed copy of the Gemma-repository chat
+prompt. Point `CLAW_SYSTEM_PROMPT_FILE` at the deployed copy of this repository's
+Claw prompt. Do not require their SHA-256 values to match: their operational
+instructions are intentionally role-specific.
 
 ## Operational verification
 
@@ -124,7 +140,7 @@ After deployment:
 systemctl show claw-telegram-bridge.service -p ActiveState -p NRestarts
 systemctl show tg-gemma-bot.service -p ActiveState -p NRestarts
 
-# local source/deployed copies must match
+# each role's local source must match its own deployed copy
 sha256sum \
   integrations/telegram/prompts/gemma4-abliterated-system-prompt.txt \
   /path/to/deployed/gemma4-abliterated-system-prompt.txt
