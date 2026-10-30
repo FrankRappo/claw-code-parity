@@ -49,6 +49,20 @@ CLAW_COMMANDS = frozenset({
     "claw", "newclaw", "projects", "project", "closeclaw", "progress",
     "pause", "continue", "next", "queue", "stop", "permissions",
 })
+CLAW_BUTTON_TEXTS = frozenset({
+    "\U0001f6e0 Claw Cod",
+    "\U0001f195 Новый проект",
+    "\U0001f4c1 Проекты",
+    "\U0001f4ca Ход работы",
+    "\u26d4 Остановить Claw",
+    "\u23f8 Пауза Claw",
+    "\u25b6\ufe0f Продолжить Claw",
+    "\u274c Закрыть проект",
+})
+CLAW_EXEMPT_COMMANDS = frozenset({
+    "gemma", "reset", "start", "help", "whoami", "status", "tokens",
+    "bench", "long", "send", "cancellong", "cancel",
+})
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "4096"))
 MAX_RESPONSE_TOKENS = max(
     64,
@@ -1562,7 +1576,17 @@ def handle_message(message):
     if not claw_allowed_user(user):
         parts = text.split()
         command = parts[0].lstrip("/").split("@")[0].lower() if parts else ""
-        if command in CLAW_COMMANDS or chat_mode(chat_id) == MODE_CLAW:
+        gemma_side = (
+            text in RESET_TEXTS
+            or text == "\U0001f4ac Gemma"
+            or command in CLAW_EXEMPT_COMMANDS
+        )
+        claw_only = (
+            command in CLAW_COMMANDS
+            or text in CLAW_BUTTON_TEXTS
+            or (chat_mode(chat_id) == MODE_CLAW and not gemma_side)
+        )
+        if claw_only:
             send_message(
                 chat_id,
                 "Claw-агент отключён для этого аккаунта. Доступен обычный чат: /gemma",

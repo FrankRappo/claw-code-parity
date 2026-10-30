@@ -51,47 +51,66 @@ class ClawAllowlistTest(unittest.TestCase):
         bot = load_bot("", "")
         self.assertTrue(bot.claw_allowed_user({"id": 42, "username": "other"}))
 
-    def test_gate_blocks_claw_command(self):
-        message = {
-            "chat": {"id": 100},
-            "from": {"id": 42, "username": "other"},
-            "message_id": 5,
-            "text": "/claw",
-        }
+    def run_message(self, chat_id, user, text, mode=None):
         sent = []
-        self.bot.CHAT_MODES.pop(100, None)
-        original = self.bot.send_message
-        self.bot.send_message = lambda chat_id, text, reply_to=None, keyboard=True: sent.append(
-            (chat_id, text)
-        )
-        try:
-            self.bot.handle_message(message)
-        finally:
-            self.bot.send_message = original
-        self.assertEqual(len(sent), 1)
-        self.assertIn("Claw", sent[0][1])
-
-    def test_gate_silent_for_ordinary_gemma_message(self):
-        message = {
-            "chat": {"id": 101},
-            "from": {"id": 42, "username": "other"},
-            "message_id": 6,
-            "text": "hello",
-        }
-        sent = []
-        self.bot.CHAT_MODES.pop(101, None)
+        self.bot.CHAT_MODES.pop(chat_id, None)
+        if mode:
+            self.bot.CHAT_MODES[chat_id] = mode
         original_send = self.bot.send_message
-        self.bot.send_message = lambda chat_id, text, reply_to=None, keyboard=True: sent.append(
-            (chat_id, text)
-        )
         original_llm = self.bot.llm_answer
-        self.bot.llm_answer = lambda chat_id, user_text, image=None, image_mime_type=None: "ok"
+        original_claw = self.bot.claw_request
+        self.bot.send_message = lambda cid, text, reply_to=None, keyboard=True: sent.append(
+            (cid, text)
+        )
+        self.bot.llm_answer = lambda cid, user_text, image=None, image_mime_type=None: "ok"
+        self.bot.claw_request = lambda path, payload, timeout=5: {"ok": True}
         try:
-            self.bot.handle_message(message)
+            self.bot.handle_message(
+                {"chat": {"id": chat_id}, "from": user, "message_id": 1, "text": text}
+            )
         finally:
             self.bot.send_message = original_send
             self.bot.llm_answer = original_llm
-        self.assertTrue(all("Claw-агент отключён" not in text for _, text in sent))
+            self.bot.claw_request = original_claw
+        return sent
+
+    BLOCK = "Claw-агент отключён"
+    USER = {"id": 42, "username": "other"}
+
+    def test_gate_blocks_claw_command(self):
+        sent = self.run_message(100, self.USER, "/claw")
+        self.assertEqual(len(sent), 1)
+        self.assertIn(self.BLOCK, sent[0][1])
+
+    def test_gate_blocks_claw_keyboard_buttons(self):
+        for text in ("🛠 Claw Cod", "🆕 Новый проект", "📁 Проекты"):
+            with self.subTest(text=text):
+                sent = self.run_message(102, self.USER, text)
+                self.assertTrue(sent)
+                self.assertIn(self.BLOCK, sent[0][1])
+
+    def test_gate_silent_for_ordinary_gemma_message(self):
+        sent = self.run_message(101, self.USER, "hello")
+        self.assertTrue(all(self.BLOCK not in text for _, text in sent))
+
+    def test_gemma_button_escapes_stuck_claw_mode(self):
+        sent = self.run_message(103, self.USER, "💬 Gemma", mode="claw")
+        self.assertTrue(all(self.BLOCK not in text for _, text in sent))
+        self.assertEqual(self.bot.CHAT_MODES[103], "gemma")
+
+    def test_gemma_command_escapes_stuck_claw_mode(self):
+        sent = self.run_message(104, self.USER, "/gemma", mode="claw")
+        self.assertTrue(all(self.BLOCK not in text for _, text in sent))
+        self.assertEqual(self.bot.CHAT_MODES[104], "gemma")
+
+    def test_reset_button_passes_in_claw_mode(self):
+        sent = self.run_message(105, self.USER, "🧹 Сбросить чат Gemma", mode="claw")
+        self.assertTrue(all(self.BLOCK not in text for _, text in sent))
+
+    def test_plain_task_blocked_in_claw_mode(self):
+        sent = self.run_message(106, self.USER, "сделай задачу", mode="claw")
+        self.assertTrue(sent)
+        self.assertIn(self.BLOCK, sent[0][1])
 
 
 if __name__ == "__main__":
