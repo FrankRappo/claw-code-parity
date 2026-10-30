@@ -434,7 +434,7 @@ Baseline зафиксирован 2026-07-15; capability snapshot дополни
   `c71854292f7c367cc3b35939f88121d81945472f`;
 - GPU: две AMD Radeon RX 9060 XT 16 GiB, RDNA4/GFX1200;
 - `srv1`: локальный `Vulkan0`;
-- `srv2`: `RPC0` через приватный адрес `10.30.0.2:50053`;
+- `srv2`: `RPC0` через приватный адрес `<srv2-rpc-ip>:50053`;
 - layer split `1,1`, context 32K, `parallel=1`, Q4 KV;
 - vision: `mmproj-gemma-4-31B-it-Q8_0.gguf`;
 - high-resolution vision: range `280–1120`, все batch limits `1280`,

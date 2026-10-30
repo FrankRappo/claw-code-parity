@@ -20,7 +20,7 @@
 Gemma API: srv1, 127.0.0.1:8080, single-GPU, health OK
 claw repo: уже скачан на srv1 SSD: /mnt/ssd/claw-code-parity
 local /work/claster external copy: удалена
-VM120: running, IP 192.168.87.32
+VM120: running, IP <vm120-lan>
 VM120 disk: srv1 /mnt/ssd, внутри VM примерно /home/ubuntu доступно ~191G
 storage: <storage-lan>
 VM120 -> storage ping: OK

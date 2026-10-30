@@ -11,7 +11,7 @@ clients / Telegram tunnel
         v
 srv1 127.0.0.1:8080, llama-server b10012
   - Vulkan0: srv1 AMD GPU
-  - RPC0: srv2 AMD GPU over 10.30.0.2:50053
+  - RPC0: srv2 AMD GPU over <srv2-rpc-ip>:50053
   - layer tensor split: 1,1
   - Gemma 4 mmproj Q8 for PNG/JPEG screenshots
 ```
@@ -85,7 +85,7 @@ srv2 llm-gpu2-local-server.service: inactive/disabled (rollback service)
 --model gemma-4-31b-abliterated-Q4_K_M.gguf
 --mmproj mmproj-gemma-4-31B-it-Q8_0.gguf
 --mmproj-offload
---rpc 10.30.0.2:50053
+--rpc <srv2-rpc-ip>:50053
 --device Vulkan0,RPC0
 --split-mode layer
 --tensor-split 1,1
@@ -119,7 +119,7 @@ Host-memory prompt caching remains disabled with `--cache-ram 0`. The measured
 additional working RAM for the 1120 OCR path was approximately 502 MiB; it is
 image/batch workspace, not a prompt cache.
 
-The service launcher waits for `10.30.0.2:50053` before starting the model. RPC
+The service launcher waits for `<srv2-rpc-ip>:50053` before starting the model. RPC
 is bound only to the private point-to-point link because llama.cpp RPC is
 unauthenticated and experimental.
 
@@ -131,7 +131,7 @@ unauthenticated and experimental.
 3. Install the same `ggml-rpc-server` build on srv2.
 4. Back up the old srv2 RPC unit.
 5. Stop/disable `llm-gpu2-local-server.service` and start/enable
-   `llm-gpu2-rpc-worker.service` on `10.30.0.2:50053`.
+   `llm-gpu2-rpc-worker.service` on `<srv2-rpc-ip>:50053`.
 6. Verify the RPC port and free GPU memory.
 7. Install/enable `llm-gemma4-primary.service` on srv1.
 8. Start first at context 8K, verify text and vision, then restart at context
@@ -231,7 +231,7 @@ journalctl -u llm-gemma4-primary.service -n 80 --no-pager
 ```bash
 systemctl is-active llm-gpu2-rpc-worker.service
 systemctl is-enabled llm-gpu2-rpc-worker.service
-ss -ltn | grep '10.30.0.2:50053'
+ss -ltn | grep '<srv2-rpc-ip>:50053'
 journalctl -u llm-gpu2-rpc-worker.service -n 80 --no-pager
 ```
 

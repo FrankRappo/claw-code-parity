@@ -26,9 +26,9 @@ local/controller shell
      - current production/single-GPU LLM: localhost:8080 (do not disturb)
      - second LLM llama-server: <srv1-lan>:8081
      - VM121 claw-second-llm: <vm121-lan>
-  -> srv2 <srv1-public>:235 / <srv2-lan> / 10.30.0.2
+  -> srv2 <srv1-public>:235 / <srv2-lan> / <srv2-rpc-ip>
      - GPU2 host mode
-     - llama.cpp RPC worker: 10.30.0.2:50053
+     - llama.cpp RPC worker: <srv2-rpc-ip>:50053
 ```
 
 The second LLM currently uses:
@@ -85,7 +85,7 @@ VMID: 121
 name: claw-second-llm
 node: srv1
 IP: <vm121-lan>/24
-GW: 192.168.87.1
+GW: <lan-gateway>
 CPU: host, 4 cores
 RAM: 16384 MB
 Disk: 80G on ssd storage
@@ -222,7 +222,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 Environment=VK_LOADER_DRIVERS_SELECT=radeon_icd.x86_64.json
-ExecStart=/opt/llm-rpc/runtime/llamacpp-rpc-vulkan-runtime-portable/run-rpc-server.sh -H 10.30.0.2 -p 50053
+ExecStart=/opt/llm-rpc/runtime/llamacpp-rpc-vulkan-runtime-portable/run-rpc-server.sh -H <srv2-rpc-ip> -p 50053
 Restart=on-failure
 RestartSec=5
 
@@ -235,7 +235,7 @@ Observed state at creation:
 ```text
 active: active/running
 pid: 16487
-listen: 10.30.0.2:50053
+listen: <srv2-rpc-ip>:50053
 ```
 
 The service is currently **disabled** for autostart but was started manually for this session.
@@ -274,7 +274,7 @@ Current intended args:
 ```bash
 /mnt/ssd/llm-distributed/src/llama.cpp/build-rpc-vulkan-portable/bin/llama-server \
   --model /mnt/ssd/llm-distributed/models/gemma-4-31b-abliterated-Q4_K_M.gguf \
-  --rpc 10.30.0.2:50053 \
+  --rpc <srv2-rpc-ip>:50053 \
   --device RPC0 \
   --gpu-layers auto \
   --ctx-size 260000 \
@@ -301,7 +301,7 @@ health: HTTP 503 while model is loading/warming
 Important log evidence:
 
 ```text
-RPC0: 10.30.0.2:50053 (15941 MiB free)
+RPC0: <srv2-rpc-ip>:50053 (15941 MiB free)
 n_ctx_seq (260096) < n_ctx_train (262144)
 warming up the model with an empty run
 ```
@@ -466,7 +466,7 @@ Given previous failures happened after about 4 hours, a meaningful stability tes
 snapshot_time: 2026-06-06T15:36:58+03:00 srv/VM clocks; 2026-06-06 local session
 VM121: running, IP <vm121-lan>, 4 CPU, 16GB RAM, 80GB SSD
 VM121 Claw: installed; /usr/local/bin/run-claw-gemma2 available; claw 0.1.0
-srv2 RPC worker: active/running, pid 16487, 10.30.0.2:50053, NRestarts=0
+srv2 RPC worker: active/running, pid 16487, <srv2-rpc-ip>:50053, NRestarts=0
 srv1 second LLM: active/running, pid 4103003, <srv1-lan>:8081, health {"status":"ok"}, NRestarts=0
 srv1 existing LLM: active/healthy, pid 3461651, 127.0.0.1:8080, health {"status":"ok"}
 srv2 GPU binding: 03:00.0 amdgpu; 03:00.1 snd_hda_intel; power/control=on; d3cold_allowed=0

@@ -86,7 +86,7 @@ sudo pkill -f monitor-amdgpu-vm100
 
 ## Update — after 2.5G kernel NAT cutover — 2026-05-28
 
-The active RPC path is now `10.30.0.2:50052` via srv2 kernel NAT to VM100. During the verification benchmark both GPUs showed nonzero load:
+The active RPC path is now `<srv2-rpc-ip>:50052` via srv2 kernel NAT to VM100. During the verification benchmark both GPUs showed nonzero load:
 
 ```text
 srv1:  busy ~40-42%, VRAM ~14.43/15.92 GiB

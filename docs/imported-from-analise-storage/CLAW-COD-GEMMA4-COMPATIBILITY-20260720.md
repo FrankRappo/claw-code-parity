@@ -65,7 +65,7 @@ Claw processes after smoke: none
 ## Установленный Claw
 
 ```text
-VM:                  VM120 / llm-vpn-ubuntu24 / 192.168.87.32
+VM:                  VM120 / llm-vpn-ubuntu24 / <vm120-lan>
 OS user:             clawrun (без sudo)
 repository:          /home/clawrun/analise_storage/claw-code-parity
 source commit:       5fbee8e82b9714882698e0be65f1ff31b19e4643

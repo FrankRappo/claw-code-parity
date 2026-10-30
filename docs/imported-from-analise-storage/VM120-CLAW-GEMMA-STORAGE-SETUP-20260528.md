@@ -63,7 +63,7 @@ Important: VM120 sees `storage:/mnt/excise-docs-ro` only when storage SSHFS is m
 ### VM120
 
 - Hostname: `llm-vpn-ubuntu24`
-- IP: `192.168.87.32`
+- IP: `<vm120-lan>`
 - Рабочий пользователь: `clawrun`
 - Рабочая папка: `/home/clawrun/analise_storage`
 - Symlink для удобства: `/home/ubuntu/analise_storage -> /home/clawrun/analise_storage`
